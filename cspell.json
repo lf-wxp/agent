@@ -1,6 +1,11 @@
 {
     "words": [
+        "backon",
+        "deepseek",
         "dotenvy",
+        "MSVC",
+        "rustc",
+        "schemars",
         "serde"
     ]
 }

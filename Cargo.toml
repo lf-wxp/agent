@@ -3,10 +3,18 @@ name = "agent"
 version = "0.1.0"
 edition = "2024"
 
+[[example]]
+name = "stream_chat"
+path = "examples/stream_chat.rs"
+
 [dependencies]
 anyhow = "1.0.104"
-async-openai = { version = "0.41.2", features = ["chat-completion"] }
+async-openai = { version = "0.41", features = ["chat-completion"] }
+async-stream = "0.3.6"
+backon = "1.6.0"
 dotenvy = "0.15.7"
+futures = "0.3.33"
+schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["full"] }
