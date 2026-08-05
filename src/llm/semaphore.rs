@@ -1,9 +1,12 @@
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 use tokio::sync::Semaphore;
 
-static SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+use crate::config;
+
+/// Global concurrency gate. `LazyLock` avoids the `get_or_init` branch on every access that `OnceLock` would incur.
+static SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(config::max_concurrency()));
 
 pub fn get_semaphore() -> &'static Semaphore {
-  SEMAPHORE.get_or_init(|| Semaphore::new(3))
+  &SEMAPHORE
 }

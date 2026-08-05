@@ -1,44 +1,24 @@
-use async_openai::types::chat::{
-  ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-  CreateChatCompletionRequestArgs,
+use crate::llm::client::{
+  DEFAULT_MAX_TOKENS, build_messages, client, ensure_valid_params, first_choice, log_response_meta,
+  request_builder,
 };
 
+/// Plain text completion.
 pub async fn chat_complete(
   model: &str,
   system: Option<&str>,
   prompt: &str,
 ) -> anyhow::Result<String> {
-  let client = async_openai::Client::new();
-  let mut messages = vec![];
-  if let Some(system) = system {
-    messages.push(
-      ChatCompletionRequestSystemMessageArgs::default()
-        .content(system)
-        .build()?
-        .into(),
-    );
-  }
-  messages.push(
-    ChatCompletionRequestUserMessageArgs::default()
-      .content(prompt)
-      .build()?
-      .into(),
-  );
-  let request = CreateChatCompletionRequestArgs::default()
-    .model(model)
-    .messages(messages)
-    .max_tokens(2048u32)
-    .build()?;
-  let response = client.chat().create(request).await?;
+  ensure_valid_params(model, prompt)?;
 
-  tracing::info!("Response {:#?}", response);
+  let request =
+    request_builder(model, build_messages(system, prompt)?, DEFAULT_MAX_TOKENS).build()?;
+  let response = client().chat().create(request).await?;
+  log_response_meta(&response, "chat completion finished");
 
-  let content = response
-    .choices
-    .into_iter()
-    .next()
-    .and_then(|c| c.message.content)
-    .ok_or_else(|| anyhow::anyhow!("No content in response"))?;
-
-  Ok(content)
+  first_choice(response)?
+    .message
+    .content
+    .filter(|content| !content.trim().is_empty())
+    .ok_or_else(|| anyhow::anyhow!("No content in response"))
 }
