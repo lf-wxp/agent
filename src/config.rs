@@ -23,6 +23,12 @@ const ENV_STRUCTURED_MODE: &str = "LLM_STRUCTURED_MODE";
 /// Environment variable: rounds of tool execution allowed before a final answer is forced.
 const ENV_MAX_TOOL_ROUNDS: &str = "LLM_MAX_TOOL_ROUNDS";
 
+/// Environment variable: Tavily API key, used by the `web_search` tool.
+const ENV_TAVILY_API_KEY: &str = "TAVILY_API_KEY";
+
+/// Environment variable: Tavily search depth, `basic` / `advanced` / `fast` / `ultra-fast`.
+const ENV_TAVILY_SEARCH_DEPTH: &str = "TAVILY_SEARCH_DEPTH";
+
 /// Model used when `LLM_MODEL` is not configured.
 const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 
@@ -31,6 +37,9 @@ const DEFAULT_MAX_CONCURRENCY: usize = 3;
 
 /// Default tool-round budget: enough for multi-step tasks while keeping cost bounded.
 const DEFAULT_MAX_TOOL_ROUNDS: usize = 10;
+
+/// Default Tavily search depth: `basic` costs 1 credit and balances latency against relevance.
+const DEFAULT_TAVILY_SEARCH_DEPTH: &str = "basic";
 
 static MODEL: LazyLock<String> =
   LazyLock::new(|| non_empty_var(ENV_MODEL).unwrap_or_else(|| DEFAULT_MODEL.to_owned()));
@@ -70,6 +79,19 @@ pub fn max_tool_rounds() -> usize {
   non_empty_var(ENV_MAX_TOOL_ROUNDS)
     .and_then(|value| value.parse::<usize>().ok())
     .unwrap_or(DEFAULT_MAX_TOOL_ROUNDS)
+}
+
+/// Tavily API key used by the `web_search` tool. `None` when unset.
+pub fn tavily_api_key() -> Option<String> {
+  non_empty_var(ENV_TAVILY_API_KEY)
+}
+
+/// Tavily search depth. Override with `TAVILY_SEARCH_DEPTH`.
+///
+/// This is an operational trade-off (credits and latency versus relevance), so it is
+/// configured here rather than exposed in the tool schema for the model to pick.
+pub fn tavily_search_depth() -> String {
+  non_empty_var(ENV_TAVILY_SEARCH_DEPTH).unwrap_or_else(|| DEFAULT_TAVILY_SEARCH_DEPTH.to_owned())
 }
 
 /// Read an environment variable and trim leading/trailing whitespace; unset or blank is treated as not configured.

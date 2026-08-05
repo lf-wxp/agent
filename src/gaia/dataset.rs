@@ -1,9 +1,8 @@
-use std::sync::LazyLock;
-
 use reqwest::StatusCode;
 
 use crate::{
   gaia::models::{GaiaRow, HfResponse},
+  http,
   util::truncate_chars,
 };
 
@@ -18,9 +17,6 @@ const MAX_ROWS_PER_REQUEST: usize = 100;
 
 /// Length (in chars) of the response body kept in error messages, to avoid log bloat.
 const BODY_PREVIEW_CHARS: usize = 512;
-
-/// Reuse a single HTTP client within the process to avoid rebuilding the connection pool.
-static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
 
 /// Fetch some rows of the given GAIA config/split from the HF datasets-server.
 pub async fn load_gaia_rows(
@@ -42,7 +38,7 @@ pub async fn load_gaia_rows(
 
   let offset = offset.to_string();
   let length = length.to_string();
-  let response = CLIENT
+  let response = http::client()
     .get(HF_ROWS_ENDPOINT)
     .query(&[
       ("dataset", GAIA_DATASET),

@@ -16,7 +16,7 @@ use crate::{
   config,
   llm::{
     client::{build_messages, ensure_valid_params},
-    tool_loop,
+    tool_loop::{self, BudgetExhausted},
   },
   util::truncate_chars,
 };
@@ -152,8 +152,12 @@ impl StructuredChoice {
   }
 
   /// Parse the JSON text into `T`, converting every failure into a diagnosable error.
+  ///
+  /// Failures are tagged with [`BudgetExhausted`] when the tool budget had run out, so
+  /// callers can skip a retry that would spend the whole budget again.
   pub fn parse<T: DeserializeOwned>(self) -> anyhow::Result<T> {
     let finish_reason = self.finish_reason();
+    let budget_exhausted = self.budget_exhausted;
 
     // When truncated by max_tokens the JSON is necessarily incomplete (under reasoning models content is often empty);
     // throw a dedicated error up front to avoid degrading into the cryptic "EOF while parsing a value".
@@ -172,15 +176,30 @@ impl StructuredChoice {
       .content
       .filter(|content| !content.trim().is_empty())
       .ok_or_else(|| {
-        anyhow::anyhow!("Empty content in response (finish_reason: {finish_reason:?})")
+        tag_budget(
+          anyhow::anyhow!("Empty content in response (finish_reason: {finish_reason:?})"),
+          budget_exhausted,
+        )
       })?;
 
     serde_json::from_str::<T>(strip_code_fence(&content)).map_err(|err| {
-      anyhow::anyhow!(
-        "Failed to parse structured output: {err}; raw content: {}",
-        truncate_chars(&content, RAW_CONTENT_PREVIEW_CHARS)
+      tag_budget(
+        anyhow::anyhow!(
+          "Failed to parse structured output: {err}; raw content: {}",
+          truncate_chars(&content, RAW_CONTENT_PREVIEW_CHARS)
+        ),
+        budget_exhausted,
       )
     })
+  }
+}
+
+/// Mark a failure as caused by a budget-exhausted attempt, so retries can be skipped.
+fn tag_budget(err: anyhow::Error, budget_exhausted: bool) -> anyhow::Error {
+  if budget_exhausted {
+    err.context(BudgetExhausted)
+  } else {
+    err
   }
 }
 

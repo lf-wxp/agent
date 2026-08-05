@@ -1,13 +1,11 @@
-// use std::sync::Arc;
+use std::borrow::Cow;
 
 use async_openai::types::chat::ChatCompletionTools;
 
 use crate::gaia::{
   models::{GaiaEvalResult, GaiaRow, Solution},
   solver::solve_problem_with_retry,
-  // solver::{solve_problem_with_retry, solve_problem_with_tools},
 };
-// use crate::tools::ToolBox;
 
 pub const GAIA_PROMPT: &str = r#"You are a general AI assistant. I will ask you a question.
 First, determine if you can solve this problem with your current capabilities and set "is_solvable" accordingly.
@@ -64,18 +62,29 @@ pub async fn evaluate_gaia_single(
   model: &str,
   tools: &[ChatCompletionTools],
 ) -> GaiaEvalResult {
-  let result = solve_problem_with_retry(model, GAIA_PROMPT, &problem.question, tools).await;
+  let system = system_prompt(tools);
+  let result = solve_problem_with_retry(model, &system, &problem.question, tools).await;
   to_eval_result(problem, model, result)
 }
 
-// pub async fn evaluate_gaia_single_with_tools(
-//   problem: GaiaRow,
-//   model: &str,
-//   toolbox: Arc<ToolBox>,
-// ) -> GaiaEvalResult {
-//   let result = solve_problem_with_tools(model, GAIA_PROMPT, &problem.question, toolbox).await;
-//   to_eval_result(problem, model, result)
-// }
+/// Appended when tools are available.
+///
+/// Without it the model applies [`GAIA_PROMPT`] literally — judging solvability from its
+/// own knowledge — and reports `is_solvable: false` on anything it cannot recall, never
+/// reaching for the tools. That would make a with-tools/without-tools comparison
+/// measure nothing.
+const TOOL_HINT: &str = "You have tools available. Use them to look up any fact you are \
+                         missing, and only report the problem as unsolvable once the tools \
+                         have failed to provide what you need.";
+
+/// Borrowed in the no-tools case so the common path allocates nothing.
+fn system_prompt(tools: &[ChatCompletionTools]) -> Cow<'static, str> {
+  if tools.is_empty() {
+    Cow::Borrowed(GAIA_PROMPT)
+  } else {
+    Cow::Owned(format!("{GAIA_PROMPT}\n\n{TOOL_HINT}"))
+  }
+}
 
 #[cfg(test)]
 mod tests {

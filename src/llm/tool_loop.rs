@@ -3,6 +3,8 @@
 //! Streaming has its own loop in [`crate::llm::stream`] (fragments must be reassembled
 //! first), but reuses [`disable_tools`] and [`append_tool_results`] from here.
 
+use std::fmt;
+
 use async_openai::types::chat::{
   ChatChoice, ChatCompletionMessageCustomToolCall, ChatCompletionMessageToolCall,
   ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs,
@@ -25,6 +27,23 @@ pub struct Completion {
   /// disabled, i.e. the model had to work from partial information. Callers may want
   /// to treat such answers as lower confidence, or report them separately.
   pub budget_exhausted: bool,
+}
+
+/// Marker attached to failures that happened after the tool budget was spent.
+///
+/// Such a failure is effectively deterministic: a retry replays the whole conversation
+/// and spends the entire budget again before failing the same way. Callers use it to
+/// skip retries (see `gaia::solver`).
+#[derive(Debug)]
+pub struct BudgetExhausted;
+
+impl fmt::Display for BudgetExhausted {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(
+      f,
+      "failed after the tool round budget was spent, so retrying would repeat the full budget"
+    )
+  }
 }
 
 /// Drive a completion to a final answer, executing tool calls as the model requests them.

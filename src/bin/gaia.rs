@@ -1,18 +1,13 @@
 use std::collections::HashMap;
-// use std::sync::Arc;
 
 use agent::{
   config,
-  gaia::{
-    dataset::load_gaia_level1,
-    // evaluator::{evaluate_gaia_single, evaluate_gaia_single_with_tools},
-    evaluator::evaluate_gaia_single,
-    models::GaiaEvalResult,
-  },
+  gaia::{dataset::load_gaia_level1, evaluator::evaluate_gaia_single, models::GaiaEvalResult},
   llm::semaphore::get_semaphore,
   telemetry,
-  // tools::build_toolbox,
+  tools::tools,
 };
+use async_openai::types::chat::ChatCompletionTools;
 use tokio::task::JoinSet;
 
 /// Number of problems to evaluate.
@@ -29,30 +24,25 @@ async fn main() -> anyhow::Result<()> {
 
 pub async fn gaia_level1_experiment() -> anyhow::Result<()> {
   let problems = load_gaia_level1(SAMPLE_SIZE).await?;
-  // let toolbox = Arc::new(build_toolbox().await?);
 
   // Fetch once up front: `config::model()` returns a 'static value, so it can be moved into each task directly.
   let model = config::model();
 
+  // Both arms run the same problems, so the comparison is paired rather than across samples.
+  let groups: [(&'static str, &'static [ChatCompletionTools]); 2] =
+    [(GROUP_WITHOUT_TOOLS, &[]), (GROUP_WITH_TOOLS, tools())];
+
   let mut set = JoinSet::new();
-
-  // Use clone rather than into_iter: the same problems are also fed to the "with tools" group for comparison.
-  for problem in problems.iter().cloned() {
-    set.spawn(async move {
-      let _permit = get_semaphore().acquire().await?;
-      let eval = evaluate_gaia_single(problem, model, &[]).await;
-      Ok::<_, anyhow::Error>((GROUP_WITHOUT_TOOLS, eval))
-    });
+  for (group, tools) in groups {
+    // Clone rather than consume: the problems are needed by the other arm too.
+    for problem in problems.iter().cloned() {
+      set.spawn(async move {
+        let _permit = get_semaphore().acquire().await?;
+        let eval = evaluate_gaia_single(problem, model, tools).await;
+        Ok::<_, anyhow::Error>((group, eval))
+      });
+    }
   }
-
-  // for problem in problems.iter().cloned() {
-  //   let toolbox = toolbox.clone();
-  //   set.spawn(async move {
-  //     let _permit = get_semaphore().acquire().await?;
-  //     let eval = evaluate_gaia_single_with_tools(problem, model, toolbox).await;
-  //     Ok::<_, anyhow::Error>((GROUP_WITH_TOOLS, eval))
-  //   });
-  // }
 
   let mut results: HashMap<&str, Vec<GaiaEvalResult>> = HashMap::new();
   // Note: do not write `while let Some(Ok(result))` here — if a task panics (JoinError),
@@ -80,6 +70,16 @@ fn report(results: &HashMap<&str, Vec<GaiaEvalResult>>) {
       continue;
     };
     log_accuracy(group, evals);
+
+    // Failures never produced an answer, so they sit in neither budget bucket below.
+    // Surfacing the count explains a gap between the headline total and those buckets.
+    let failed = evals.iter().filter(|eval| eval.error.is_some()).count();
+    if failed > 0 {
+      tracing::warn!(
+        "{group}: {failed}/{} failed to produce an answer",
+        evals.len()
+      );
+    }
 
     // Answers produced after the tool budget ran out rest on partial information, so they
     // are broken out: mixing them into the headline number hides why a run scored badly.

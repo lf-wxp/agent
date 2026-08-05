@@ -1,10 +1,12 @@
 use async_openai::types::chat::{ChatCompletionTools, FinishReason};
 use backon::{ExponentialBuilder, Retryable};
 
-// use crate::{agent::Agent, gaia::models::GaiaOutput, tools::ToolBox};
 use crate::{
   gaia::models::{GaiaOutput, Solution},
-  llm::structured::{TruncatedOutput, chat_complete_structured_raw},
+  llm::{
+    structured::{TruncatedOutput, chat_complete_structured_raw},
+    tool_loop::BudgetExhausted,
+  },
 };
 
 /// Max retry attempts.
@@ -18,8 +20,13 @@ pub async fn solve_problem_with_retry(
 ) -> anyhow::Result<Solution> {
   let op = || solve_problem(model, system, prompt, tools);
   op.retry(ExponentialBuilder::default().with_max_times(MAX_RETRY_TIMES))
-    // A max_tokens truncation is a deterministic failure; retrying only consumes tokens again.
-    .when(|err: &anyhow::Error| err.downcast_ref::<TruncatedOutput>().is_none())
+    // Skip deterministic failures, where a retry only burns resources for the same outcome:
+    // a max_tokens truncation repeats token spend, and a budget-exhausted attempt replays
+    // the entire tool round budget.
+    .when(|err: &anyhow::Error| {
+      err.downcast_ref::<TruncatedOutput>().is_none()
+        && err.downcast_ref::<BudgetExhausted>().is_none()
+    })
     .notify(|err, dur| tracing::warn!("retrying after {dur:?}: {err}"))
     .await
 }
@@ -55,14 +62,3 @@ async fn solve_problem(
     budget_exhausted,
   })
 }
-
-// pub async fn solve_problem_with_tools(
-//   model: &str,
-//   system: &str,
-//   prompt: &str,
-//   toolbox: Arc<ToolBox>,
-// ) -> anyhow::Result<GaiaOutput> {
-//   let agent = Agent::new(model, Some(system), toolbox).with_max_steps(15);
-//   let result = agent.run_structured::<GaiaOutput>(prompt).await?;
-//   Ok(result.output)
-// }
