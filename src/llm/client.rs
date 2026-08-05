@@ -10,7 +10,7 @@ use async_openai::{
   config::OpenAIConfig,
   types::chat::{
     ChatChoice, ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-    ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs,
+    ChatCompletionRequestUserMessageArgs, ChatCompletionTools, CreateChatCompletionRequestArgs,
     CreateChatCompletionResponse,
   },
 };
@@ -59,13 +59,20 @@ pub fn build_messages(
 }
 
 /// Request builder preloaded with model / messages / max_tokens; callers can keep appending params before `build()`.
+///
+/// An empty `tools` slice is left unset rather than sent as `"tools": []`: the API
+/// requires at least one entry when the field is present, so an empty array is rejected.
 pub fn request_builder(
   model: &str,
   messages: Vec<ChatCompletionRequestMessage>,
   max_tokens: u32,
+  tools: &[ChatCompletionTools],
 ) -> CreateChatCompletionRequestArgs {
   let mut args = CreateChatCompletionRequestArgs::default();
   args.model(model).messages(messages).max_tokens(max_tokens);
+  if !tools.is_empty() {
+    args.tools(tools.to_vec());
+  }
   args
 }
 

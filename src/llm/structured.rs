@@ -7,14 +7,17 @@
 use std::{fmt, str::FromStr};
 
 use async_openai::types::chat::{
-  ChatChoice, FinishReason, ResponseFormat, ResponseFormatJsonSchema,
+  ChatChoice, ChatCompletionTools, FinishReason, ResponseFormat, ResponseFormatJsonSchema,
 };
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
 use crate::{
   config,
-  llm::client::{build_messages, client, ensure_valid_params, first_choice, request_builder},
+  llm::{
+    client::{build_messages, ensure_valid_params},
+    tool_loop,
+  },
   util::truncate_chars,
 };
 
@@ -130,6 +133,7 @@ impl std::error::Error for TruncatedOutput {}
 pub struct StructuredChoice {
   choice: ChatChoice,
   mode: StructuredMode,
+  budget_exhausted: bool,
 }
 
 impl StructuredChoice {
@@ -139,6 +143,12 @@ impl StructuredChoice {
 
   pub fn mode(&self) -> StructuredMode {
     self.mode
+  }
+
+  /// `true` when the tool round budget ran out before the model finished, so the answer
+  /// rests on partial information. See [`crate::llm::tool_loop::Completion`].
+  pub fn budget_exhausted(&self) -> bool {
+    self.budget_exhausted
   }
 
   /// Parse the JSON text into `T`, converting every failure into a diagnosable error.
@@ -182,6 +192,7 @@ pub async fn chat_complete_structured_raw<T: JsonSchema>(
   model: &str,
   system: Option<&str>,
   prompt: &str,
+  tools: &[ChatCompletionTools],
 ) -> anyhow::Result<StructuredChoice> {
   ensure_valid_params(model, prompt)?;
 
@@ -194,27 +205,23 @@ pub async fn chat_complete_structured_raw<T: JsonSchema>(
       ResponseFormat::JsonObject,
     ),
   };
+  tracing::debug!(model, ?mode, "structured completion started");
 
-  let request = request_builder(
+  // Goes through the tool loop so a structured request can also use tools: without it the
+  // model's tool call would leave `content` empty and surface as a bogus parse error.
+  let completion = tool_loop::run(
     model,
     build_messages(system_content.as_deref(), prompt)?,
+    tools,
     mode.max_tokens(),
+    Some(response_format),
   )
-  .response_format(response_format)
-  .build()?;
-
-  let response = client().chat().create(request).await?;
-  // The full response can be long; only log metadata to help inspect usage and trace id.
-  tracing::debug!(
-    id = %response.id,
-    ?mode,
-    usage = ?response.usage,
-    "structured completion finished"
-  );
+  .await?;
 
   Ok(StructuredChoice {
-    choice: first_choice(response)?,
+    choice: completion.choice,
     mode,
+    budget_exhausted: completion.budget_exhausted,
   })
 }
 
@@ -223,11 +230,12 @@ pub async fn chat_complete_structured<T>(
   model: &str,
   system: Option<&str>,
   prompt: &str,
+  tools: &[ChatCompletionTools],
 ) -> anyhow::Result<T>
 where
   T: JsonSchema + DeserializeOwned,
 {
-  chat_complete_structured_raw::<T>(model, system, prompt)
+  chat_complete_structured_raw::<T>(model, system, prompt, tools)
     .await?
     .parse()
 }

@@ -1,38 +1,112 @@
+use async_openai::types::chat::ChatCompletionTools;
 use async_stream::stream;
 use backon::{ExponentialBuilder, Retryable};
 use futures::{Stream, StreamExt};
 
-use crate::llm::client::{
-  DEFAULT_MAX_TOKENS, build_messages, client, ensure_valid_params, request_builder,
+use crate::{
+  config,
+  llm::{
+    client::{DEFAULT_MAX_TOKENS, build_messages, client, ensure_valid_params, request_builder},
+    tool_calls::ToolCallAccumulator,
+    tool_loop::{append_tool_results, disable_tools},
+  },
 };
 
 /// Max retry attempts.
 const MAX_RETRY_TIMES: usize = 3;
 
 /// Streaming completion, yielding incremental text segments.
-fn chat_stream(
-  model: &str,
-  system: Option<&str>,
-  prompt: &str,
-) -> impl Stream<Item = anyhow::Result<String>> {
+///
+/// Tool calls are handled transparently: a streamed call is reassembled from its fragments,
+/// executed, and the conversation continues in a new stream, so the caller only ever sees
+/// the text of the final answer. Text emitted *before* a tool call is forwarded as well,
+/// since some models narrate what they are about to do.
+///
+/// Same budget policy as [`crate::llm::tool_loop::run`]: when the round budget is spent,
+/// the last stream goes out with tools disabled so an answer still comes back.
+fn chat_stream<'a>(
+  model: &'a str,
+  system: Option<&'a str>,
+  prompt: &'a str,
+  tools: &'a [ChatCompletionTools],
+) -> impl Stream<Item = anyhow::Result<String>> + 'a {
   stream! {
     ensure_valid_params(model, prompt)?;
 
-    let request = request_builder(model, build_messages(system, prompt)?, DEFAULT_MAX_TOKENS).build()?;
-    let mut stream = client().chat().create_stream(request).await?;
+    let max_rounds = config::max_tool_rounds();
+    let mut messages = build_messages(system, prompt)?;
+    let mut round: usize = 0;
 
-    while let Some(chunk) = stream.next().await {
-      match chunk {
-        Ok(chunk) => {
-          // Heartbeat / role-declaration chunks have empty delta.content; skip to avoid flooding downstream with empty strings.
-          if let Some(choice) = chunk.choices.first()
-            && let Some(text) = &choice.delta.content
-            && !text.is_empty()
-          {
-            yield Ok(text.clone())
-          }
+    loop {
+      let tools_allowed = round < max_rounds;
+
+      let mut builder = request_builder(model, messages.clone(), DEFAULT_MAX_TOKENS, tools);
+      if !tools_allowed {
+        disable_tools(&mut builder, tools);
+        // Only worth warning about when tools were actually taken away.
+        if !tools.is_empty() {
+          tracing::warn!(max_rounds, "tool round budget spent; forcing a final answer");
         }
-        Err(err) => yield Err(err.into()),
+      }
+      let mut chunks = client().chat().create_stream(builder.build()?).await?;
+
+      let mut accumulator = ToolCallAccumulator::default();
+      // Kept so the assistant message we replay carries whatever the model said.
+      let mut assistant_text = String::new();
+
+      while let Some(chunk) = chunks.next().await {
+        let chunk = match chunk {
+          Ok(chunk) => chunk,
+          // Abort instead of continuing: after a transport error the remaining
+          // fragments would assemble into a truncated tool call.
+          Err(err) => {
+            yield Err(err.into());
+            return;
+          }
+        };
+
+        let Some(choice) = chunk.choices.first() else {
+          continue;
+        };
+
+        if let Some(fragments) = &choice.delta.tool_calls {
+          accumulator.push(fragments);
+        }
+
+        // Heartbeat / role-declaration chunks have empty delta.content; skip to avoid
+        // flooding downstream with empty strings.
+        if let Some(text) = &choice.delta.content
+          && !text.is_empty()
+        {
+          assistant_text.push_str(text);
+          yield Ok(text.clone());
+        }
+      }
+
+      // No tool calls means the model produced its final answer.
+      if accumulator.is_empty() {
+        return;
+      }
+
+      // The model ignored `tool_choice = none`; its text has already been forwarded,
+      // so end the stream rather than spending another round.
+      if !tools_allowed {
+        tracing::warn!("model requested tools after they were disabled");
+        return;
+      }
+      round += 1;
+
+      let tool_calls = match accumulator.finish() {
+        Ok(tool_calls) => tool_calls,
+        Err(err) => {
+          yield Err(err);
+          return;
+        }
+      };
+
+      if let Err(err) = append_tool_results(&mut messages, tool_calls, Some(assistant_text)).await {
+        yield Err(err);
+        return;
       }
     }
   }
@@ -46,9 +120,10 @@ pub async fn chat_stream_with_retry(
   model: &str,
   system: Option<&str>,
   prompt: &str,
+  tools: &[ChatCompletionTools],
 ) -> anyhow::Result<String> {
   let op = || async {
-    let stream = chat_stream(model, system, prompt);
+    let stream = chat_stream(model, system, prompt, tools);
     futures::pin_mut!(stream);
 
     let mut output = String::new();

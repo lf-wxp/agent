@@ -1,7 +1,9 @@
 // use std::sync::Arc;
 
+use async_openai::types::chat::ChatCompletionTools;
+
 use crate::gaia::{
-  models::{GaiaEvalResult, GaiaOutput, GaiaRow},
+  models::{GaiaEvalResult, GaiaRow, Solution},
   solver::solve_problem_with_retry,
   // solver::{solve_problem_with_retry, solve_problem_with_tools},
 };
@@ -25,10 +27,13 @@ fn is_correct(prediction: &str, answer: &str) -> bool {
 fn to_eval_result(
   problem: GaiaRow,
   model: &str,
-  result: anyhow::Result<GaiaOutput>,
+  result: anyhow::Result<Solution>,
 ) -> GaiaEvalResult {
   match result {
-    Ok(output) => GaiaEvalResult {
+    Ok(Solution {
+      output,
+      budget_exhausted,
+    }) => GaiaEvalResult {
       task_id: problem.task_id,
       model: model.to_owned(),
       correct: is_correct(&output.final_answer, &problem.final_answer),
@@ -36,6 +41,7 @@ fn to_eval_result(
       prediction: Some(output.final_answer),
       answer: problem.final_answer,
       unsolvable_reason: Some(output.unsolvable_reason),
+      budget_exhausted: Some(budget_exhausted),
       error: None,
     },
     Err(err) => GaiaEvalResult {
@@ -48,12 +54,17 @@ fn to_eval_result(
       // Use `{err:#}` to print the full error chain, otherwise only the outermost message is kept and root cause is hard to locate.
       error: Some(format!("{err:#}")),
       unsolvable_reason: None,
+      budget_exhausted: None,
     },
   }
 }
 
-pub async fn evaluate_gaia_single(problem: GaiaRow, model: &str) -> GaiaEvalResult {
-  let result = solve_problem_with_retry(model, GAIA_PROMPT, &problem.question).await;
+pub async fn evaluate_gaia_single(
+  problem: GaiaRow,
+  model: &str,
+  tools: &[ChatCompletionTools],
+) -> GaiaEvalResult {
+  let result = solve_problem_with_retry(model, GAIA_PROMPT, &problem.question, tools).await;
   to_eval_result(problem, model, result)
 }
 

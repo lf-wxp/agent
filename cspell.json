@@ -3,9 +3,13 @@
         "backon",
         "deepseek",
         "dotenvy",
+        "evals",
+        "monomorphizations",
         "MSVC",
+        "rsplit",
         "rustc",
         "schemars",
-        "serde"
+        "serde",
+        "unparseable"
     ]
 }

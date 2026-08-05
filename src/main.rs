@@ -10,6 +10,7 @@ async fn main() -> anyhow::Result<()> {
     config::model(),
     Some("You are a general-purpose assistant"),
     "Help me plan a three-day trip to Hangzhou",
+    &[],
   )
   .await?;
 

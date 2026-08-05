@@ -40,7 +40,7 @@ pub async fn gaia_level1_experiment() -> anyhow::Result<()> {
   for problem in problems.iter().cloned() {
     set.spawn(async move {
       let _permit = get_semaphore().acquire().await?;
-      let eval = evaluate_gaia_single(problem, model).await;
+      let eval = evaluate_gaia_single(problem, model, &[]).await;
       Ok::<_, anyhow::Error>((GROUP_WITHOUT_TOOLS, eval))
     });
   }
@@ -76,15 +76,48 @@ pub async fn gaia_level1_experiment() -> anyhow::Result<()> {
 /// Print accuracy grouped by category.
 fn report(results: &HashMap<&str, Vec<GaiaEvalResult>>) {
   for group in [GROUP_WITH_TOOLS, GROUP_WITHOUT_TOOLS] {
-    // Skip empty groups to avoid printing NaN from 0/0.
-    let Some(evals) = results.get(group).filter(|evals| !evals.is_empty()) else {
+    let Some(evals) = results.get(group) else {
       continue;
     };
-    let total = evals.len();
-    let correct = evals.iter().filter(|eval| eval.correct).count();
-    tracing::info!(
-      "{group}: {correct}/{total} ({:.1}%)",
-      correct as f64 / total as f64 * 100.0
-    );
+    log_accuracy(group, evals);
+
+    // Answers produced after the tool budget ran out rest on partial information, so they
+    // are broken out: mixing them into the headline number hides why a run scored badly.
+    if evals.iter().any(is_budget_exhausted) {
+      log_accuracy(
+        &format!("{group} / budget exhausted"),
+        evals.iter().filter(|eval| is_budget_exhausted(eval)),
+      );
+      log_accuracy(
+        &format!("{group} / within budget"),
+        evals
+          .iter()
+          .filter(|eval| eval.budget_exhausted == Some(false)),
+      );
+    }
   }
+}
+
+fn is_budget_exhausted(eval: &GaiaEvalResult) -> bool {
+  eval.budget_exhausted == Some(true)
+}
+
+/// Log `correct/total (pct)` for a set of results; silent when the set is empty,
+/// which also avoids printing NaN from 0/0.
+fn log_accuracy<'a>(label: &str, evals: impl IntoIterator<Item = &'a GaiaEvalResult>) {
+  let mut total = 0usize;
+  let mut correct = 0usize;
+  for eval in evals {
+    total += 1;
+    correct += usize::from(eval.correct);
+  }
+
+  if total == 0 {
+    return;
+  }
+
+  tracing::info!(
+    "{label}: {correct}/{total} ({:.1}%)",
+    correct as f64 / total as f64 * 100.0
+  );
 }

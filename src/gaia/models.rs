@@ -30,6 +30,18 @@ pub struct GaiaOutput {
   pub final_answer: String,
 }
 
+/// A solved problem plus metadata about how the answer was produced.
+///
+/// Kept separate from [`GaiaOutput`], which is the model's own schema: adding fields there
+/// would make the model responsible for filling them in.
+#[derive(Debug)]
+pub struct Solution {
+  pub output: GaiaOutput,
+  /// `true` when the tool round budget ran out before the model finished, so the answer
+  /// rests on partial information and should be scored separately.
+  pub budget_exhausted: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct GaiaEvalResult {
   pub task_id: String,
@@ -39,5 +51,7 @@ pub struct GaiaEvalResult {
   pub prediction: Option<String>,
   pub answer: String,
   pub unsolvable_reason: Option<String>,
+  /// `None` when solving failed outright, so the question never got an answer.
+  pub budget_exhausted: Option<bool>,
   pub error: Option<String>,
 }

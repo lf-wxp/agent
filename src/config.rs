@@ -20,11 +20,17 @@ const ENV_LOG_LEVEL: &str = "RUST_LOG";
 /// Environment variable: force a specific structured-output mode, `json_schema` / `json_object`.
 const ENV_STRUCTURED_MODE: &str = "LLM_STRUCTURED_MODE";
 
+/// Environment variable: rounds of tool execution allowed before a final answer is forced.
+const ENV_MAX_TOOL_ROUNDS: &str = "LLM_MAX_TOOL_ROUNDS";
+
 /// Model used when `LLM_MODEL` is not configured.
 const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 
 /// Default max concurrency: most LLM services rate-limit requests per minute, so default conservatively to 3.
 const DEFAULT_MAX_CONCURRENCY: usize = 3;
+
+/// Default tool-round budget: enough for multi-step tasks while keeping cost bounded.
+const DEFAULT_MAX_TOOL_ROUNDS: usize = 10;
 
 static MODEL: LazyLock<String> =
   LazyLock::new(|| non_empty_var(ENV_MODEL).unwrap_or_else(|| DEFAULT_MODEL.to_owned()));
@@ -54,6 +60,16 @@ pub fn log_level() -> Level {
 /// Returns a raw string instead of an enum: let the `llm` layer parse it so the config layer does not depend on concrete implementation types.
 pub fn structured_mode_override() -> Option<String> {
   non_empty_var(ENV_STRUCTURED_MODE)
+}
+
+/// Rounds of tool execution allowed before tools are disabled and the model must answer
+/// from what it already gathered. Override with `LLM_MAX_TOOL_ROUNDS`.
+///
+/// Unlike the other limits, `0` is meaningful here: it disables tool calling entirely.
+pub fn max_tool_rounds() -> usize {
+  non_empty_var(ENV_MAX_TOOL_ROUNDS)
+    .and_then(|value| value.parse::<usize>().ok())
+    .unwrap_or(DEFAULT_MAX_TOOL_ROUNDS)
 }
 
 /// Read an environment variable and trim leading/trailing whitespace; unset or blank is treated as not configured.

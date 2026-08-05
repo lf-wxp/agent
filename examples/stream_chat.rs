@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
     set.spawn(
       async move {
         let _permit = get_semaphore().acquire().await?;
-        let output = chat_stream_with_retry(model, Some(SYSTEM_PROMPT), prompt).await?;
+        let output = chat_stream_with_retry(model, Some(SYSTEM_PROMPT), prompt, &[]).await?;
         Ok::<_, anyhow::Error>((prompt, output))
       }
       .instrument(span),
