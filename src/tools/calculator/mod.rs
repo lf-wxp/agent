@@ -7,9 +7,36 @@ pub mod definition;
 pub mod execute;
 
 use serde::Deserialize;
+use serde_json::Value;
+
+use crate::tools::tool::Tool;
 
 /// Tool name, used both in the definition and in dispatch.
 pub const NAME: &str = "calculator";
+
+/// Basic arithmetic, exposed to the model as a [`Tool`].
+#[derive(Debug, Clone, Copy)]
+pub struct Calculator;
+
+#[async_trait::async_trait]
+impl Tool for Calculator {
+  fn name(&self) -> &str {
+    NAME
+  }
+
+  fn description(&self) -> &str {
+    definition::DESCRIPTION
+  }
+
+  fn parameters(&self) -> Value {
+    definition::parameters()
+  }
+
+  async fn execute(&self, args_json: &str) -> anyhow::Result<String> {
+    // Pure CPU work: nothing to await, and fast enough not to need spawn_blocking.
+    execute::run(args_json)
+  }
+}
 
 /// Supported arithmetic operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -61,5 +88,15 @@ mod tests {
         "schema value {json} must deserialize back"
       );
     }
+  }
+
+  #[tokio::test]
+  async fn executes_through_the_trait() {
+    let output = Calculator
+      .execute(r#"{"operator":"add","first_number":1,"second_number":2}"#)
+      .await
+      .unwrap();
+
+    assert_eq!(output, "3");
   }
 }

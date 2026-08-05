@@ -7,6 +7,9 @@ pub mod definition;
 pub mod execute;
 
 use serde::Deserialize;
+use serde_json::Value;
+
+use crate::tools::tool::Tool;
 
 /// Tool name, used both in the definition and in dispatch.
 pub const NAME: &str = "web_search";
@@ -16,6 +19,29 @@ pub const DEFAULT_MAX_RESULTS: u8 = 5;
 
 /// Tavily rejects `max_results` above 20 with a 400.
 pub const MAX_RESULTS_LIMIT: u8 = 20;
+
+/// Tavily-backed web search, exposed to the model as a [`Tool`].
+#[derive(Debug, Clone, Copy)]
+pub struct WebSearch;
+
+#[async_trait::async_trait]
+impl Tool for WebSearch {
+  fn name(&self) -> &str {
+    NAME
+  }
+
+  fn description(&self) -> &str {
+    definition::DESCRIPTION
+  }
+
+  fn parameters(&self) -> Value {
+    definition::parameters()
+  }
+
+  async fn execute(&self, args_json: &str) -> anyhow::Result<String> {
+    execute::run(args_json).await
+  }
+}
 
 /// Arguments as produced by the model.
 #[derive(Debug, Deserialize)]
@@ -77,5 +103,11 @@ mod tests {
   #[test]
   fn requires_query() {
     assert!(serde_json::from_str::<WebSearchArgs>(r#"{"max_results":3}"#).is_err());
+  }
+
+  #[tokio::test]
+  async fn rejects_malformed_arguments_through_the_trait() {
+    // No network involved: parsing fails before any request is made.
+    assert!(WebSearch.execute("not json").await.is_err());
   }
 }

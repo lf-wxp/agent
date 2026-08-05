@@ -1,11 +1,8 @@
+use anyhow::Context;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::{
-  config, http,
-  tools::web_search::{NAME, WebSearchArgs},
-  util::truncate_chars,
-};
+use crate::{config, http, tools::web_search::WebSearchArgs, util::truncate_chars};
 
 /// Tavily search endpoint.
 const TAVILY_ENDPOINT: &str = "https://api.tavily.com/search";
@@ -36,23 +33,13 @@ struct TavilyResult {
 
 /// Run the tool against the raw JSON arguments produced by the model.
 ///
-/// Returns a string in both the success and failure cases: tool errors are fed back as
-/// tool messages so the model can rephrase the query or work around the failure, rather
-/// than aborting the whole conversation.
-pub async fn run(arguments: &str) -> String {
-  let args = match serde_json::from_str::<WebSearchArgs>(arguments) {
-    Ok(args) => args,
-    Err(err) => return format!("Error: invalid arguments: {err}"),
-  };
+/// Errors are returned rather than formatted: the registry turns them into a tool message
+/// so the model can rephrase the query or work around the failure.
+pub async fn run(arguments: &str) -> anyhow::Result<String> {
+  let args =
+    serde_json::from_str::<WebSearchArgs>(arguments).context("invalid web_search arguments")?;
 
-  match search(&args).await {
-    Ok(response) => render(&response),
-    Err(err) => {
-      // Keep the full chain in the logs; the model only needs the summary.
-      tracing::warn!("{NAME} failed: {err:#}");
-      format!("Error: {err}")
-    }
-  }
+  Ok(render(&search(&args).await?))
 }
 
 /// Issue the search request.
@@ -236,11 +223,8 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn reports_malformed_arguments_as_text() {
-    assert!(
-      run("not json")
-        .await
-        .starts_with("Error: invalid arguments")
-    );
+  async fn rejects_malformed_json() {
+    // Parsing fails before any request is made, so this needs no network.
+    assert!(run("not json").await.is_err());
   }
 }
