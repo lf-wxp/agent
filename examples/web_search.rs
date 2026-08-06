@@ -1,4 +1,9 @@
-use agent::{config, llm::complete::chat_complete, telemetry, tools::ToolRegistry};
+use agent::{
+  config,
+  llm::{complete::chat_complete, provider::Provider},
+  telemetry,
+  tools::ToolRegistry,
+};
 
 const SYSTEM_PROMPT: &str = "You are a general-purpose assistant. When you use search \
                              results, cite the source URL.";
@@ -9,6 +14,7 @@ async fn main() -> anyhow::Result<()> {
 
   // Needs fresh information, so the model has to reach for the web_search tool.
   let answer = chat_complete(
+    Provider::shared(),
     config::model(),
     Some(SYSTEM_PROMPT),
     "What is the latest stable Rust version, and what did it change?",

@@ -13,7 +13,7 @@
 
 use agent::{
   config,
-  llm::complete::chat_complete,
+  llm::{complete::chat_complete, provider::Provider},
   telemetry,
   tools::{ToolRegistry, mcp::McpConnection},
 };
@@ -42,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
 
   // Needs both a remote tool (date arithmetic) and a local one (multiplication).
   let answer = chat_complete(
+    Provider::shared(),
     config::model(),
     Some(SYSTEM_PROMPT),
     "How many days are there from 2026-08-06 to 2026-12-25? \

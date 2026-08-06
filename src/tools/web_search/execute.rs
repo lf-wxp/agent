@@ -16,19 +16,19 @@ const ERROR_PREVIEW_CHARS: usize = 200;
 
 /// The subset of the Tavily response we use; unknown fields are ignored.
 #[derive(Debug, Deserialize)]
-struct TavilyResponse {
+pub struct TavilyResponse {
   /// Only present because the request sets `include_answer`.
   answer: Option<String>,
   /// Defaulted rather than required: an empty result set may omit the field entirely.
   #[serde(default)]
-  results: Vec<TavilyResult>,
+  pub results: Vec<TavilyResult>,
 }
 
 #[derive(Debug, Deserialize)]
-struct TavilyResult {
-  title: String,
-  url: String,
-  content: String,
+pub struct TavilyResult {
+  pub title: String,
+  pub url: String,
+  pub content: String,
 }
 
 /// Run the tool against the raw JSON arguments produced by the model.
@@ -43,7 +43,7 @@ pub async fn run(arguments: &str) -> anyhow::Result<String> {
 }
 
 /// Issue the search request.
-async fn search(args: &WebSearchArgs) -> anyhow::Result<TavilyResponse> {
+pub async fn search(args: &WebSearchArgs) -> anyhow::Result<TavilyResponse> {
   let query = args.query.trim();
   anyhow::ensure!(!query.is_empty(), "query must not be empty");
 

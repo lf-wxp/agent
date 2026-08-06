@@ -10,7 +10,10 @@
 
 use std::sync::Arc;
 
-use agent::{Agent, config, models::action_plan::ActionPlan, telemetry, tools::ToolRegistry};
+use agent::{
+  Agent, config, llm::provider::Provider, models::action_plan::ActionPlan, telemetry,
+  tools::ToolRegistry,
+};
 
 const SYSTEM_PROMPT: &str = "You are a general-purpose assistant.";
 
@@ -19,7 +22,12 @@ async fn main() -> anyhow::Result<()> {
   telemetry::init()?;
 
   let toolbox = Arc::new(ToolRegistry::builtin()?);
-  let agent = Agent::new(config::model(), Some(SYSTEM_PROMPT), Arc::clone(&toolbox));
+  let agent = Agent::new(
+    Provider::shared().clone(),
+    config::model(),
+    Some(SYSTEM_PROMPT),
+    Arc::clone(&toolbox),
+  );
 
   // Arithmetic: the model is expected to call the calculator tool along the way.
   let result = agent

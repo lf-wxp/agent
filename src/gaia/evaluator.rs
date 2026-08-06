@@ -4,6 +4,7 @@ use crate::gaia::{
   models::{GaiaEvalResult, GaiaRow, Solution},
   solver::solve_problem_with_retry,
 };
+use crate::llm::provider::Provider;
 use crate::tools::ToolRegistry;
 
 pub const GAIA_PROMPT: &str = r#"You are a general AI assistant. I will ask you a question.
@@ -57,12 +58,14 @@ fn to_eval_result(
 }
 
 pub async fn evaluate_gaia_single(
+  provider: &Provider,
   problem: GaiaRow,
   model: &str,
   registry: &ToolRegistry,
 ) -> GaiaEvalResult {
   let system = system_prompt(registry);
-  let result = solve_problem_with_retry(model, &system, &problem.question, registry).await;
+  let result =
+    solve_problem_with_retry(provider, model, &system, &problem.question, registry).await;
   to_eval_result(problem, model, result)
 }
 

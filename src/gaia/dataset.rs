@@ -1,6 +1,7 @@
 use reqwest::StatusCode;
 
 use crate::{
+  config,
   gaia::models::{GaiaRow, HfResponse},
   http,
   util::truncate_chars,
@@ -30,7 +31,7 @@ pub async fn load_gaia_rows(
     "length must be in 1..={MAX_ROWS_PER_REQUEST}, got {length}"
   );
 
-  let token = std::env::var("HF_TOKEN").map_err(|_| {
+  let token = config::hf_token().ok_or_else(|| {
     anyhow::anyhow!(
       "HF_TOKEN is not set; create a read token at https://huggingface.co/settings/tokens"
     )

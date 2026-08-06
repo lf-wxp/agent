@@ -32,11 +32,48 @@ const ENV_MAX_TOOL_ROUNDS: &str = "LLM_MAX_TOOL_ROUNDS";
 /// Environment variable: path to the MCP server config file.
 const ENV_MCP_CONFIG_PATH: &str = "MCP_CONFIG_PATH";
 
+/// Environment variable: address the HTTP agent server ([`crate::api`]) listens on.
+const ENV_HTTP_ADDR: &str = "AGENT_HTTP_ADDR";
+
+/// Environment variable: path to the tenant config file used by the HTTP agent server.
+const ENV_TENANTS_CONFIG_PATH: &str = "AGENT_TENANTS_PATH";
+
+/// Environment variable: idle timeout (seconds) for HTTP multi-turn sessions before
+/// [`crate::api::session::SessionStore`] evicts them.
+const ENV_SESSION_TTL_SECS: &str = "AGENT_SESSION_TTL_SECS";
+
+/// Environment variable: how long (seconds) a successful `POST /v1/agent/run` response
+/// is cached against its `Idempotency-Key` before [`crate::api::idempotency::IdempotencyStore`]
+/// evicts it.
+const ENV_IDEMPOTENCY_TTL_SECS: &str = "AGENT_IDEMPOTENCY_TTL_SECS";
+
+/// Environment variable: soft token budget for conversation history passed to
+/// [`crate::agent::Agent::run_continuing`]; see [`crate::agent::history::trim_to_budget`].
+const ENV_MAX_HISTORY_TOKENS: &str = "LLM_MAX_HISTORY_TOKENS";
+
 /// Environment variable: Tavily API key, used by the `web_search` tool.
 const ENV_TAVILY_API_KEY: &str = "TAVILY_API_KEY";
 
+/// Environment variable: Hugging Face read token, used by the `gaia` dataset loader.
+const ENV_HF_TOKEN: &str = "HF_TOKEN";
+
 /// Environment variable: Tavily search depth, `basic` / `advanced` / `fast` / `ultra-fast`.
 const ENV_TAVILY_SEARCH_DEPTH: &str = "TAVILY_SEARCH_DEPTH";
+
+/// Environment variable: Tavily search depth, `basic` / `advanced` / `fast` / `ultra-fast`.
+const ENV_EMBED_MODEL: &str = "EMBED_MODEL";
+
+/// Environment variable: base URL for the embeddings API.
+///
+/// Chat completions and embeddings often need different providers (e.g. a reasoning-only
+/// model has no embeddings endpoint), so this is deliberately separate from
+/// `OPENAI_BASE_URL`. Unset falls back to it, so a single OpenAI-compatible provider that
+/// serves both still works with no extra configuration.
+const ENV_EMBED_BASE_URL: &str = "EMBED_BASE_URL";
+
+/// Environment variable: API key for the embeddings API. Unset falls back to `OPENAI_API_KEY`,
+/// see [`ENV_EMBED_BASE_URL`].
+const ENV_EMBED_API_KEY: &str = "EMBED_API_KEY";
 
 /// Model used when `LLM_MODEL` is not configured.
 const DEFAULT_MODEL: &str = "deepseek-v4-flash";
@@ -49,6 +86,25 @@ const DEFAULT_MAX_TOOL_ROUNDS: usize = 10;
 
 /// Default MCP config location, relative to the working directory.
 const DEFAULT_MCP_CONFIG_PATH: &str = "mcp.json";
+
+/// Default address for the HTTP agent server.
+const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:8080";
+
+/// Default tenant config location, relative to the working directory.
+const DEFAULT_TENANTS_CONFIG_PATH: &str = "tenants.json";
+
+/// Default idle timeout for HTTP multi-turn sessions: 30 minutes.
+const DEFAULT_SESSION_TTL_SECS: u64 = 1800;
+
+/// Default cache lifetime for an idempotency key: 24 hours, the same window Stripe uses
+/// for its `Idempotency-Key` header.
+const DEFAULT_IDEMPOTENCY_TTL_SECS: u64 = 86_400;
+
+/// Default soft token budget for conversation history. Deliberately well under typical
+/// 32k-128k model context windows: it leaves headroom for the system prompt, tool
+/// definitions, and the model's own output, and keeps per-turn cost bounded for models
+/// billed by input tokens.
+const DEFAULT_MAX_HISTORY_TOKENS: usize = 6_000;
 
 /// Default Tavily search depth: `basic` costs 1 credit and balances latency against relevance.
 const DEFAULT_TAVILY_SEARCH_DEPTH: &str = "basic";
@@ -129,9 +185,61 @@ pub fn mcp_config_path() -> PathBuf {
     .unwrap_or_else(|| PathBuf::from(DEFAULT_MCP_CONFIG_PATH))
 }
 
+/// Address the HTTP agent server ([`crate::api`]) binds to. Override with `AGENT_HTTP_ADDR`.
+pub fn http_addr() -> String {
+  non_empty_var(ENV_HTTP_ADDR).unwrap_or_else(|| DEFAULT_HTTP_ADDR.to_owned())
+}
+
+/// Path to the tenant config file used by [`crate::api::tenant::TenantRegistry`].
+/// Override with `AGENT_TENANTS_PATH`.
+pub fn tenants_config_path() -> PathBuf {
+  non_empty_var(ENV_TENANTS_CONFIG_PATH)
+    .map(PathBuf::from)
+    .unwrap_or_else(|| PathBuf::from(DEFAULT_TENANTS_CONFIG_PATH))
+}
+
+/// How long an idle multi-turn HTTP session ([`crate::api::session::SessionStore`]) is
+/// kept before eviction. Override with `AGENT_SESSION_TTL_SECS`; invalid values
+/// (non-numeric or 0) fall back to the default.
+pub fn session_ttl() -> std::time::Duration {
+  let secs = non_empty_var(ENV_SESSION_TTL_SECS)
+    .and_then(|value| value.parse::<u64>().ok())
+    .filter(|value| *value > 0)
+    .unwrap_or(DEFAULT_SESSION_TTL_SECS);
+  std::time::Duration::from_secs(secs)
+}
+
+/// How long a cached response stays valid for its `Idempotency-Key`
+/// ([`crate::api::idempotency::IdempotencyStore`]). Override with
+/// `AGENT_IDEMPOTENCY_TTL_SECS`; invalid values (non-numeric or 0) fall back to the
+/// default.
+pub fn idempotency_ttl() -> std::time::Duration {
+  let secs = non_empty_var(ENV_IDEMPOTENCY_TTL_SECS)
+    .and_then(|value| value.parse::<u64>().ok())
+    .filter(|value| *value > 0)
+    .unwrap_or(DEFAULT_IDEMPOTENCY_TTL_SECS);
+  std::time::Duration::from_secs(secs)
+}
+
+/// Soft token budget for conversation history handed to [`crate::agent::Agent::run_continuing`]
+/// (see [`crate::agent::history::trim_to_budget`]). Override with `LLM_MAX_HISTORY_TOKENS`;
+/// invalid values (non-numeric or 0) fall back to the default.
+pub fn max_history_tokens() -> usize {
+  non_empty_var(ENV_MAX_HISTORY_TOKENS)
+    .and_then(|value| value.parse::<usize>().ok())
+    .filter(|value| *value > 0)
+    .unwrap_or(DEFAULT_MAX_HISTORY_TOKENS)
+}
+
 /// Tavily API key used by the `web_search` tool. `None` when unset.
 pub fn tavily_api_key() -> Option<String> {
   non_empty_var(ENV_TAVILY_API_KEY)
+}
+
+/// Hugging Face read token used by [`crate::gaia::dataset`] to fetch the GAIA dataset.
+/// `None` when unset. Create one at <https://huggingface.co/settings/tokens>.
+pub fn hf_token() -> Option<String> {
+  non_empty_var(ENV_HF_TOKEN)
 }
 
 /// Tavily search depth. Override with `TAVILY_SEARCH_DEPTH`.
@@ -140,6 +248,23 @@ pub fn tavily_api_key() -> Option<String> {
 /// configured here rather than exposed in the tool schema for the model to pick.
 pub fn tavily_search_depth() -> String {
   non_empty_var(ENV_TAVILY_SEARCH_DEPTH).unwrap_or_else(|| DEFAULT_TAVILY_SEARCH_DEPTH.to_owned())
+}
+
+/// Tavily API key used by the `web_search` tool. `None` when unset.
+pub fn embed_model() -> Option<String> {
+  non_empty_var(ENV_EMBED_MODEL)
+}
+
+/// Base URL for the embeddings API. Override with `EMBED_BASE_URL`; `None` when unset,
+/// letting the caller fall back to the default OpenAI-compatible base URL.
+pub fn embed_base_url() -> Option<String> {
+  non_empty_var(ENV_EMBED_BASE_URL)
+}
+
+/// API key for the embeddings API. Override with `EMBED_API_KEY`; `None` when unset,
+/// letting the caller fall back to `OPENAI_API_KEY`.
+pub fn embed_api_key() -> Option<String> {
+  non_empty_var(ENV_EMBED_API_KEY)
 }
 
 /// Read an environment variable and trim leading/trailing whitespace; unset or blank is treated as not configured.

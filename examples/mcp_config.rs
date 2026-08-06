@@ -12,7 +12,12 @@
 //! Without a config file this falls back to the built-in tools, which is the same thing
 //! that happens in a fresh checkout.
 
-use agent::{config, llm::complete::chat_complete, telemetry, tools::ToolRegistry};
+use agent::{
+  config,
+  llm::{complete::chat_complete, provider::Provider},
+  telemetry,
+  tools::ToolRegistry,
+};
 
 const SYSTEM_PROMPT: &str = "You are a general-purpose assistant. Prefer tools over \
                              guessing for dates and arithmetic.";
@@ -29,6 +34,7 @@ async fn main() -> anyhow::Result<()> {
   tracing::info!(?registry, servers = connections.len(), "registry ready");
 
   let answer = chat_complete(
+    Provider::shared(),
     config::model(),
     Some(SYSTEM_PROMPT),
     "How many days are there from 2026-08-06 to 2026-12-25?",

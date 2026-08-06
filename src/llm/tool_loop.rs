@@ -12,13 +12,22 @@ use async_openai::types::chat::{
   ChatCompletionToolChoiceOption, ChatCompletionTools, CreateChatCompletionRequestArgs,
   FunctionCall, ResponseFormat, ToolChoiceOptions,
 };
+use futures::future::join_all;
 
 use crate::{
   agent::ExecutionContext,
   config,
-  llm::client::{client, first_choice, request_builder},
+  llm::{
+    client::{first_choice, request_builder},
+    provider::Provider,
+  },
   tools::ToolRegistry,
+  util::truncate_chars,
 };
+
+/// Chars of tool arguments/results kept in debug logs, to avoid dumping large or
+/// sensitive payloads in full.
+const TOOL_LOG_PREVIEW_CHARS: usize = 500;
 
 /// The outcome of a tool-enabled completion.
 #[derive(Debug)]
@@ -56,7 +65,13 @@ impl fmt::Display for BudgetExhausted {
 /// one last request goes out with tools disabled, so a long task still returns an answer
 /// built from the results already gathered instead of losing all of that work. That case
 /// is flagged through [`Completion::budget_exhausted`].
+///
+/// `provider` supplies both the credentials for the model call and the concurrency slot
+/// it is charged against (see [`Provider::acquire`]) — held only for the duration of that
+/// one call, not the whole loop, so time spent running tools does not also block other
+/// callers sharing the same provider from reaching the model.
 pub async fn run(
+  provider: &Provider,
   model: &str,
   mut messages: Vec<ChatCompletionRequestMessage>,
   registry: &ToolRegistry,
@@ -87,7 +102,10 @@ pub async fn run(
       );
     }
 
-    let response = client().chat().create(builder.build()?).await?;
+    let response = {
+      let _permit = provider.acquire().await?;
+      provider.client().chat().create(builder.build()?).await?
+    };
     // The full response can be long; only log metadata to inspect usage and trace id.
     tracing::debug!(id = %response.id, round, usage = ?response.usage, "completion finished");
 
@@ -158,8 +176,16 @@ pub(crate) async fn append_tool_results(
   }
   messages.push(assistant.build()?.into());
 
-  for tool_call in tool_calls {
-    let (id, result) = execute(registry, tool_call).await;
+  // Independent tool calls in the same round are executed concurrently: sequential
+  // awaits would otherwise add up their network latency instead of overlapping it.
+  let results = join_all(
+    tool_calls
+      .into_iter()
+      .map(|tool_call| execute(registry, tool_call)),
+  )
+  .await;
+
+  for (id, result) in results {
     messages.push(
       ChatCompletionRequestToolMessageArgs::default()
         .tool_call_id(id)
@@ -182,11 +208,19 @@ async fn execute(
       id,
       function: FunctionCall { name, arguments },
     }) => {
-      tracing::info!(tool = %name, %arguments, "executing tool");
+      tracing::debug!(
+        tool = %name,
+        arguments = %truncate_chars(&arguments, TOOL_LOG_PREVIEW_CHARS),
+        "executing tool"
+      );
       let result = registry
         .execute(&name, &arguments, &ExecutionContext::default())
         .await;
-      tracing::info!(tool = %name, %result, "tool finished");
+      tracing::debug!(
+        tool = %name,
+        result = %truncate_chars(&result, TOOL_LOG_PREVIEW_CHARS),
+        "tool finished"
+      );
       (id, result)
     }
     // Custom tools are not supported yet, but still need a reply to keep the

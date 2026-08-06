@@ -1,32 +1,19 @@
-//! Common construction layer for LLM requests: shared client, message assembly, and request skeleton.
+//! Common construction layer for LLM requests: message assembly and request skeleton.
 //!
 //! `complete` / `stream` / `structured` differ only in "extra request parameters" and "response
-//! parsing"; the common parts are unified here.
+//! parsing"; the common parts are unified here. The client itself now lives on
+//! [`crate::llm::provider::Provider`] (per-tenant), not here.
 
-use std::sync::LazyLock;
-
-use async_openai::{
-  Client,
-  config::OpenAIConfig,
-  types::chat::{
-    ChatChoice, ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-    ChatCompletionRequestUserMessageArgs, ChatCompletionTools, CreateChatCompletionRequestArgs,
-    CreateChatCompletionResponse,
-  },
+use async_openai::types::chat::{
+  ChatChoice, ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
+  ChatCompletionRequestUserMessageArgs, ChatCompletionTools, CreateChatCompletionRequestArgs,
+  CreateChatCompletionResponse,
 };
 
 /// Output token budget for normal conversations.
 ///
 /// Structured / reasoning scenarios need a larger budget; see `structured::NATIVE_SCHEMA_MAX_TOKENS`.
 pub const DEFAULT_MAX_TOKENS: u32 = 2048;
-
-/// Reuse a single client within the process: avoid rebuilding the connection pool and re-reading env vars on every call.
-static CLIENT: LazyLock<Client<OpenAIConfig>> = LazyLock::new(Client::new);
-
-/// Get the shared client.
-pub fn client() -> &'static Client<OpenAIConfig> {
-  &CLIENT
-}
 
 /// Empty parameters cause a request that is guaranteed to fail; intercept early.
 pub fn ensure_valid_params(model: &str, prompt: &str) -> anyhow::Result<()> {

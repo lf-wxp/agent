@@ -14,6 +14,7 @@ use crate::{
   config,
   llm::{
     client::{build_messages, ensure_valid_params},
+    provider::Provider,
     schema::{merge_system, native_schema_format, schema_instruction, strip_code_fence},
     tool_loop::{self, BudgetExhausted},
   },
@@ -207,7 +208,11 @@ fn tag_budget(err: anyhow::Error, budget_exhausted: bool) -> anyhow::Error {
 ///
 /// Use this when you need special handling based on `finish_reason` (e.g. content filtering, see `gaia::solver`);
 /// otherwise use [`chat_complete_structured`] directly.
+///
+/// `provider` selects which tenant's credentials and concurrency budget the request is
+/// charged against; pass [`Provider::shared`] for the single-tenant default.
 pub async fn chat_complete_structured_raw<T: JsonSchema>(
+  provider: &Provider,
   model: &str,
   system: Option<&str>,
   prompt: &str,
@@ -229,6 +234,7 @@ pub async fn chat_complete_structured_raw<T: JsonSchema>(
   // Goes through the tool loop so a structured request can also use tools: without it the
   // model's tool call would leave `content` empty and surface as a bogus parse error.
   let completion = tool_loop::run(
+    provider,
     model,
     build_messages(system_content.as_deref(), prompt)?,
     registry,
@@ -246,6 +252,7 @@ pub async fn chat_complete_structured_raw<T: JsonSchema>(
 
 /// Convenience wrapper: one request + parse.
 pub async fn chat_complete_structured<T>(
+  provider: &Provider,
   model: &str,
   system: Option<&str>,
   prompt: &str,
@@ -254,7 +261,7 @@ pub async fn chat_complete_structured<T>(
 where
   T: JsonSchema + DeserializeOwned,
 {
-  chat_complete_structured_raw::<T>(model, system, prompt, registry)
+  chat_complete_structured_raw::<T>(provider, model, system, prompt, registry)
     .await?
     .parse()
 }

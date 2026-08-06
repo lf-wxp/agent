@@ -7,10 +7,10 @@ use async_openai::types::chat::ChatCompletionTools;
 use crate::{
   agent::ExecutionContext,
   tools::{
-    calculator::Calculator,
+    calculator::{self, Calculator},
     mcp::{McpConfig, McpConnection},
     tool::Tool,
-    web_search::WebSearch,
+    web_search::{self, WebSearch},
   },
 };
 
@@ -38,6 +38,25 @@ impl ToolRegistry {
     let mut registry = Self::empty();
     registry.add(Arc::new(Calculator))?;
     registry.add(Arc::new(WebSearch))?;
+    Ok(registry)
+  }
+
+  /// A registry containing exactly the named built-in tools, e.g. `["calculator"]`.
+  ///
+  /// For callers (the HTTP agent API, see [`crate::api`]) that let a request pick a
+  /// subset of tools by name rather than always getting the full [`Self::builtin`] set.
+  /// MCP tools are not selectable this way: they only exist once discovered from
+  /// `mcp.json` (see [`Self::with_mcp`]), so there is no name to select before that.
+  pub fn select(names: &[String]) -> anyhow::Result<Self> {
+    let mut registry = Self::empty();
+    for name in names {
+      let tool: Arc<dyn Tool> = match name.as_str() {
+        calculator::NAME => Arc::new(Calculator),
+        web_search::NAME => Arc::new(WebSearch),
+        other => anyhow::bail!("unknown tool `{other}`"),
+      };
+      registry.add(tool)?;
+    }
     Ok(registry)
   }
 
@@ -185,6 +204,24 @@ mod tests {
     assert_eq!(registry.len(), registry.definitions().len());
     assert!(registry.contains(calculator::NAME));
     assert!(registry.contains(web_search::NAME));
+  }
+
+  #[test]
+  fn select_builds_only_the_named_tools() {
+    let registry = ToolRegistry::select(&[calculator::NAME.to_owned()]).unwrap();
+    assert!(registry.contains(calculator::NAME));
+    assert!(!registry.contains(web_search::NAME));
+  }
+
+  #[test]
+  fn select_rejects_unknown_tool_names() {
+    let err = ToolRegistry::select(&["nope".to_owned()]).unwrap_err();
+    assert!(err.to_string().contains("unknown tool"));
+  }
+
+  #[test]
+  fn select_of_empty_list_is_the_empty_registry() {
+    assert!(ToolRegistry::select(&[]).unwrap().is_empty());
   }
 
   #[test]

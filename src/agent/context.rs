@@ -1,6 +1,3 @@
-use std::collections::HashMap;
-
-use serde_json::Value;
 use uuid::Uuid;
 
 use super::event::Event;
@@ -25,7 +22,6 @@ pub struct ExecutionContext {
   pub execution_id: String,
   pub events: Vec<Event>,
   pub current_step: u32,
-  pub state: HashMap<String, Value>,
   pub final_result: Option<String>,
   pub usage: TokenUsage,
 }
@@ -36,7 +32,6 @@ impl ExecutionContext {
       execution_id: Uuid::new_v4().to_string(),
       events: Vec::new(),
       current_step: 0,
-      state: HashMap::new(),
       final_result: None,
       usage: TokenUsage::default(),
     }

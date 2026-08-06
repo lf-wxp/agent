@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use agent::{
   config,
   gaia::{dataset::load_gaia_level1, evaluator::evaluate_gaia_single, models::GaiaEvalResult},
-  llm::semaphore::get_semaphore,
+  llm::provider::Provider,
   telemetry,
   tools::ToolRegistry,
 };
@@ -27,6 +27,10 @@ pub async fn gaia_level1_experiment() -> anyhow::Result<()> {
 
   // Fetch once up front: `config::model()` returns a 'static value, so it can be moved into each task directly.
   let model = config::model();
+  // Concurrency is enforced inside every model call now (see `Provider::acquire`), not by
+  // holding a permit for a whole task here, so tasks waiting on tool I/O no longer starve
+  // others out of their turn on the shared budget.
+  let provider = Provider::shared();
 
   // Both arms run the same problems, so the comparison is paired rather than across samples.
   // `Arc` because each spawned task needs its own handle on the shared registry.
@@ -41,8 +45,7 @@ pub async fn gaia_level1_experiment() -> anyhow::Result<()> {
     for problem in problems.iter().cloned() {
       let registry = Arc::clone(&registry);
       set.spawn(async move {
-        let _permit = get_semaphore().acquire().await?;
-        let eval = evaluate_gaia_single(problem, model, &registry).await;
+        let eval = evaluate_gaia_single(provider, problem, model, &registry).await;
         Ok::<_, anyhow::Error>((group, eval))
       });
     }

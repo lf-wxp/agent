@@ -1,6 +1,6 @@
 use agent::{
   config,
-  llm::{semaphore::get_semaphore, stream::chat_stream_with_retry},
+  llm::{provider::Provider, stream::chat_stream_with_retry},
   telemetry,
   tools::ToolRegistry,
 };
@@ -27,16 +27,23 @@ async fn main() -> anyhow::Result<()> {
 
   // Fetch once up front: `config::model()` returns a 'static value, so it can be moved into each task directly.
   let model = config::model();
+  // Concurrency is enforced inside `chat_stream_with_retry` itself now (see
+  // `Provider::acquire`), so tasks no longer need to acquire a permit by hand.
+  let provider = Provider::shared();
 
   let mut set = JoinSet::new();
   for prompt in prompts {
     let span = tracing::info_span!("chat", prompt);
     set.spawn(
       async move {
-        let _permit = get_semaphore().acquire().await?;
-        let output =
-          chat_stream_with_retry(model, Some(SYSTEM_PROMPT), prompt, &ToolRegistry::empty())
-            .await?;
+        let output = chat_stream_with_retry(
+          provider,
+          model,
+          Some(SYSTEM_PROMPT),
+          prompt,
+          &ToolRegistry::empty(),
+        )
+        .await?;
         Ok::<_, anyhow::Error>((prompt, output))
       }
       .instrument(span),

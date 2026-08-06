@@ -1,4 +1,9 @@
-use agent::{config, llm::complete::chat_complete, telemetry, tools::ToolRegistry};
+use agent::{
+  config,
+  llm::{complete::chat_complete, provider::Provider},
+  telemetry,
+  tools::ToolRegistry,
+};
 
 const SYSTEM_PROMPT: &str = "You are a general-purpose assistant";
 
@@ -6,15 +11,24 @@ const SYSTEM_PROMPT: &str = "You are a general-purpose assistant";
 async fn main() -> anyhow::Result<()> {
   telemetry::init()?;
 
+  let provider = Provider::shared();
   let model = config::model();
   let registry = ToolRegistry::builtin()?;
 
   // No tool needed: the model should answer directly.
-  let answer = chat_complete(model, Some(SYSTEM_PROMPT), "尼泊尔的首都是哪里", &registry).await?;
+  let answer = chat_complete(
+    provider,
+    model,
+    Some(SYSTEM_PROMPT),
+    "尼泊尔的首都是哪里",
+    &registry,
+  )
+  .await?;
   tracing::info!("Response one: {answer}");
 
   // Arithmetic: the model is expected to call the calculator tool.
   let answer = chat_complete(
+    provider,
     model,
     Some(SYSTEM_PROMPT),
     "5875 乘以 467 是多少",

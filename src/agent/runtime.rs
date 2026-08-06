@@ -10,6 +10,15 @@
 //! ported by hand.
 //!
 //! Known gap versus `tool_loop`: no streaming counterpart yet (see [`crate::llm::stream`]).
+//!
+//! Multi-turn conversations are supported via [`Agent::run_continuing`], which seeds a
+//! call with a prior turn's events instead of starting from an empty transcript. `Agent`
+//! itself stays a stateless function of "prior events + new input": it does not own a
+//! session/storage concept, that lives one layer up (see [`crate::api::session`] for how
+//! the HTTP API persists history across requests). It does, however, cap how much of
+//! that history it will actually send per call (see [`Self::with_max_history_tokens`] and
+//! [`crate::agent::history::trim_to_budget`]), since an unbounded session could otherwise
+//! grow past the model's context window.
 
 use std::sync::Arc;
 
@@ -20,11 +29,13 @@ use async_openai::types::chat::{
   ChatCompletionRequestUserMessageArgs, ChatCompletionToolChoiceOption, ChatCompletionTools,
   CreateChatCompletionResponse, FinishReason, FunctionCall, ResponseFormat, ToolChoiceOptions,
 };
+use futures::future::join_all;
 
 use crate::{
   config,
   llm::{
-    client::{DEFAULT_MAX_TOKENS, client, first_choice, request_builder},
+    client::{DEFAULT_MAX_TOKENS, first_choice, request_builder},
+    provider::Provider,
     schema::{
       FINAL_ANSWER_TOOL_NAME, final_answer_tool, native_schema_format, schema_instruction,
       strip_code_fence,
@@ -33,12 +44,18 @@ use crate::{
     tool_loop::{BudgetExhausted, disable_tools},
   },
   tools::ToolRegistry,
+  util::truncate_chars,
 };
 
 use super::{
   context::ExecutionContext,
   event::{ContentItem, Event, ToolResultStatus},
 };
+
+/// Chars of tool arguments/results kept in debug logs, to avoid dumping large or
+/// sensitive payloads (e.g. fetched web content, credentials echoed by a misbehaving
+/// MCP server) into the log stream in full.
+const TOOL_LOG_PREVIEW_CHARS: usize = 500;
 
 /// Outcome of [`Agent::run`].
 #[derive(Debug)]
@@ -61,30 +78,41 @@ pub struct StructuredAgentResult<T> {
 
 /// Drives a model to a final answer, executing tool calls as it requests them.
 ///
-/// A value rather than a free function: `model`, `instructions` and the tool set are
-/// fixed for the lifetime of the agent, while each [`Self::run`] call gets its own fresh
-/// [`ExecutionContext`] so concurrent runs never share state.
+/// A value rather than a free function: `provider`, `model`, `instructions` and the tool
+/// set are fixed for the lifetime of the agent, while each [`Self::run`] call gets its
+/// own fresh [`ExecutionContext`] so concurrent runs never share state.
 pub struct Agent {
+  provider: Provider,
   model: String,
   instructions: Option<String>,
   toolbox: Arc<ToolRegistry>,
   max_steps: u32,
+  max_history_tokens: usize,
 }
 
 impl Agent {
   /// Rounds default to [`config::max_tool_rounds`], the same budget `tool_loop` uses, so
   /// the two do not silently drift apart; override with [`Self::with_max_steps`] when an
   /// agent needs a different budget than the rest of the process.
+  ///
+  /// `provider` is the tenant this agent talks to — its credentials and concurrency
+  /// budget (see [`Provider::acquire`]) are used for every request the agent makes. Pass
+  /// [`Provider::shared`] for the single-tenant default, or a tenant-specific
+  /// [`Provider::new`] to isolate this agent's traffic (rate limit, API key, base URL)
+  /// from other tenants running in the same process.
   pub fn new(
+    provider: Provider,
     model: impl Into<String>,
     instructions: Option<impl Into<String>>,
     toolbox: Arc<ToolRegistry>,
   ) -> Self {
     Self {
+      provider,
       model: model.into(),
       instructions: instructions.map(Into::into),
       toolbox,
       max_steps: config::max_tool_rounds() as u32,
+      max_history_tokens: config::max_history_tokens(),
     }
   }
 
@@ -96,25 +124,72 @@ impl Agent {
     self
   }
 
-  /// Run to a plain-text final answer.
+  /// Soft token budget for the `history` passed to [`Self::run_continuing`] — see
+  /// [`crate::agent::history::trim_to_budget`] for exactly how it is enforced (whole
+  /// turns dropped oldest-first, the most recent turn always kept). Defaults to
+  /// [`config::max_history_tokens`]; override when a particular agent talks to a model
+  /// with an unusually small or large context window.
+  pub fn with_max_history_tokens(mut self, max_history_tokens: usize) -> Self {
+    self.max_history_tokens = max_history_tokens;
+    self
+  }
+
+  /// Whether the current round may still call the real tools, and whether reaching this
+  /// point means the round budget just ran out (only meaningful when there are tools to
+  /// spend a budget on).
+  ///
+  /// Extracted because [`Self::run`], [`Self::run_structured_via_tool_choice`] and
+  /// [`Self::run_structured_via_response_format`] all make and log this same decision
+  /// once per round; keeping one copy means the "budget spent -> warn" policy cannot
+  /// drift between them.
+  fn round_budget(&self, context: &ExecutionContext) -> (bool, bool) {
+    let tools_allowed = tool_rounds_remaining(context.current_step, self.max_steps);
+    let budget_exhausted = !tools_allowed && !self.toolbox.is_empty();
+    if budget_exhausted {
+      tracing::warn!(
+        max_steps = self.max_steps,
+        "tool round budget spent; forcing a final answer"
+      );
+    }
+    (tools_allowed, budget_exhausted)
+  }
+
+  /// Run to a plain-text final answer, starting a brand-new conversation.
   ///
   /// Once the round budget ([`Self::with_max_steps`]) is spent, one last request goes out
   /// with tools disabled (see [`disable_tools`]) so a long task still returns an answer
   /// built from the results already gathered, instead of losing all of that work. That
   /// case is flagged through [`AgentResult::budget_exhausted`].
+  ///
+  /// Equivalent to [`Self::run_continuing`] with an empty history; use that instead to
+  /// send a follow-up turn in an existing conversation.
   pub async fn run(&self, user_input: &str) -> anyhow::Result<AgentResult> {
-    let mut context = ExecutionContext::new();
-    self.record_user_input(&mut context, user_input);
+    self.run_continuing(Vec::new(), user_input).await
+  }
+
+  /// Run to a plain-text final answer, continuing a conversation whose prior turns are
+  /// `history`.
+  ///
+  /// `history` is normally a previous call's `AgentResult::context.events` — keep it on
+  /// the caller's side (in memory, a database, an HTTP session store, ...) between calls
+  /// and hand it back here for the next turn, so the model sees the full exchange so
+  /// far. This is what makes multi-turn conversations possible without `Agent` itself
+  /// owning any session/storage concept: it stays a pure function of "prior events + new
+  /// input" (see [`crate::api::session`] for one way to manage that storage across HTTP
+  /// requests).
+  ///
+  /// The round budget ([`Self::with_max_steps`]) resets every call — `current_step`
+  /// starts back at zero — so a long conversation is never penalized for rounds already
+  /// spent on earlier turns; only this turn's own tool calls count against it.
+  pub async fn run_continuing(
+    &self,
+    history: Vec<Event>,
+    user_input: &str,
+  ) -> anyhow::Result<AgentResult> {
+    let mut context = self.seed_context(history, user_input);
 
     loop {
-      let tools_allowed = tool_rounds_remaining(context.current_step, self.max_steps);
-      let budget_exhausted = !tools_allowed && !self.toolbox.is_empty();
-      if budget_exhausted {
-        tracing::warn!(
-          max_steps = self.max_steps,
-          "tool round budget spent; forcing a final answer"
-        );
-      }
+      let (tools_allowed, budget_exhausted) = self.round_budget(&context);
 
       let messages = self.build_messages(&context)?;
       let mut builder = request_builder(
@@ -127,7 +202,15 @@ impl Agent {
         disable_tools(&mut builder, self.toolbox.definitions());
       }
 
-      let response = client().chat().create(builder.build()?).await?;
+      let response = {
+        let _permit = self.provider.acquire().await?;
+        self
+          .provider
+          .client()
+          .chat()
+          .create(builder.build()?)
+          .await?
+      };
       self.record_usage(&mut context, &response);
       let message = first_choice(response)?.message;
 
@@ -213,14 +296,7 @@ impl Agent {
     let final_answer_only = std::slice::from_ref(&final_answer);
 
     loop {
-      let tools_allowed = tool_rounds_remaining(context.current_step, self.max_steps);
-      let budget_exhausted = !tools_allowed && !self.toolbox.is_empty();
-      if budget_exhausted {
-        tracing::warn!(
-          max_steps = self.max_steps,
-          "tool round budget spent; forcing a final answer"
-        );
-      }
+      let (tools_allowed, budget_exhausted) = self.round_budget(&context);
 
       let definitions: &[ChatCompletionTools] = if tools_allowed {
         &tool_definitions
@@ -234,7 +310,15 @@ impl Agent {
         ToolChoiceOptions::Required,
       ));
 
-      let response = client().chat().create(builder.build()?).await?;
+      let response = {
+        let _permit = self.provider.acquire().await?;
+        self
+          .provider
+          .client()
+          .chat()
+          .create(builder.build()?)
+          .await?
+      };
       self.record_usage(&mut context, &response);
       let choice = first_choice(response)?;
 
@@ -330,14 +414,7 @@ impl Agent {
     self.record_user_input(&mut context, user_input);
 
     loop {
-      let tools_allowed = tool_rounds_remaining(context.current_step, self.max_steps);
-      let budget_exhausted = !tools_allowed && !self.toolbox.is_empty();
-      if budget_exhausted {
-        tracing::warn!(
-          max_steps = self.max_steps,
-          "tool round budget spent; forcing a final answer"
-        );
-      }
+      let (tools_allowed, budget_exhausted) = self.round_budget(&context);
 
       // Constrain the structure on **every** round, not just once tools look done: this
       // model picks when to stop calling tools and answer, and if that round were
@@ -360,7 +437,15 @@ impl Agent {
         disable_tools(&mut builder, self.toolbox.definitions());
       }
 
-      let response = client().chat().create(builder.build()?).await?;
+      let response = {
+        let _permit = self.provider.acquire().await?;
+        self
+          .provider
+          .client()
+          .chat()
+          .create(builder.build()?)
+          .await?
+      };
       self.record_usage(&mut context, &response);
       let choice = first_choice(response)?;
 
@@ -456,6 +541,18 @@ impl Agent {
     context.final_result = Some(raw_arguments);
   }
 
+  /// Build the starting [`ExecutionContext`] for a call: a fresh execution id and step
+  /// counter (see [`Self::run_continuing`] on why the round budget resets per call), with
+  /// `history` trimmed to [`Self::with_max_history_tokens`] (see
+  /// [`crate::agent::history::trim_to_budget`]) and spliced in as prior turns before the
+  /// new user input is recorded.
+  fn seed_context(&self, history: Vec<Event>, user_input: &str) -> ExecutionContext {
+    let mut context = ExecutionContext::new();
+    context.events = super::history::trim_to_budget(history, self.max_history_tokens);
+    self.record_user_input(&mut context, user_input);
+    context
+  }
+
   fn record_user_input(&self, context: &mut ExecutionContext, user_input: &str) {
     context.add_event(Event::new(
       context.execution_id.clone(),
@@ -517,48 +614,67 @@ impl Agent {
   /// Execute every call in one model turn, feeding each tool the same context the caller
   /// will get back — unlike [`ToolRegistry::execute`] (used by [`crate::llm::tool_loop`]),
   /// which only ever sees a throwaway [`ExecutionContext::default`].
+  ///
+  /// Calls run concurrently rather than one after another: every [`Tool::execute`] only
+  /// reads `context` (`&ExecutionContext`), so independent tool calls requested in the
+  /// same turn (e.g. two `web_search` calls) do not have to pay for each other's network
+  /// latency in sequence.
   async fn execute_tool_calls(
     &self,
     context: &mut ExecutionContext,
     tool_calls: &[ChatCompletionMessageToolCalls],
   ) {
-    let mut result_items = Vec::new();
+    // Reborrowed as immutable for the duration of the concurrent calls below;
+    // `context.add_event` takes a fresh `&mut` once every result is back.
+    let context_ref: &ExecutionContext = context;
 
-    for tool_call in tool_calls {
+    let result_items = join_all(tool_calls.iter().filter_map(|tool_call| {
       let ChatCompletionMessageToolCalls::Function(function_call) = tool_call else {
-        continue;
+        return None;
       };
-      let function_name = &function_call.function.name;
-      let arguments = &function_call.function.arguments;
 
-      tracing::info!(tool = %function_name, %arguments, "executing tool");
+      Some(async move {
+        let function_name = &function_call.function.name;
+        let arguments = &function_call.function.arguments;
 
-      let (status, content) = match self.toolbox.get(function_name) {
-        Some(tool) => match tool.execute(arguments, context).await {
-          Ok(result) => {
-            tracing::info!(tool = %function_name, %result, "tool finished");
-            (ToolResultStatus::Success, result)
-          }
-          Err(err) => {
-            let msg = format!("Tool execution error: {err}");
+        tracing::debug!(
+          tool = %function_name,
+          arguments = %truncate_chars(arguments, TOOL_LOG_PREVIEW_CHARS),
+          "executing tool"
+        );
+
+        let (status, content) = match self.toolbox.get(function_name) {
+          Some(tool) => match tool.execute(arguments, context_ref).await {
+            Ok(result) => {
+              tracing::debug!(
+                tool = %function_name,
+                result = %truncate_chars(&result, TOOL_LOG_PREVIEW_CHARS),
+                "tool finished"
+              );
+              (ToolResultStatus::Success, result)
+            }
+            Err(err) => {
+              let msg = format!("Tool execution error: {err}");
+              tracing::warn!("{msg}");
+              (ToolResultStatus::Error, msg)
+            }
+          },
+          None => {
+            let msg = format!("Tool execution error: unknown tool {function_name}");
             tracing::warn!("{msg}");
             (ToolResultStatus::Error, msg)
           }
-        },
-        None => {
-          let msg = format!("Tool execution error: unknown tool {function_name}");
-          tracing::warn!("{msg}");
-          (ToolResultStatus::Error, msg)
-        }
-      };
+        };
 
-      result_items.push(ContentItem::ToolResult {
-        tool_call_id: function_call.id.clone(),
-        name: function_name.clone(),
-        status,
-        content,
-      });
-    }
+        ContentItem::ToolResult {
+          tool_call_id: function_call.id.clone(),
+          name: function_name.clone(),
+          status,
+          content,
+        }
+      })
+    }))
+    .await;
 
     context.add_event(Event::new(
       context.execution_id.clone(),
@@ -673,7 +789,12 @@ mod tests {
   use crate::tools::calculator::{self, Calculator};
 
   fn agent_with(toolbox: ToolRegistry) -> Agent {
-    Agent::new("gpt-test", Option::<String>::None, Arc::new(toolbox))
+    Agent::new(
+      Provider::shared().clone(),
+      "gpt-test",
+      Option::<String>::None,
+      Arc::new(toolbox),
+    )
   }
 
   #[test]
@@ -696,8 +817,25 @@ mod tests {
   }
 
   #[test]
+  fn new_defaults_max_history_tokens_to_the_shared_config() {
+    let agent = agent_with(ToolRegistry::empty());
+    assert_eq!(agent.max_history_tokens, config::max_history_tokens());
+  }
+
+  #[test]
+  fn with_max_history_tokens_overrides_the_default() {
+    let agent = agent_with(ToolRegistry::empty()).with_max_history_tokens(42);
+    assert_eq!(agent.max_history_tokens, 42);
+  }
+
+  #[test]
   fn build_messages_replays_system_user_tool_call_and_result() {
-    let agent = Agent::new("gpt-test", Some("be nice"), Arc::new(ToolRegistry::empty()));
+    let agent = Agent::new(
+      Provider::shared().clone(),
+      "gpt-test",
+      Some("be nice"),
+      Arc::new(ToolRegistry::empty()),
+    );
     let mut context = ExecutionContext::new();
     let id = context.execution_id.clone();
 
@@ -822,6 +960,37 @@ mod tests {
     };
     assert_eq!(*status, ToolResultStatus::Error);
     assert!(content.contains("unknown tool"), "got: {content}");
+  }
+
+  #[test]
+  fn seed_context_appends_the_new_turn_after_prior_history() {
+    let agent = agent_with(ToolRegistry::empty());
+    let prior = vec![Event::new(
+      "prev-execution",
+      "user",
+      vec![ContentItem::Message {
+        role: "user".to_owned(),
+        content: "hi".to_owned(),
+      }],
+    )];
+
+    let context = agent.seed_context(prior, "follow up");
+
+    assert_eq!(context.events.len(), 2, "prior turn plus the new user turn");
+    assert_eq!(context.events[0].author, "user");
+    let new_turn = &context.events[1];
+    assert_eq!(new_turn.execution_id, context.execution_id);
+    let ContentItem::Message { content, .. } = &new_turn.content[0] else {
+      panic!("expected a message");
+    };
+    assert_eq!(content, "follow up");
+  }
+
+  #[test]
+  fn seed_context_with_empty_history_only_has_the_new_turn() {
+    let agent = agent_with(ToolRegistry::empty());
+    let context = agent.seed_context(Vec::new(), "hi");
+    assert_eq!(context.events.len(), 1);
   }
 
   #[test]

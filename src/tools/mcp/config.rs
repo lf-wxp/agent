@@ -26,6 +26,15 @@
 //!   }
 //! }
 //! ```
+//!
+//! ## Trust boundary
+//!
+//! A stdio entry's `command` / `args` / `env` / `cwd` are spawned as a child process
+//! verbatim (see [`spawn_stdio`]), and [`crate::config::mcp_config_path`] (env
+//! `MCP_CONFIG_PATH`) lets the file location itself be overridden. Both are meant to be
+//! set by whoever operates the agent, not by untrusted end users: treat `mcp.json` and
+//! `MCP_CONFIG_PATH` the same way you would a shell command — anything that can control
+//! their contents can run arbitrary processes on this host.
 
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 
@@ -221,7 +230,10 @@ async fn connect_http(label: &str, server: &ServerConfig) -> anyhow::Result<McpC
 /// Keeps credentials out of the config file, which is usually committed. An undefined
 /// variable is an error rather than being left as-is: passing a literal `${TOKEN}` to a
 /// server produces a far more confusing failure downstream.
-fn expand(text: &str) -> anyhow::Result<String> {
+///
+/// Shared with [`crate::api::tenant`], which needs the same substitution for its own
+/// (also usually-committed) tenant config file.
+pub(crate) fn expand(text: &str) -> anyhow::Result<String> {
   let mut out = String::with_capacity(text.len());
   let mut rest = text;
 

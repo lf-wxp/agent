@@ -5,7 +5,8 @@ use futures::{Stream, StreamExt};
 use crate::{
   config,
   llm::{
-    client::{DEFAULT_MAX_TOKENS, build_messages, client, ensure_valid_params, request_builder},
+    client::{DEFAULT_MAX_TOKENS, build_messages, ensure_valid_params, request_builder},
+    provider::Provider,
     tool_calls::ToolCallAccumulator,
     tool_loop::{append_tool_results, disable_tools},
   },
@@ -23,8 +24,11 @@ const MAX_RETRY_TIMES: usize = 3;
 /// since some models narrate what they are about to do.
 ///
 /// Same budget policy as [`crate::llm::tool_loop::run`]: when the round budget is spent,
-/// the last stream goes out with tools disabled so an answer still comes back.
+/// the last stream goes out with tools disabled so an answer still comes back. `provider`
+/// supplies the credentials and concurrency slot for each stream request (see
+/// [`Provider::acquire`]), held only while the stream for that one round is open.
 fn chat_stream<'a>(
+  provider: &'a Provider,
   model: &'a str,
   system: Option<&'a str>,
   prompt: &'a str,
@@ -49,7 +53,10 @@ fn chat_stream<'a>(
           tracing::warn!(max_rounds, "tool round budget spent; forcing a final answer");
         }
       }
-      let mut chunks = client().chat().create_stream(builder.build()?).await?;
+      let mut chunks = {
+        let _permit = provider.acquire().await?;
+        provider.client().chat().create_stream(builder.build()?).await?
+      };
 
       let mut accumulator = ToolCallAccumulator::default();
       // Kept so the assistant message we replay carries whatever the model said.
@@ -119,14 +126,18 @@ fn chat_stream<'a>(
 ///
 /// Note: a retry regenerates from scratch and discards already-emitted segments, so we accumulate
 /// internally and only return on success, to avoid exposing partial content to the caller.
+///
+/// `provider` selects which tenant's credentials and concurrency budget the request is
+/// charged against; pass [`Provider::shared`] for the single-tenant default.
 pub async fn chat_stream_with_retry(
+  provider: &Provider,
   model: &str,
   system: Option<&str>,
   prompt: &str,
   registry: &ToolRegistry,
 ) -> anyhow::Result<String> {
   let op = || async {
-    let stream = chat_stream(model, system, prompt, registry);
+    let stream = chat_stream(provider, model, system, prompt, registry);
     futures::pin_mut!(stream);
 
     let mut output = String::new();

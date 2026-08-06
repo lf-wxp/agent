@@ -1,6 +1,7 @@
 use crate::{
   llm::{
     client::{DEFAULT_MAX_TOKENS, build_messages, ensure_valid_params},
+    provider::Provider,
     tool_loop,
   },
   tools::ToolRegistry,
@@ -11,7 +12,11 @@ use crate::{
 /// The tool round budget being exhausted is only logged here (see
 /// [`crate::llm::tool_loop::Completion::budget_exhausted`]); use the structured API when
 /// the caller needs to react to it programmatically.
+///
+/// `provider` selects which tenant's credentials and concurrency budget the request is
+/// charged against; pass [`Provider::shared`] for the single-tenant default.
 pub async fn chat_complete(
+  provider: &Provider,
   model: &str,
   system: Option<&str>,
   prompt: &str,
@@ -20,6 +25,7 @@ pub async fn chat_complete(
   ensure_valid_params(model, prompt)?;
 
   let completion = tool_loop::run(
+    provider,
     model,
     build_messages(system, prompt)?,
     registry,

@@ -4,6 +4,7 @@ use backon::{ExponentialBuilder, Retryable};
 use crate::{
   gaia::models::{GaiaOutput, Solution},
   llm::{
+    provider::Provider,
     structured::{TruncatedOutput, chat_complete_structured_raw},
     tool_loop::BudgetExhausted,
   },
@@ -14,12 +15,13 @@ use crate::{
 const MAX_RETRY_TIMES: usize = 3;
 
 pub async fn solve_problem_with_retry(
+  provider: &Provider,
   model: &str,
   system: &str,
   prompt: &str,
   registry: &ToolRegistry,
 ) -> anyhow::Result<Solution> {
-  let op = || solve_problem(model, system, prompt, registry);
+  let op = || solve_problem(provider, model, system, prompt, registry);
   op.retry(ExponentialBuilder::default().with_max_times(MAX_RETRY_TIMES))
     // Skip deterministic failures, where a retry only burns resources for the same outcome:
     // a max_tokens truncation repeats token spend, and a budget-exhausted attempt replays
@@ -33,6 +35,7 @@ pub async fn solve_problem_with_retry(
 }
 
 async fn solve_problem(
+  provider: &Provider,
   model: &str,
   system: &str,
   prompt: &str,
@@ -40,7 +43,8 @@ async fn solve_problem(
 ) -> anyhow::Result<Solution> {
   // The structured approach (native schema / prompt injection) is decided automatically by the model; see `llm::structured`.
   let choice =
-    chat_complete_structured_raw::<GaiaOutput>(model, Some(system), prompt, registry).await?;
+    chat_complete_structured_raw::<GaiaOutput>(provider, model, Some(system), prompt, registry)
+      .await?;
 
   // Read before `parse` consumes the choice.
   let budget_exhausted = choice.budget_exhausted();

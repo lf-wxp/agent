@@ -1,5 +1,8 @@
 use agent::{
-  config, llm::structured::chat_complete_structured, models::action_plan::ActionPlan, telemetry,
+  config,
+  llm::{provider::Provider, structured::chat_complete_structured},
+  models::action_plan::ActionPlan,
+  telemetry,
   tools::ToolRegistry,
 };
 
@@ -9,6 +12,7 @@ async fn main() -> anyhow::Result<()> {
 
   let model = config::model();
   let plan = chat_complete_structured::<ActionPlan>(
+    Provider::shared(),
     model,
     Some("You are a general-purpose assistant"),
     "I'm going to the USA, Canada, and Mexico for the World Cup; how should I plan the trip?",
