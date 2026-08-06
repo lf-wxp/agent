@@ -3,6 +3,8 @@
 use async_openai::types::chat::{ChatCompletionTool, ChatCompletionTools, FunctionObjectArgs};
 use serde_json::Value;
 
+use crate::agent::ExecutionContext;
+
 /// A tool the model can call.
 ///
 /// Uses `async_trait` rather than a native `async fn`: the registry keeps tools as
@@ -24,7 +26,7 @@ pub trait Tool: Send + Sync {
   /// Return `Err` for anything that did not work — malformed arguments, a failing
   /// request. The registry turns it into a tool message so the model can correct
   /// itself, which is why implementations never format their own error text.
-  async fn execute(&self, args_json: &str) -> anyhow::Result<String>;
+  async fn execute(&self, args_json: &str, context: &ExecutionContext) -> anyhow::Result<String>;
 
   /// Render the definition advertised to the model.
   ///

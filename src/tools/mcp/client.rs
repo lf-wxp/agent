@@ -24,7 +24,7 @@ use rmcp::{
 use serde_json::Value;
 use tokio::process::Command;
 
-use crate::tools::tool::Tool;
+use crate::{agent::ExecutionContext, tools::tool::Tool};
 
 /// Separates the server label from the remote tool name in the local name.
 const LABEL_SEPARATOR: &str = "__";
@@ -208,7 +208,7 @@ impl Tool for McpTool {
     self.parameters.clone()
   }
 
-  async fn execute(&self, args_json: &str) -> anyhow::Result<String> {
+  async fn execute(&self, args_json: &str, _context: &ExecutionContext) -> anyhow::Result<String> {
     let request = CallToolRequestParams::new(self.remote_name.clone())
       .with_arguments(parse_arguments(args_json)?);
 

@@ -20,6 +20,12 @@ const ENV_LOG_LEVEL: &str = "RUST_LOG";
 /// Environment variable: force a specific structured-output mode, `json_schema` / `json_object`.
 const ENV_STRUCTURED_MODE: &str = "LLM_STRUCTURED_MODE";
 
+/// Environment variable: force whether the model is treated as supporting `tool_choice`.
+///
+/// `1`/`true`/`yes`/`on` force "supported"; `0`/`false`/`no`/`off` force "unsupported".
+/// Unset falls back to inference from the model name.
+const ENV_SUPPORTS_TOOL_CHOICE: &str = "LLM_SUPPORTS_TOOL_CHOICE";
+
 /// Environment variable: rounds of tool execution allowed before a final answer is forced.
 const ENV_MAX_TOOL_ROUNDS: &str = "LLM_MAX_TOOL_ROUNDS";
 
@@ -46,6 +52,15 @@ const DEFAULT_MCP_CONFIG_PATH: &str = "mcp.json";
 
 /// Default Tavily search depth: `basic` costs 1 credit and balances latency against relevance.
 const DEFAULT_TAVILY_SEARCH_DEPTH: &str = "basic";
+
+/// Lowercased model-name keywords for models that reject any `tool_choice` constraint.
+///
+/// Reasoning / "thinking" models (e.g. DeepSeek reasoners) return
+/// `400 ... Thinking mode does not support this tool_choice`, so a caller that relies on
+/// forcing `tool_choice` (see [`crate::agent::runtime::Agent::run_structured`]) must fall
+/// back to a `response_format` route for them. `contains` (not `starts_with`) because
+/// hosted names carry prefixes/suffixes, e.g. `deepseek-ai/DeepSeek-V3`, `deepseek-v4-flash`.
+const NO_TOOL_CHOICE_KEYWORDS: [&str; 1] = ["deepseek"];
 
 static MODEL: LazyLock<String> =
   LazyLock::new(|| non_empty_var(ENV_MODEL).unwrap_or_else(|| DEFAULT_MODEL.to_owned()));
@@ -75,6 +90,26 @@ pub fn log_level() -> Level {
 /// Returns a raw string instead of an enum: let the `llm` layer parse it so the config layer does not depend on concrete implementation types.
 pub fn structured_mode_override() -> Option<String> {
   non_empty_var(ENV_STRUCTURED_MODE)
+}
+
+/// Whether the model accepts a `tool_choice` constraint (e.g. forcing a tool call).
+///
+/// Reasoning / "thinking" models reject it outright, so [`crate::agent::runtime::Agent::run_structured`]
+/// uses this to decide between the forced-`tool_choice` route and a `response_format` route.
+/// Override with `LLM_SUPPORTS_TOOL_CHOICE`; unset infers from the model name.
+pub fn model_supports_tool_choice(model: &str) -> bool {
+  if let Some(forced) = parse_bool_var(ENV_SUPPORTS_TOOL_CHOICE) {
+    return forced;
+  }
+  infer_tool_choice_support(model)
+}
+
+/// Infer tool_choice support purely from the model name, without reading env vars.
+fn infer_tool_choice_support(model: &str) -> bool {
+  let model = model.to_ascii_lowercase();
+  !NO_TOOL_CHOICE_KEYWORDS
+    .iter()
+    .any(|keyword| model.contains(keyword))
 }
 
 /// Rounds of tool execution allowed before tools are disabled and the model must answer
@@ -113,4 +148,42 @@ fn non_empty_var(key: &str) -> Option<String> {
     .ok()
     .map(|value| value.trim().to_owned())
     .filter(|value| !value.is_empty())
+}
+
+/// Parse a boolean-ish env var; unrecognized values are treated as unset (returns `None`).
+fn parse_bool_var(key: &str) -> Option<bool> {
+  match non_empty_var(key)?.to_ascii_lowercase().as_str() {
+    "1" | "true" | "yes" | "on" => Some(true),
+    "0" | "false" | "no" | "off" => Some(false),
+    other => {
+      tracing::warn!("ignoring {key}: unrecognized boolean value `{other}`");
+      None
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn reasoning_models_do_not_support_tool_choice() {
+    for model in [
+      "deepseek-v4-flash",
+      "DeepSeek-V3",
+      "deepseek-ai/DeepSeek-R1",
+    ] {
+      assert!(
+        !infer_tool_choice_support(model),
+        "{model} should be treated as unsupported"
+      );
+    }
+  }
+
+  #[test]
+  fn other_models_support_tool_choice_by_default() {
+    for model in ["gpt-4o", "gpt-4o-mini", "claude-3-5-sonnet"] {
+      assert!(infer_tool_choice_support(model), "{model} should support");
+    }
+  }
 }

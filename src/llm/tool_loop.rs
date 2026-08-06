@@ -14,6 +14,7 @@ use async_openai::types::chat::{
 };
 
 use crate::{
+  agent::ExecutionContext,
   config,
   llm::client::{client, first_choice, request_builder},
   tools::ToolRegistry,
@@ -182,7 +183,9 @@ async fn execute(
       function: FunctionCall { name, arguments },
     }) => {
       tracing::info!(tool = %name, %arguments, "executing tool");
-      let result = registry.execute(&name, &arguments).await;
+      let result = registry
+        .execute(&name, &arguments, &ExecutionContext::default())
+        .await;
       tracing::info!(tool = %name, %result, "tool finished");
       (id, result)
     }

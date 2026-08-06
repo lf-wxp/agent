@@ -1,5 +1,6 @@
 pub mod client;
 pub mod complete;
+pub mod schema;
 pub mod semaphore;
 pub mod stream;
 pub mod structured;

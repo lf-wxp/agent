@@ -9,7 +9,7 @@ pub mod execute;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::tools::tool::Tool;
+use crate::{agent::ExecutionContext, tools::tool::Tool};
 
 /// Tool name, used both in the definition and in dispatch.
 pub const NAME: &str = "web_search";
@@ -38,7 +38,7 @@ impl Tool for WebSearch {
     definition::parameters()
   }
 
-  async fn execute(&self, args_json: &str) -> anyhow::Result<String> {
+  async fn execute(&self, args_json: &str, _context: &ExecutionContext) -> anyhow::Result<String> {
     execute::run(args_json).await
   }
 }
@@ -108,6 +108,11 @@ mod tests {
   #[tokio::test]
   async fn rejects_malformed_arguments_through_the_trait() {
     // No network involved: parsing fails before any request is made.
-    assert!(WebSearch.execute("not json").await.is_err());
+    assert!(
+      WebSearch
+        .execute("not json", &ExecutionContext::default())
+        .await
+        .is_err()
+    );
   }
 }

@@ -1,0 +1,850 @@
+//! [`Agent`]: drives a model through a tool-calling loop while recording every step into
+//! an [`ExecutionContext`].
+//!
+//! This differs from [`crate::llm::tool_loop::run`], which only returns the last choice:
+//! here the whole transcript (user input, tool calls, tool results, final answer) is kept
+//! as [`Event`]s, so a caller can inspect or persist what happened at each step. The model
+//! call itself is not reimplemented, and neither is the round-budget behavior: both go
+//! through the same shared client, request builder and [`disable_tools`] as `tool_loop`,
+//! so a fix made there (retries, concurrency limits, degradation) does not have to be
+//! ported by hand.
+//!
+//! Known gap versus `tool_loop`: no streaming counterpart yet (see [`crate::llm::stream`]).
+
+use std::sync::Arc;
+
+use async_openai::types::chat::{
+  ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
+  ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+  ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
+  ChatCompletionRequestUserMessageArgs, ChatCompletionToolChoiceOption, ChatCompletionTools,
+  CreateChatCompletionResponse, FinishReason, FunctionCall, ResponseFormat, ToolChoiceOptions,
+};
+
+use crate::{
+  config,
+  llm::{
+    client::{DEFAULT_MAX_TOKENS, client, first_choice, request_builder},
+    schema::{
+      FINAL_ANSWER_TOOL_NAME, final_answer_tool, native_schema_format, schema_instruction,
+      strip_code_fence,
+    },
+    structured::{StructuredMode, TruncatedOutput},
+    tool_loop::{BudgetExhausted, disable_tools},
+  },
+  tools::ToolRegistry,
+};
+
+use super::{
+  context::ExecutionContext,
+  event::{ContentItem, Event, ToolResultStatus},
+};
+
+/// Outcome of [`Agent::run`].
+#[derive(Debug)]
+pub struct AgentResult {
+  pub output: String,
+  pub context: ExecutionContext,
+  /// `true` when the round budget ran out and this answer was produced with tools
+  /// disabled, i.e. built from partial information. Mirrors
+  /// [`crate::llm::tool_loop::Completion::budget_exhausted`].
+  pub budget_exhausted: bool,
+}
+
+/// Outcome of [`Agent::run_structured`].
+#[derive(Debug)]
+pub struct StructuredAgentResult<T> {
+  pub output: T,
+  pub context: ExecutionContext,
+  pub budget_exhausted: bool,
+}
+
+/// Drives a model to a final answer, executing tool calls as it requests them.
+///
+/// A value rather than a free function: `model`, `instructions` and the tool set are
+/// fixed for the lifetime of the agent, while each [`Self::run`] call gets its own fresh
+/// [`ExecutionContext`] so concurrent runs never share state.
+pub struct Agent {
+  model: String,
+  instructions: Option<String>,
+  toolbox: Arc<ToolRegistry>,
+  max_steps: u32,
+}
+
+impl Agent {
+  /// Rounds default to [`config::max_tool_rounds`], the same budget `tool_loop` uses, so
+  /// the two do not silently drift apart; override with [`Self::with_max_steps`] when an
+  /// agent needs a different budget than the rest of the process.
+  pub fn new(
+    model: impl Into<String>,
+    instructions: Option<impl Into<String>>,
+    toolbox: Arc<ToolRegistry>,
+  ) -> Self {
+    Self {
+      model: model.into(),
+      instructions: instructions.map(Into::into),
+      toolbox,
+      max_steps: config::max_tool_rounds() as u32,
+    }
+  }
+
+  /// Rounds of tool execution allowed before further rounds fall back to a
+  /// tools-disabled request, instead of looping forever on a model that never stops
+  /// calling tools. See [`Self::run`] / [`Self::run_structured`].
+  pub fn with_max_steps(mut self, max_steps: u32) -> Self {
+    self.max_steps = max_steps;
+    self
+  }
+
+  /// Run to a plain-text final answer.
+  ///
+  /// Once the round budget ([`Self::with_max_steps`]) is spent, one last request goes out
+  /// with tools disabled (see [`disable_tools`]) so a long task still returns an answer
+  /// built from the results already gathered, instead of losing all of that work. That
+  /// case is flagged through [`AgentResult::budget_exhausted`].
+  pub async fn run(&self, user_input: &str) -> anyhow::Result<AgentResult> {
+    let mut context = ExecutionContext::new();
+    self.record_user_input(&mut context, user_input);
+
+    loop {
+      let tools_allowed = tool_rounds_remaining(context.current_step, self.max_steps);
+      let budget_exhausted = !tools_allowed && !self.toolbox.is_empty();
+      if budget_exhausted {
+        tracing::warn!(
+          max_steps = self.max_steps,
+          "tool round budget spent; forcing a final answer"
+        );
+      }
+
+      let messages = self.build_messages(&context)?;
+      let mut builder = request_builder(
+        &self.model,
+        messages,
+        DEFAULT_MAX_TOKENS,
+        self.toolbox.definitions(),
+      );
+      if !tools_allowed {
+        disable_tools(&mut builder, self.toolbox.definitions());
+      }
+
+      let response = client().chat().create(builder.build()?).await?;
+      self.record_usage(&mut context, &response);
+      let message = first_choice(response)?.message;
+
+      // Some providers send `Some(vec![])` rather than `None` for "no tool calls".
+      let Some(tool_calls) = message.tool_calls.filter(|calls| !calls.is_empty()) else {
+        let content = message
+          .content
+          .ok_or_else(|| anyhow::anyhow!("No content in final response"))?;
+        self.record_final_answer(&mut context, &content);
+        return Ok(AgentResult {
+          output: content,
+          context,
+          budget_exhausted,
+        });
+      };
+
+      // The model ignored the disabled tools. Returning its message beats looping
+      // forever; the caller still sees whatever content came back.
+      if !tools_allowed {
+        tracing::warn!("model requested tools after they were disabled");
+        let content = message.content.unwrap_or_default();
+        self.record_final_answer(&mut context, &content);
+        return Ok(AgentResult {
+          output: content,
+          context,
+          budget_exhausted: true,
+        });
+      }
+
+      self.record_tool_calls(&mut context, &tool_calls);
+      self.execute_tool_calls(&mut context, &tool_calls).await;
+      context.increment_step();
+    }
+  }
+
+  /// Run to a structured final answer of type `T`.
+  ///
+  /// Two routes, chosen by [`config::model_supports_tool_choice`]:
+  /// - **forced tool_choice** (default): a synthetic `final_answer` tool carrying `T`'s
+  ///   schema, with `tool_choice = required`, lets the model end the loop while still
+  ///   calling the real tools along the way. Most reliable.
+  /// - **response_format** (reasoning / "thinking" models that reject any `tool_choice`):
+  ///   the real tools still run each round, but the final structure is constrained by
+  ///   `response_format` (see [`crate::llm::structured::StructuredMode`]) instead of a
+  ///   forced tool call — the model emits the JSON as message content, which is parsed
+  ///   into `T`.
+  ///
+  /// Both record the full [`Event`] transcript and honor the round budget
+  /// ([`StructuredAgentResult::budget_exhausted`]).
+  pub async fn run_structured<T>(
+    &self,
+    user_input: &str,
+  ) -> anyhow::Result<StructuredAgentResult<T>>
+  where
+    T: schemars::JsonSchema + serde::de::DeserializeOwned,
+  {
+    if config::model_supports_tool_choice(&self.model) {
+      self.run_structured_via_tool_choice(user_input).await
+    } else {
+      tracing::debug!(
+        model = %self.model,
+        "model rejects tool_choice; using response_format for structured output"
+      );
+      self.run_structured_via_response_format(user_input).await
+    }
+  }
+
+  /// Structured output by forcing `tool_choice = required` on a synthetic `final_answer`
+  /// tool. See [`Self::run_structured`].
+  async fn run_structured_via_tool_choice<T>(
+    &self,
+    user_input: &str,
+  ) -> anyhow::Result<StructuredAgentResult<T>>
+  where
+    T: schemars::JsonSchema + serde::de::DeserializeOwned,
+  {
+    let mut context = ExecutionContext::new();
+    self.record_user_input(&mut context, user_input);
+
+    let final_answer = final_answer_tool::<T>()?;
+    let mut tool_definitions = self.toolbox.definitions().to_vec();
+    tool_definitions.push(final_answer.clone());
+    let final_answer_only = std::slice::from_ref(&final_answer);
+
+    loop {
+      let tools_allowed = tool_rounds_remaining(context.current_step, self.max_steps);
+      let budget_exhausted = !tools_allowed && !self.toolbox.is_empty();
+      if budget_exhausted {
+        tracing::warn!(
+          max_steps = self.max_steps,
+          "tool round budget spent; forcing a final answer"
+        );
+      }
+
+      let definitions: &[ChatCompletionTools] = if tools_allowed {
+        &tool_definitions
+      } else {
+        final_answer_only
+      };
+
+      let messages = self.build_messages(&context)?;
+      let mut builder = request_builder(&self.model, messages, DEFAULT_MAX_TOKENS, definitions);
+      builder.tool_choice(ChatCompletionToolChoiceOption::Mode(
+        ToolChoiceOptions::Required,
+      ));
+
+      let response = client().chat().create(builder.build()?).await?;
+      self.record_usage(&mut context, &response);
+      let choice = first_choice(response)?;
+
+      // Truncation is deterministic — a retry burns the same budget and truncates again —
+      // so surface it as [`TruncatedOutput`] up front (same treatment as `llm::structured`),
+      // rather than letting it degrade into a cryptic empty-tool-call error below.
+      if choice.finish_reason == Some(FinishReason::Length) {
+        return Err(
+          TruncatedOutput {
+            limit: DEFAULT_MAX_TOKENS,
+          }
+          .into(),
+        );
+      }
+
+      let message = choice.message;
+
+      let tool_calls = message.tool_calls.ok_or_else(|| {
+        tag_budget(
+          anyhow::anyhow!("Model returned no tool call despite tool_choice = required"),
+          budget_exhausted,
+        )
+      })?;
+
+      self.record_tool_calls(&mut context, &tool_calls);
+
+      let final_call = tool_calls.iter().find_map(|tool_call| match tool_call {
+        ChatCompletionMessageToolCalls::Function(f)
+          if f.function.name == FINAL_ANSWER_TOOL_NAME =>
+        {
+          Some(f)
+        }
+        _ => None,
+      });
+
+      if let Some(final_call) = final_call {
+        let raw_arguments = final_call.function.arguments.clone();
+        let parsed: T = serde_json::from_str(&raw_arguments).map_err(|err| {
+          tag_budget(
+            anyhow::anyhow!("failed to parse `{FINAL_ANSWER_TOOL_NAME}` arguments: {err}"),
+            budget_exhausted,
+          )
+        })?;
+
+        self.record_final_structured(&mut context, final_call.id.clone(), raw_arguments);
+
+        return Ok(StructuredAgentResult {
+          output: parsed,
+          context,
+          budget_exhausted,
+        });
+      }
+
+      // Once the budget is spent, `final_answer` is the only tool on offer; anything
+      // else here cannot be recovered from without spending another round.
+      if !tools_allowed {
+        anyhow::bail!(tag_budget(
+          anyhow::anyhow!(
+            "model did not call `{FINAL_ANSWER_TOOL_NAME}` after the round budget was spent"
+          ),
+          true
+        ));
+      }
+
+      self.execute_tool_calls(&mut context, &tool_calls).await;
+      context.increment_step();
+    }
+  }
+
+  /// Structured output for models that reject `tool_choice`: real tools still run each
+  /// round, but the final structure is constrained by `response_format` and the model
+  /// emits the JSON as message content. See [`Self::run_structured`].
+  async fn run_structured_via_response_format<T>(
+    &self,
+    user_input: &str,
+  ) -> anyhow::Result<StructuredAgentResult<T>>
+  where
+    T: schemars::JsonSchema + serde::de::DeserializeOwned,
+  {
+    let mode = StructuredMode::for_model(&self.model);
+    // Under `json_object` the schema is only *guided* by a prompt, so inject it as an
+    // extra system instruction; native `json_schema` is server-enforced and needs none.
+    let schema_hint = match mode {
+      StructuredMode::JsonObject => Some(schema_instruction::<T>()),
+      StructuredMode::NativeSchema => None,
+    };
+    let response_format = match mode {
+      StructuredMode::NativeSchema => native_schema_format::<T>(),
+      StructuredMode::JsonObject => ResponseFormat::JsonObject,
+    };
+
+    let mut context = ExecutionContext::new();
+    self.record_user_input(&mut context, user_input);
+
+    loop {
+      let tools_allowed = tool_rounds_remaining(context.current_step, self.max_steps);
+      let budget_exhausted = !tools_allowed && !self.toolbox.is_empty();
+      if budget_exhausted {
+        tracing::warn!(
+          max_steps = self.max_steps,
+          "tool round budget spent; forcing a final answer"
+        );
+      }
+
+      // Constrain the structure on **every** round, not just once tools look done: this
+      // model picks when to stop calling tools and answer, and if that round were
+      // unconstrained it would reply in prose and fail to parse. On tool-calling rounds
+      // `content` is empty anyway, so the constraint is harmless there.
+      let messages = match &schema_hint {
+        Some(hint) => self.messages_with_schema_hint(&context, hint)?,
+        None => self.build_messages(&context)?,
+      };
+      // Reasoning models keep `max_tokens` covering chain-of-thought + answer, so the
+      // structured budget applies here too (see `structured::JSON_OBJECT_MAX_TOKENS`).
+      let mut builder = request_builder(
+        &self.model,
+        messages,
+        mode.max_tokens(),
+        self.toolbox.definitions(),
+      );
+      builder.response_format(response_format.clone());
+      if !tools_allowed {
+        disable_tools(&mut builder, self.toolbox.definitions());
+      }
+
+      let response = client().chat().create(builder.build()?).await?;
+      self.record_usage(&mut context, &response);
+      let choice = first_choice(response)?;
+
+      if choice.finish_reason == Some(FinishReason::Length) {
+        return Err(
+          TruncatedOutput {
+            limit: mode.max_tokens(),
+          }
+          .into(),
+        );
+      }
+
+      let message = choice.message;
+
+      // The model may still call the real tools before answering.
+      if let Some(tool_calls) = message.tool_calls.filter(|calls| !calls.is_empty()) {
+        if !tools_allowed {
+          // Budget spent but the model wants more tools: take whatever content it gave,
+          // rather than looping forever.
+          tracing::warn!("model requested tools after they were disabled");
+        } else {
+          self.record_tool_calls(&mut context, &tool_calls);
+          self.execute_tool_calls(&mut context, &tool_calls).await;
+          context.increment_step();
+          continue;
+        }
+      }
+
+      let content = message
+        .content
+        .filter(|c| !c.trim().is_empty())
+        .ok_or_else(|| {
+          tag_budget(
+            anyhow::anyhow!("empty content while expecting a structured answer"),
+            budget_exhausted,
+          )
+        })?;
+
+      let parsed: T = serde_json::from_str(strip_code_fence(&content)).map_err(|err| {
+        tag_budget(
+          anyhow::anyhow!(
+            "failed to parse structured content: {err}; raw: {}",
+            crate::util::truncate_chars(&content, 512)
+          ),
+          budget_exhausted,
+        )
+      })?;
+
+      self.record_final_answer(&mut context, &content);
+
+      return Ok(StructuredAgentResult {
+        output: parsed,
+        context,
+        budget_exhausted,
+      });
+    }
+  }
+
+  /// Like [`Self::build_messages`] but appends a one-off system message carrying the schema
+  /// hint, used by the `json_object` response-format route.
+  fn messages_with_schema_hint(
+    &self,
+    context: &ExecutionContext,
+    hint: &str,
+  ) -> anyhow::Result<Vec<ChatCompletionRequestMessage>> {
+    let mut messages = self.build_messages(context)?;
+    messages.push(
+      ChatCompletionRequestSystemMessageArgs::default()
+        .content(hint)
+        .build()?
+        .into(),
+    );
+    Ok(messages)
+  }
+
+  /// Record a structured final answer produced through the `final_answer` tool.
+  fn record_final_structured(
+    &self,
+    context: &mut ExecutionContext,
+    tool_call_id: String,
+    raw_arguments: String,
+  ) {
+    context.add_event(Event::new(
+      context.execution_id.clone(),
+      "tool",
+      vec![ContentItem::ToolResult {
+        tool_call_id,
+        name: FINAL_ANSWER_TOOL_NAME.to_owned(),
+        status: ToolResultStatus::Success,
+        content: raw_arguments.clone(),
+      }],
+    ));
+    context.final_result = Some(raw_arguments);
+  }
+
+  fn record_user_input(&self, context: &mut ExecutionContext, user_input: &str) {
+    context.add_event(Event::new(
+      context.execution_id.clone(),
+      "user",
+      vec![ContentItem::Message {
+        role: "user".to_owned(),
+        content: user_input.to_owned(),
+      }],
+    ));
+  }
+
+  /// Record the assistant's final text and set [`ExecutionContext::final_result`].
+  fn record_final_answer(&self, context: &mut ExecutionContext, content: &str) {
+    context.add_event(Event::new(
+      context.execution_id.clone(),
+      "agent",
+      vec![ContentItem::Message {
+        role: "assistant".to_owned(),
+        content: content.to_owned(),
+      }],
+    ));
+    context.final_result = Some(content.to_owned());
+  }
+
+  fn record_usage(&self, context: &mut ExecutionContext, response: &CreateChatCompletionResponse) {
+    if let Some(usage) = &response.usage {
+      context.usage.add(
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.total_tokens,
+      );
+    }
+  }
+
+  fn record_tool_calls(
+    &self,
+    context: &mut ExecutionContext,
+    tool_calls: &[ChatCompletionMessageToolCalls],
+  ) {
+    let mut call_items = Vec::new();
+    for tool_call in tool_calls {
+      if let ChatCompletionMessageToolCalls::Function(function_call) = tool_call {
+        let arguments: serde_json::Value = serde_json::from_str(&function_call.function.arguments)
+          .unwrap_or(serde_json::Value::Null);
+        call_items.push(ContentItem::ToolCall {
+          tool_call_id: function_call.id.clone(),
+          name: function_call.function.name.clone(),
+          arguments,
+        });
+      }
+    }
+    context.add_event(Event::new(
+      context.execution_id.clone(),
+      "agent",
+      call_items,
+    ));
+  }
+
+  /// Execute every call in one model turn, feeding each tool the same context the caller
+  /// will get back — unlike [`ToolRegistry::execute`] (used by [`crate::llm::tool_loop`]),
+  /// which only ever sees a throwaway [`ExecutionContext::default`].
+  async fn execute_tool_calls(
+    &self,
+    context: &mut ExecutionContext,
+    tool_calls: &[ChatCompletionMessageToolCalls],
+  ) {
+    let mut result_items = Vec::new();
+
+    for tool_call in tool_calls {
+      let ChatCompletionMessageToolCalls::Function(function_call) = tool_call else {
+        continue;
+      };
+      let function_name = &function_call.function.name;
+      let arguments = &function_call.function.arguments;
+
+      tracing::info!(tool = %function_name, %arguments, "executing tool");
+
+      let (status, content) = match self.toolbox.get(function_name) {
+        Some(tool) => match tool.execute(arguments, context).await {
+          Ok(result) => {
+            tracing::info!(tool = %function_name, %result, "tool finished");
+            (ToolResultStatus::Success, result)
+          }
+          Err(err) => {
+            let msg = format!("Tool execution error: {err}");
+            tracing::warn!("{msg}");
+            (ToolResultStatus::Error, msg)
+          }
+        },
+        None => {
+          let msg = format!("Tool execution error: unknown tool {function_name}");
+          tracing::warn!("{msg}");
+          (ToolResultStatus::Error, msg)
+        }
+      };
+
+      result_items.push(ContentItem::ToolResult {
+        tool_call_id: function_call.id.clone(),
+        name: function_name.clone(),
+        status,
+        content,
+      });
+    }
+
+    context.add_event(Event::new(
+      context.execution_id.clone(),
+      "tool",
+      result_items,
+    ));
+  }
+
+  /// Replay the transcript recorded in `context` into the message shape the API expects.
+  fn build_messages(
+    &self,
+    context: &ExecutionContext,
+  ) -> anyhow::Result<Vec<ChatCompletionRequestMessage>> {
+    let mut messages = Vec::new();
+
+    if let Some(system) = &self.instructions {
+      messages.push(
+        ChatCompletionRequestSystemMessageArgs::default()
+          .content(system.as_str())
+          .build()?
+          .into(),
+      );
+    }
+
+    for event in &context.events {
+      for item in &event.content {
+        match item {
+          ContentItem::Message { role, content } => {
+            let message: ChatCompletionRequestMessage = if role == "user" {
+              ChatCompletionRequestUserMessageArgs::default()
+                .content(content.clone())
+                .build()?
+                .into()
+            } else {
+              ChatCompletionRequestAssistantMessageArgs::default()
+                .content(content.clone())
+                .build()?
+                .into()
+            };
+            messages.push(message);
+          }
+          ContentItem::ToolCall {
+            tool_call_id,
+            name,
+            arguments,
+          } => {
+            let tool_call =
+              ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+                id: tool_call_id.clone(),
+                function: FunctionCall {
+                  name: name.clone(),
+                  arguments: arguments.to_string(),
+                },
+              });
+
+            if let Some(ChatCompletionRequestMessage::Assistant(last)) = messages.last_mut() {
+              last.tool_calls.get_or_insert_with(Vec::new).push(tool_call);
+            } else {
+              messages.push(
+                ChatCompletionRequestAssistantMessageArgs::default()
+                  .tool_calls(vec![tool_call])
+                  .build()?
+                  .into(),
+              );
+            }
+          }
+          ContentItem::ToolResult {
+            tool_call_id,
+            content,
+            ..
+          } => {
+            messages.push(
+              ChatCompletionRequestToolMessageArgs::default()
+                .tool_call_id(tool_call_id.clone())
+                .content(content.clone())
+                .build()?
+                .into(),
+            );
+          }
+        }
+      }
+    }
+
+    Ok(messages)
+  }
+}
+
+/// Whether another round may still call the real tools.
+///
+/// Mirrors `round < max_rounds` in [`crate::llm::tool_loop::run`]: once the budget is
+/// spent, the caller must fall back to a tools-disabled (or `final_answer`-only) request
+/// instead of looping forever on a model that never stops calling tools.
+fn tool_rounds_remaining(current_step: u32, max_steps: u32) -> bool {
+  current_step < max_steps
+}
+
+/// Mark a failure as caused by a budget-exhausted attempt, so retries can be skipped —
+/// same convention `llm::structured` uses around [`BudgetExhausted`].
+fn tag_budget(err: anyhow::Error, budget_exhausted: bool) -> anyhow::Error {
+  if budget_exhausted {
+    err.context(BudgetExhausted)
+  } else {
+    err
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use serde_json::json;
+
+  use super::*;
+  use crate::tools::calculator::{self, Calculator};
+
+  fn agent_with(toolbox: ToolRegistry) -> Agent {
+    Agent::new("gpt-test", Option::<String>::None, Arc::new(toolbox))
+  }
+
+  #[test]
+  fn tool_rounds_remaining_until_budget_spent() {
+    assert!(tool_rounds_remaining(0, 3));
+    assert!(tool_rounds_remaining(2, 3));
+    assert!(!tool_rounds_remaining(3, 3));
+  }
+
+  #[test]
+  fn new_defaults_max_steps_to_the_shared_tool_round_budget() {
+    let agent = agent_with(ToolRegistry::empty());
+    assert_eq!(agent.max_steps, config::max_tool_rounds() as u32);
+  }
+
+  #[test]
+  fn with_max_steps_overrides_the_default() {
+    let agent = agent_with(ToolRegistry::empty()).with_max_steps(1);
+    assert_eq!(agent.max_steps, 1);
+  }
+
+  #[test]
+  fn build_messages_replays_system_user_tool_call_and_result() {
+    let agent = Agent::new("gpt-test", Some("be nice"), Arc::new(ToolRegistry::empty()));
+    let mut context = ExecutionContext::new();
+    let id = context.execution_id.clone();
+
+    context.add_event(Event::new(
+      id.clone(),
+      "user",
+      vec![ContentItem::Message {
+        role: "user".to_owned(),
+        content: "hi".to_owned(),
+      }],
+    ));
+    context.add_event(Event::new(
+      id.clone(),
+      "agent",
+      vec![ContentItem::ToolCall {
+        tool_call_id: "call_1".to_owned(),
+        name: calculator::NAME.to_owned(),
+        arguments: json!({"operator": "add"}),
+      }],
+    ));
+    context.add_event(Event::new(
+      id,
+      "tool",
+      vec![ContentItem::ToolResult {
+        tool_call_id: "call_1".to_owned(),
+        name: calculator::NAME.to_owned(),
+        status: ToolResultStatus::Success,
+        content: "3".to_owned(),
+      }],
+    ));
+
+    let messages = agent.build_messages(&context).unwrap();
+
+    assert_eq!(messages.len(), 4, "system + user + assistant + tool");
+    assert!(matches!(
+      messages[0],
+      ChatCompletionRequestMessage::System(_)
+    ));
+    assert!(matches!(messages[1], ChatCompletionRequestMessage::User(_)));
+    assert!(matches!(
+      messages[2],
+      ChatCompletionRequestMessage::Assistant(_)
+    ));
+    assert!(matches!(messages[3], ChatCompletionRequestMessage::Tool(_)));
+  }
+
+  #[test]
+  fn build_messages_merges_consecutive_tool_calls_into_one_assistant_message() {
+    let agent = agent_with(ToolRegistry::empty());
+    let mut context = ExecutionContext::new();
+    let id = context.execution_id.clone();
+
+    context.add_event(Event::new(
+      id.clone(),
+      "agent",
+      vec![
+        ContentItem::ToolCall {
+          tool_call_id: "call_1".to_owned(),
+          name: "a".to_owned(),
+          arguments: json!({}),
+        },
+        ContentItem::ToolCall {
+          tool_call_id: "call_2".to_owned(),
+          name: "b".to_owned(),
+          arguments: json!({}),
+        },
+      ],
+    ));
+
+    let messages = agent.build_messages(&context).unwrap();
+    assert_eq!(messages.len(), 1);
+    let ChatCompletionRequestMessage::Assistant(assistant) = &messages[0] else {
+      panic!("expected an assistant message");
+    };
+    assert_eq!(assistant.tool_calls.as_ref().unwrap().len(), 2);
+  }
+
+  #[tokio::test]
+  async fn execute_tool_calls_records_success_and_unknown_tool() {
+    let mut registry = ToolRegistry::empty();
+    registry.add(Arc::new(Calculator)).unwrap();
+    let agent = agent_with(registry);
+    let mut context = ExecutionContext::new();
+
+    let calls = vec![
+      ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+        id: "call_1".to_owned(),
+        function: FunctionCall {
+          name: calculator::NAME.to_owned(),
+          arguments: r#"{"operator":"add","first_number":1,"second_number":2}"#.to_owned(),
+        },
+      }),
+      ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+        id: "call_2".to_owned(),
+        function: FunctionCall {
+          name: "nope".to_owned(),
+          arguments: "{}".to_owned(),
+        },
+      }),
+    ];
+
+    agent.execute_tool_calls(&mut context, &calls).await;
+
+    let event = context.events.last().unwrap();
+    assert_eq!(event.author, "tool");
+    assert_eq!(event.content.len(), 2);
+
+    let ContentItem::ToolResult {
+      status, content, ..
+    } = &event.content[0]
+    else {
+      panic!("expected a tool result");
+    };
+    assert_eq!(*status, ToolResultStatus::Success);
+    assert_eq!(content, "3");
+
+    let ContentItem::ToolResult {
+      status, content, ..
+    } = &event.content[1]
+    else {
+      panic!("expected a tool result");
+    };
+    assert_eq!(*status, ToolResultStatus::Error);
+    assert!(content.contains("unknown tool"), "got: {content}");
+  }
+
+  #[test]
+  fn record_tool_calls_falls_back_to_null_on_malformed_arguments() {
+    let agent = agent_with(ToolRegistry::empty());
+    let mut context = ExecutionContext::new();
+
+    let calls = vec![ChatCompletionMessageToolCalls::Function(
+      ChatCompletionMessageToolCall {
+        id: "call_1".to_owned(),
+        function: FunctionCall {
+          name: "calculator".to_owned(),
+          arguments: "not json".to_owned(),
+        },
+      },
+    )];
+
+    agent.record_tool_calls(&mut context, &calls);
+
+    let event = context.events.last().unwrap();
+    let ContentItem::ToolCall { arguments, .. } = &event.content[0] else {
+      panic!("expected a tool call");
+    };
+    assert!(arguments.is_null());
+  }
+}

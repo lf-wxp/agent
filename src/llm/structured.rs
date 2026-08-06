@@ -6,9 +6,7 @@
 
 use std::{fmt, str::FromStr};
 
-use async_openai::types::chat::{
-  ChatChoice, FinishReason, ResponseFormat, ResponseFormatJsonSchema,
-};
+use async_openai::types::chat::{ChatChoice, FinishReason, ResponseFormat};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
@@ -16,6 +14,7 @@ use crate::{
   config,
   llm::{
     client::{build_messages, ensure_valid_params},
+    schema::{merge_system, native_schema_format, schema_instruction, strip_code_fence},
     tool_loop::{self, BudgetExhausted},
   },
   tools::ToolRegistry,
@@ -85,7 +84,7 @@ impl StructuredMode {
   }
 
   /// Output token budget for this mode.
-  fn max_tokens(self) -> u32 {
+  pub fn max_tokens(self) -> u32 {
     match self {
       Self::NativeSchema => NATIVE_SCHEMA_MAX_TOKENS,
       Self::JsonObject => JSON_OBJECT_MAX_TOKENS,
@@ -260,70 +259,9 @@ where
     .parse()
 }
 
-/// Build the native `json_schema` response format.
-fn native_schema_format<T: JsonSchema>() -> ResponseFormat {
-  ResponseFormat::JsonSchema {
-    json_schema: ResponseFormatJsonSchema {
-      description: None,
-      name: schema_name::<T>(),
-      schema: schemars::schema_for!(T).as_value().clone(),
-      strict: Some(true),
-    },
-  }
-}
-
-/// Write the target type's JSON Schema as a system instruction, for services that only support `json_object`.
-///
-/// A `static` inside a generic function is shared across all monomorphizations, so it cannot be cached per type;
-/// hence we regenerate each time (negligible relative to one network request).
-fn schema_instruction<T: JsonSchema>() -> String {
-  let schema = schemars::schema_for!(T);
-  // The product of schema_for! is always serializable; in the extreme case fall back to compact output instead of panicking.
-  let schema_json =
-    serde_json::to_string_pretty(&schema).unwrap_or_else(|_| schema.as_value().to_string());
-  format!(
-    "You must reply with a single valid JSON object that conforms to the following JSON Schema. \
-     Do not include any explanation, markdown code fences, or extra text.\n\nJSON Schema:\n\
-     {schema_json}"
-  )
-}
-
-/// Concatenate the caller's system prompt with the internal instruction; a blank system is treated as not provided.
-fn merge_system(system: Option<&str>, instruction: &str) -> String {
-  match system.map(str::trim).filter(|s| !s.is_empty()) {
-    Some(system) => format!("{system}\n\n{instruction}"),
-    None => instruction.to_owned(),
-  }
-}
-
-/// Derive the schema name from the type name.
-///
-/// OpenAI requires `name` to contain only `[a-zA-Z0-9_-]`, so strip module paths and generic parameters.
-fn schema_name<T: ?Sized>() -> String {
-  let full = std::any::type_name::<T>();
-  let without_generics = full.split('<').next().unwrap_or(full);
-  without_generics
-    .rsplit("::")
-    .next()
-    .unwrap_or(without_generics)
-    .to_owned()
-}
-
-/// Even when forbidden in the prompt, the model may still wrap JSON in ```json ... ```; strip it compatibly here.
-fn strip_code_fence(content: &str) -> &str {
-  let trimmed = content.trim();
-  let Some(rest) = trimmed.strip_prefix("```") else {
-    return trimmed;
-  };
-  // Drop the language-tag line immediately following the opening fence (e.g. ```json).
-  let body = rest.split_once('\n').map_or(rest, |(_, body)| body);
-  body.trim_end().strip_suffix("```").unwrap_or(body).trim()
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::models::action_plan::ActionPlan;
 
   #[test]
   fn infers_json_object_for_deepseek_variants() {
@@ -355,37 +293,5 @@ mod tests {
       StructuredMode::JsonObject
     );
     assert!("nope".parse::<StructuredMode>().is_err());
-  }
-
-  #[test]
-  fn merges_system_prompt() {
-    assert_eq!(merge_system(Some("role"), "rule"), "role\n\nrule");
-    assert_eq!(merge_system(Some("  "), "rule"), "rule");
-    assert_eq!(merge_system(None, "rule"), "rule");
-  }
-
-  #[test]
-  fn schema_name_strips_module_path() {
-    assert_eq!(schema_name::<ActionPlan>(), "ActionPlan");
-  }
-
-  #[test]
-  fn schema_name_strips_generics() {
-    assert_eq!(schema_name::<Vec<ActionPlan>>(), "Vec");
-  }
-
-  #[test]
-  fn strips_fenced_json() {
-    assert_eq!(strip_code_fence("```json\n{\"a\":1}\n```"), "{\"a\":1}");
-  }
-
-  #[test]
-  fn strips_fence_without_language_tag() {
-    assert_eq!(strip_code_fence("```\n{\"a\":1}\n```"), "{\"a\":1}");
-  }
-
-  #[test]
-  fn keeps_plain_json() {
-    assert_eq!(strip_code_fence("  {\"a\":1}  "), "{\"a\":1}");
   }
 }
