@@ -16,7 +16,7 @@ use async_openai::types::chat::{
 use crate::{
   config,
   llm::client::{client, first_choice, request_builder},
-  tools::execute_tool,
+  tools::ToolRegistry,
 };
 
 /// The outcome of a tool-enabled completion.
@@ -49,7 +49,7 @@ impl fmt::Display for BudgetExhausted {
 /// Drive a completion to a final answer, executing tool calls as the model requests them.
 ///
 /// Returns the first choice of the last response, i.e. one that carries no tool calls.
-/// When `tools` is empty this collapses to a single request.
+/// When the registry is empty this collapses to a single request.
 ///
 /// The round budget ([`config::max_tool_rounds`]) is not a hard failure: once it is spent,
 /// one last request goes out with tools disabled, so a long task still returns an answer
@@ -58,7 +58,7 @@ impl fmt::Display for BudgetExhausted {
 pub async fn run(
   model: &str,
   mut messages: Vec<ChatCompletionRequestMessage>,
-  tools: &[ChatCompletionTools],
+  registry: &ToolRegistry,
   max_tokens: u32,
   response_format: Option<ResponseFormat>,
 ) -> anyhow::Result<Completion> {
@@ -69,14 +69,14 @@ pub async fn run(
     let tools_allowed = round < max_rounds;
     // Only meaningful when tools were actually on offer: with an empty tool list there is
     // no loop to exhaust, so the flag must stay false.
-    let budget_exhausted = !tools_allowed && !tools.is_empty();
+    let budget_exhausted = !tools_allowed && !registry.is_empty();
 
-    let mut builder = request_builder(model, messages.clone(), max_tokens, tools);
+    let mut builder = request_builder(model, messages.clone(), max_tokens, registry.definitions());
     if let Some(response_format) = response_format.clone() {
       builder.response_format(response_format);
     }
     if !tools_allowed {
-      disable_tools(&mut builder, tools);
+      disable_tools(&mut builder, registry.definitions());
     }
     // Only worth warning about when tools were actually taken away.
     if budget_exhausted {
@@ -117,7 +117,7 @@ pub async fn run(
     }
 
     round += 1;
-    append_tool_results(&mut messages, tool_calls, choice.message.content).await?;
+    append_tool_results(registry, &mut messages, tool_calls, choice.message.content).await?;
   }
 }
 
@@ -144,6 +144,7 @@ pub(crate) fn disable_tools(
 /// message — even a failing or unsupported one: the API rejects a follow-up request that
 /// leaves a `tool_call_id` unanswered.
 pub(crate) async fn append_tool_results(
+  registry: &ToolRegistry,
   messages: &mut Vec<ChatCompletionRequestMessage>,
   tool_calls: Vec<ChatCompletionMessageToolCalls>,
   assistant_text: Option<String>,
@@ -157,7 +158,7 @@ pub(crate) async fn append_tool_results(
   messages.push(assistant.build()?.into());
 
   for tool_call in tool_calls {
-    let (id, result) = execute(tool_call).await;
+    let (id, result) = execute(registry, tool_call).await;
     messages.push(
       ChatCompletionRequestToolMessageArgs::default()
         .tool_call_id(id)
@@ -171,14 +172,17 @@ pub(crate) async fn append_tool_results(
 }
 
 /// Execute one tool call, returning its id and the text to feed back to the model.
-async fn execute(tool_call: ChatCompletionMessageToolCalls) -> (String, String) {
+async fn execute(
+  registry: &ToolRegistry,
+  tool_call: ChatCompletionMessageToolCalls,
+) -> (String, String) {
   match tool_call {
     ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
       id,
       function: FunctionCall { name, arguments },
     }) => {
       tracing::info!(tool = %name, %arguments, "executing tool");
-      let result = execute_tool(&name, &arguments).await;
+      let result = registry.execute(&name, &arguments).await;
       tracing::info!(tool = %name, %result, "tool finished");
       (id, result)
     }

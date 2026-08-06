@@ -1,5 +1,6 @@
 use agent::{
   config, llm::structured::chat_complete_structured, models::action_plan::ActionPlan, telemetry,
+  tools::ToolRegistry,
 };
 
 #[tokio::main]
@@ -10,7 +11,7 @@ async fn main() -> anyhow::Result<()> {
     config::model(),
     Some("You are a general-purpose assistant"),
     "Help me plan a three-day trip to Hangzhou",
-    &[],
+    &ToolRegistry::empty(),
   )
   .await?;
 

@@ -9,9 +9,11 @@ async-openai = { version = "0.41", features = ["chat-completion"] }
 async-stream = "0.3.6"
 async-trait = "0.1.91"
 backon = "1.6.0"
+chrono = "0.4.45"
 dotenvy = "0.15.7"
 futures = "0.3.33"
 reqwest = { version = "0.13.4", features = ["json"] }
+rmcp = { version = "3.1.1", features = ["client", "server", "macros", "transport-child-process", "transport-io", "transport-streamable-http-client-reqwest"] }
 schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

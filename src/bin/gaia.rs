@@ -5,9 +5,9 @@ use agent::{
   gaia::{dataset::load_gaia_level1, evaluator::evaluate_gaia_single, models::GaiaEvalResult},
   llm::semaphore::get_semaphore,
   telemetry,
-  tools::tools,
+  tools::ToolRegistry,
 };
-use async_openai::types::chat::ChatCompletionTools;
+use std::sync::Arc;
 use tokio::task::JoinSet;
 
 /// Number of problems to evaluate.
@@ -29,16 +29,20 @@ pub async fn gaia_level1_experiment() -> anyhow::Result<()> {
   let model = config::model();
 
   // Both arms run the same problems, so the comparison is paired rather than across samples.
-  let groups: [(&'static str, &'static [ChatCompletionTools]); 2] =
-    [(GROUP_WITHOUT_TOOLS, &[]), (GROUP_WITH_TOOLS, tools())];
+  // `Arc` because each spawned task needs its own handle on the shared registry.
+  let groups: [(&'static str, Arc<ToolRegistry>); 2] = [
+    (GROUP_WITHOUT_TOOLS, Arc::new(ToolRegistry::empty())),
+    (GROUP_WITH_TOOLS, Arc::new(ToolRegistry::builtin()?)),
+  ];
 
   let mut set = JoinSet::new();
-  for (group, tools) in groups {
+  for (group, registry) in groups {
     // Clone rather than consume: the problems are needed by the other arm too.
     for problem in problems.iter().cloned() {
+      let registry = Arc::clone(&registry);
       set.spawn(async move {
         let _permit = get_semaphore().acquire().await?;
-        let eval = evaluate_gaia_single(problem, model, tools).await;
+        let eval = evaluate_gaia_single(problem, model, &registry).await;
         Ok::<_, anyhow::Error>((group, eval))
       });
     }

@@ -1,4 +1,3 @@
-use async_openai::types::chat::ChatCompletionTools;
 use async_stream::stream;
 use backon::{ExponentialBuilder, Retryable};
 use futures::{Stream, StreamExt};
@@ -10,6 +9,7 @@ use crate::{
     tool_calls::ToolCallAccumulator,
     tool_loop::{append_tool_results, disable_tools},
   },
+  tools::ToolRegistry,
 };
 
 /// Max retry attempts.
@@ -28,7 +28,7 @@ fn chat_stream<'a>(
   model: &'a str,
   system: Option<&'a str>,
   prompt: &'a str,
-  tools: &'a [ChatCompletionTools],
+  registry: &'a ToolRegistry,
 ) -> impl Stream<Item = anyhow::Result<String>> + 'a {
   stream! {
     ensure_valid_params(model, prompt)?;
@@ -40,11 +40,12 @@ fn chat_stream<'a>(
     loop {
       let tools_allowed = round < max_rounds;
 
-      let mut builder = request_builder(model, messages.clone(), DEFAULT_MAX_TOKENS, tools);
+      let mut builder =
+        request_builder(model, messages.clone(), DEFAULT_MAX_TOKENS, registry.definitions());
       if !tools_allowed {
-        disable_tools(&mut builder, tools);
+        disable_tools(&mut builder, registry.definitions());
         // Only worth warning about when tools were actually taken away.
-        if !tools.is_empty() {
+        if !registry.is_empty() {
           tracing::warn!(max_rounds, "tool round budget spent; forcing a final answer");
         }
       }
@@ -104,7 +105,9 @@ fn chat_stream<'a>(
         }
       };
 
-      if let Err(err) = append_tool_results(&mut messages, tool_calls, Some(assistant_text)).await {
+      if let Err(err) =
+        append_tool_results(registry, &mut messages, tool_calls, Some(assistant_text)).await
+      {
         yield Err(err);
         return;
       }
@@ -120,10 +123,10 @@ pub async fn chat_stream_with_retry(
   model: &str,
   system: Option<&str>,
   prompt: &str,
-  tools: &[ChatCompletionTools],
+  registry: &ToolRegistry,
 ) -> anyhow::Result<String> {
   let op = || async {
-    let stream = chat_stream(model, system, prompt, tools);
+    let stream = chat_stream(model, system, prompt, registry);
     futures::pin_mut!(stream);
 
     let mut output = String::new();

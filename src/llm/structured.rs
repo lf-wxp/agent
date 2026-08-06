@@ -7,7 +7,7 @@
 use std::{fmt, str::FromStr};
 
 use async_openai::types::chat::{
-  ChatChoice, ChatCompletionTools, FinishReason, ResponseFormat, ResponseFormatJsonSchema,
+  ChatChoice, FinishReason, ResponseFormat, ResponseFormatJsonSchema,
 };
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -18,6 +18,7 @@ use crate::{
     client::{build_messages, ensure_valid_params},
     tool_loop::{self, BudgetExhausted},
   },
+  tools::ToolRegistry,
   util::truncate_chars,
 };
 
@@ -211,7 +212,7 @@ pub async fn chat_complete_structured_raw<T: JsonSchema>(
   model: &str,
   system: Option<&str>,
   prompt: &str,
-  tools: &[ChatCompletionTools],
+  registry: &ToolRegistry,
 ) -> anyhow::Result<StructuredChoice> {
   ensure_valid_params(model, prompt)?;
 
@@ -231,7 +232,7 @@ pub async fn chat_complete_structured_raw<T: JsonSchema>(
   let completion = tool_loop::run(
     model,
     build_messages(system_content.as_deref(), prompt)?,
-    tools,
+    registry,
     mode.max_tokens(),
     Some(response_format),
   )
@@ -249,12 +250,12 @@ pub async fn chat_complete_structured<T>(
   model: &str,
   system: Option<&str>,
   prompt: &str,
-  tools: &[ChatCompletionTools],
+  registry: &ToolRegistry,
 ) -> anyhow::Result<T>
 where
   T: JsonSchema + DeserializeOwned,
 {
-  chat_complete_structured_raw::<T>(model, system, prompt, tools)
+  chat_complete_structured_raw::<T>(model, system, prompt, registry)
     .await?
     .parse()
 }

@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "demo": {
+      "command": "cargo",
+      "args": ["run", "--quiet", "--example", "mcp_server"]
+    },
+    "everything": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-everything"],
+      "env": {
+        "LOG_LEVEL": "info"
+      },
+      "disabled": true
+    },
+    "remote": {
+      "type": "http",
+      "url": "http://localhost:3001/mcp",
+      "headers": {
+        "Authorization": "Bearer ${env:MCP_BEARER_TOKEN}"
+      },
+      "disabled": true
+    }
+  }
+}

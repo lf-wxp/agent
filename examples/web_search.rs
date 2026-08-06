@@ -1,4 +1,4 @@
-use agent::{config, llm::complete::chat_complete, telemetry, tools::tools};
+use agent::{config, llm::complete::chat_complete, telemetry, tools::ToolRegistry};
 
 const SYSTEM_PROMPT: &str = "You are a general-purpose assistant. When you use search \
                              results, cite the source URL.";
@@ -12,7 +12,7 @@ async fn main() -> anyhow::Result<()> {
     config::model(),
     Some(SYSTEM_PROMPT),
     "What is the latest stable Rust version, and what did it change?",
-    tools(),
+    &ToolRegistry::builtin()?,
   )
   .await?;
 

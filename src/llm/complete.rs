@@ -1,8 +1,9 @@
-use async_openai::types::chat::ChatCompletionTools;
-
-use crate::llm::{
-  client::{DEFAULT_MAX_TOKENS, build_messages, ensure_valid_params},
-  tool_loop,
+use crate::{
+  llm::{
+    client::{DEFAULT_MAX_TOKENS, build_messages, ensure_valid_params},
+    tool_loop,
+  },
+  tools::ToolRegistry,
 };
 
 /// Plain text completion; executes tool calls when the model requests them.
@@ -14,14 +15,14 @@ pub async fn chat_complete(
   model: &str,
   system: Option<&str>,
   prompt: &str,
-  tools: &[ChatCompletionTools],
+  registry: &ToolRegistry,
 ) -> anyhow::Result<String> {
   ensure_valid_params(model, prompt)?;
 
   let completion = tool_loop::run(
     model,
     build_messages(system, prompt)?,
-    tools,
+    registry,
     DEFAULT_MAX_TOKENS,
     None,
   )

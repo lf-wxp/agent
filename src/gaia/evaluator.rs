@@ -1,11 +1,10 @@
 use std::borrow::Cow;
 
-use async_openai::types::chat::ChatCompletionTools;
-
 use crate::gaia::{
   models::{GaiaEvalResult, GaiaRow, Solution},
   solver::solve_problem_with_retry,
 };
+use crate::tools::ToolRegistry;
 
 pub const GAIA_PROMPT: &str = r#"You are a general AI assistant. I will ask you a question.
 First, determine if you can solve this problem with your current capabilities and set "is_solvable" accordingly.
@@ -60,10 +59,10 @@ fn to_eval_result(
 pub async fn evaluate_gaia_single(
   problem: GaiaRow,
   model: &str,
-  tools: &[ChatCompletionTools],
+  registry: &ToolRegistry,
 ) -> GaiaEvalResult {
-  let system = system_prompt(tools);
-  let result = solve_problem_with_retry(model, &system, &problem.question, tools).await;
+  let system = system_prompt(registry);
+  let result = solve_problem_with_retry(model, &system, &problem.question, registry).await;
   to_eval_result(problem, model, result)
 }
 
@@ -78,8 +77,8 @@ const TOOL_HINT: &str = "You have tools available. Use them to look up any fact 
                          have failed to provide what you need.";
 
 /// Borrowed in the no-tools case so the common path allocates nothing.
-fn system_prompt(tools: &[ChatCompletionTools]) -> Cow<'static, str> {
-  if tools.is_empty() {
+fn system_prompt(registry: &ToolRegistry) -> Cow<'static, str> {
+  if registry.is_empty() {
     Cow::Borrowed(GAIA_PROMPT)
   } else {
     Cow::Owned(format!("{GAIA_PROMPT}\n\n{TOOL_HINT}"))

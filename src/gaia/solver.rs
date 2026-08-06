@@ -1,4 +1,4 @@
-use async_openai::types::chat::{ChatCompletionTools, FinishReason};
+use async_openai::types::chat::FinishReason;
 use backon::{ExponentialBuilder, Retryable};
 
 use crate::{
@@ -7,6 +7,7 @@ use crate::{
     structured::{TruncatedOutput, chat_complete_structured_raw},
     tool_loop::BudgetExhausted,
   },
+  tools::ToolRegistry,
 };
 
 /// Max retry attempts.
@@ -16,9 +17,9 @@ pub async fn solve_problem_with_retry(
   model: &str,
   system: &str,
   prompt: &str,
-  tools: &[ChatCompletionTools],
+  registry: &ToolRegistry,
 ) -> anyhow::Result<Solution> {
-  let op = || solve_problem(model, system, prompt, tools);
+  let op = || solve_problem(model, system, prompt, registry);
   op.retry(ExponentialBuilder::default().with_max_times(MAX_RETRY_TIMES))
     // Skip deterministic failures, where a retry only burns resources for the same outcome:
     // a max_tokens truncation repeats token spend, and a budget-exhausted attempt replays
@@ -35,11 +36,11 @@ async fn solve_problem(
   model: &str,
   system: &str,
   prompt: &str,
-  tools: &[ChatCompletionTools],
+  registry: &ToolRegistry,
 ) -> anyhow::Result<Solution> {
   // The structured approach (native schema / prompt injection) is decided automatically by the model; see `llm::structured`.
   let choice =
-    chat_complete_structured_raw::<GaiaOutput>(model, Some(system), prompt, tools).await?;
+    chat_complete_structured_raw::<GaiaOutput>(model, Some(system), prompt, registry).await?;
 
   // Read before `parse` consumes the choice.
   let budget_exhausted = choice.budget_exhausted();

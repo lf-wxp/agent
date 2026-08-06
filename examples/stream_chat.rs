@@ -2,6 +2,7 @@ use agent::{
   config,
   llm::{semaphore::get_semaphore, stream::chat_stream_with_retry},
   telemetry,
+  tools::ToolRegistry,
 };
 use tokio::task::JoinSet;
 use tracing::Instrument;
@@ -33,7 +34,9 @@ async fn main() -> anyhow::Result<()> {
     set.spawn(
       async move {
         let _permit = get_semaphore().acquire().await?;
-        let output = chat_stream_with_retry(model, Some(SYSTEM_PROMPT), prompt, &[]).await?;
+        let output =
+          chat_stream_with_retry(model, Some(SYSTEM_PROMPT), prompt, &ToolRegistry::empty())
+            .await?;
         Ok::<_, anyhow::Error>((prompt, output))
       }
       .instrument(span),

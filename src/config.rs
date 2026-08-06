@@ -4,7 +4,7 @@
 //! [`crate::telemetry::init`] (which loads `.env` internally); otherwise values
 //! set in `.env` will not take effect.
 
-use std::sync::LazyLock;
+use std::{path::PathBuf, sync::LazyLock};
 
 use tracing::Level;
 
@@ -23,6 +23,9 @@ const ENV_STRUCTURED_MODE: &str = "LLM_STRUCTURED_MODE";
 /// Environment variable: rounds of tool execution allowed before a final answer is forced.
 const ENV_MAX_TOOL_ROUNDS: &str = "LLM_MAX_TOOL_ROUNDS";
 
+/// Environment variable: path to the MCP server config file.
+const ENV_MCP_CONFIG_PATH: &str = "MCP_CONFIG_PATH";
+
 /// Environment variable: Tavily API key, used by the `web_search` tool.
 const ENV_TAVILY_API_KEY: &str = "TAVILY_API_KEY";
 
@@ -37,6 +40,9 @@ const DEFAULT_MAX_CONCURRENCY: usize = 3;
 
 /// Default tool-round budget: enough for multi-step tasks while keeping cost bounded.
 const DEFAULT_MAX_TOOL_ROUNDS: usize = 10;
+
+/// Default MCP config location, relative to the working directory.
+const DEFAULT_MCP_CONFIG_PATH: &str = "mcp.json";
 
 /// Default Tavily search depth: `basic` costs 1 credit and balances latency against relevance.
 const DEFAULT_TAVILY_SEARCH_DEPTH: &str = "basic";
@@ -79,6 +85,13 @@ pub fn max_tool_rounds() -> usize {
   non_empty_var(ENV_MAX_TOOL_ROUNDS)
     .and_then(|value| value.parse::<usize>().ok())
     .unwrap_or(DEFAULT_MAX_TOOL_ROUNDS)
+}
+
+/// Path to the `mcp.json` declaring MCP servers. Override with `MCP_CONFIG_PATH`.
+pub fn mcp_config_path() -> PathBuf {
+  non_empty_var(ENV_MCP_CONFIG_PATH)
+    .map(PathBuf::from)
+    .unwrap_or_else(|| PathBuf::from(DEFAULT_MCP_CONFIG_PATH))
 }
 
 /// Tavily API key used by the `web_search` tool. `None` when unset.
