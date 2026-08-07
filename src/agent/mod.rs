@@ -5,4 +5,4 @@ pub mod runtime;
 
 pub use context::{ExecutionContext, TokenUsage};
 pub use event::{ContentItem, Event, ToolResultStatus};
-pub use runtime::{Agent, AgentResult, StructuredAgentResult};
+pub use runtime::{Agent, AgentResult, AgentStreamEvent, StructuredAgentResult};

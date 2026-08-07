@@ -13,4 +13,4 @@ pub mod telemetry;
 pub mod tools;
 pub mod util;
 
-pub use agent::{Agent, AgentResult, StructuredAgentResult};
+pub use agent::{Agent, AgentResult, AgentStreamEvent, StructuredAgentResult};

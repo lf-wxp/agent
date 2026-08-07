@@ -9,7 +9,10 @@
 //! so a fix made there (retries, concurrency limits, degradation) does not have to be
 //! ported by hand.
 //!
-//! Known gap versus `tool_loop`: no streaming counterpart yet (see [`crate::llm::stream`]).
+//! [`Agent::run_stream`] / [`Agent::run_continuing_stream`] are the streaming counterparts
+//! of [`Agent::run`] / [`Agent::run_continuing`]: same loop, round budget and event
+//! recording, but assistant text is forwarded as it is produced (see
+//! [`crate::llm::stream`] for the same idea without event recording).
 //!
 //! Multi-turn conversations are supported via [`Agent::run_continuing`], which seeds a
 //! call with a prior turn's events instead of starting from an empty transcript. `Agent`
@@ -29,7 +32,8 @@ use async_openai::types::chat::{
   ChatCompletionRequestUserMessageArgs, ChatCompletionToolChoiceOption, ChatCompletionTools,
   CreateChatCompletionResponse, FinishReason, FunctionCall, ResponseFormat, ToolChoiceOptions,
 };
-use futures::future::join_all;
+use async_stream::stream;
+use futures::{Stream, StreamExt, future::join_all};
 
 use crate::{
   config,
@@ -42,6 +46,7 @@ use crate::{
       strip_code_fence,
     },
     structured::{StructuredMode, TruncatedOutput},
+    tool_calls::ToolCallAccumulator,
     tool_loop::{BudgetExhausted, disable_tools},
   },
   tools::ToolRegistry,
@@ -75,6 +80,26 @@ pub struct StructuredAgentResult<T> {
   pub output: T,
   pub context: ExecutionContext,
   pub budget_exhausted: bool,
+}
+
+/// One increment produced by [`Agent::run_stream`] / [`Agent::run_continuing_stream`].
+///
+/// A caller interested only in the text (e.g. forwarding straight to an SSE response) can
+/// match on [`Self::Token`] and ignore everything else until the stream ends; a caller that
+/// needs to persist the turn (e.g. [`crate::api::session::SessionStore`]) reads
+/// [`Self::Done`]'s `context` — the same fields as [`AgentResult`], just delivered as the
+/// stream's last item instead of a return value.
+#[derive(Debug)]
+pub enum AgentStreamEvent {
+  /// A chunk of assistant text, forwarded as soon as the model emits it.
+  Token(String),
+  /// The run finished. Always the last item; nothing follows it.
+  Done {
+    output: String,
+    context: ExecutionContext,
+    /// See [`AgentResult::budget_exhausted`].
+    budget_exhausted: bool,
+  },
 }
 
 /// Drives a model to a final answer, executing tool calls as it requests them.
@@ -249,6 +274,143 @@ impl Agent {
       self.record_tool_calls(&mut context, &tool_calls);
       self.execute_tool_calls(&mut context, &tool_calls).await;
       context.increment_step();
+    }
+  }
+
+  /// Streaming counterpart of [`Self::run`]: same tool-calling loop and round budget, but
+  /// assistant text is forwarded to the caller as soon as the model emits it, instead of
+  /// only once the whole run finishes. Equivalent to [`Self::run_continuing_stream`] with
+  /// an empty history.
+  pub fn run_stream<'a>(
+    &'a self,
+    user_input: &'a str,
+  ) -> impl Stream<Item = anyhow::Result<AgentStreamEvent>> + 'a {
+    self.run_continuing_stream(Vec::new(), user_input)
+  }
+
+  /// Streaming counterpart of [`Self::run_continuing`].
+  ///
+  /// Tool-call fragments are reassembled by [`ToolCallAccumulator`], the same way
+  /// [`crate::llm::stream`] does it, but tools are executed through
+  /// [`Self::execute_tool_calls`] rather than [`crate::tools::ToolRegistry::execute`], so
+  /// every call sees the real [`ExecutionContext`] being built for this run — same as
+  /// [`Self::run_continuing`] — instead of a throwaway one. Every round is recorded into
+  /// that `ExecutionContext` exactly as the non-streaming path does (assistant text that
+  /// accompanies a tool call is forwarded to the caller but, like [`Self::run_continuing`],
+  /// not persisted into the transcript — only the call itself is), so a caller switching
+  /// between the two gets the same transcript shape either way.
+  ///
+  /// Text is forwarded as [`AgentStreamEvent::Token`]s as soon as it arrives; the final
+  /// [`AgentStreamEvent::Done`] carries the same fields as [`AgentResult`] and is always the
+  /// last item, so a caller can stream tokens to a client while still waiting for `Done` to
+  /// get the context to persist (e.g. into [`crate::api::session::SessionStore`]).
+  pub fn run_continuing_stream<'a>(
+    &'a self,
+    history: Vec<Event>,
+    user_input: &'a str,
+  ) -> impl Stream<Item = anyhow::Result<AgentStreamEvent>> + 'a {
+    stream! {
+      let mut context = self.seed_context(history, user_input);
+
+      loop {
+        let (tools_allowed, budget_exhausted) = self.round_budget(&context);
+
+        let messages = self.build_messages(&context)?;
+        let mut builder = request_builder(
+          &self.model,
+          messages,
+          DEFAULT_MAX_TOKENS,
+          self.toolbox.definitions(),
+        );
+        if !tools_allowed {
+          disable_tools(&mut builder, self.toolbox.definitions());
+        }
+
+        let mut chunks = with_retry(
+          || async {
+            let _permit = self.provider.acquire().await?;
+            let stream = self
+              .provider
+              .client()
+              .chat()
+              .create_stream(builder.build()?)
+              .await?;
+            anyhow::Ok(stream)
+          },
+          |_| true,
+        )
+        .await?;
+
+        let mut accumulator = ToolCallAccumulator::default();
+        // Forwarded token by token as it arrives; also kept so the final answer (or the
+        // fallback content once tools are disabled) can be recorded as one piece.
+        let mut assistant_text = String::new();
+
+        while let Some(chunk) = chunks.next().await {
+          let chunk = match chunk {
+            Ok(chunk) => chunk,
+            // Abort instead of continuing: after a transport error the remaining
+            // fragments would assemble into a truncated tool call.
+            Err(err) => {
+              yield Err(err.into());
+              return;
+            }
+          };
+
+          let Some(choice) = chunk.choices.first() else {
+            continue;
+          };
+
+          if let Some(fragments) = &choice.delta.tool_calls {
+            accumulator.push(fragments);
+          }
+
+          // Heartbeat / role-declaration chunks have empty delta.content; skip to avoid
+          // flooding downstream with empty tokens.
+          if let Some(text) = &choice.delta.content
+            && !text.is_empty()
+          {
+            assistant_text.push_str(text);
+            yield Ok(AgentStreamEvent::Token(text.clone()));
+          }
+        }
+
+        // No tool calls means the model produced its final answer.
+        if accumulator.is_empty() {
+          self.record_final_answer(&mut context, &assistant_text);
+          yield Ok(AgentStreamEvent::Done {
+            output: assistant_text,
+            context,
+            budget_exhausted,
+          });
+          return;
+        }
+
+        // The model ignored the disabled tools. Ending here beats looping forever; the
+        // caller has already seen whatever text came back as `Token`s.
+        if !tools_allowed {
+          tracing::warn!("model requested tools after they were disabled");
+          self.record_final_answer(&mut context, &assistant_text);
+          yield Ok(AgentStreamEvent::Done {
+            output: assistant_text,
+            context,
+            budget_exhausted: true,
+          });
+          return;
+        }
+
+        let tool_calls = match accumulator.finish() {
+          Ok(tool_calls) => tool_calls,
+          Err(err) => {
+            yield Err(err);
+            return;
+          }
+        };
+
+        self.record_tool_calls(&mut context, &tool_calls);
+        self.execute_tool_calls(&mut context, &tool_calls).await;
+        context.increment_step();
+      }
     }
   }
 
