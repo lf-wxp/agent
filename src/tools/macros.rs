@@ -36,11 +36,7 @@ macro_rules! simple_tool {
     run = $run:path $(,)?
   ) => {
     $crate::tools::macros::impl_simple_tool!($tool, $args, $name, $description, {
-      async fn execute(
-        &self,
-        args_json: &str,
-        _context: &$crate::agent::ExecutionContext,
-      ) -> anyhow::Result<String> {
+      async fn execute(&self, args_json: &str) -> anyhow::Result<String> {
         $run(args_json)
       }
     });
@@ -54,11 +50,7 @@ macro_rules! simple_tool {
     async run = $run:path $(,)?
   ) => {
     $crate::tools::macros::impl_simple_tool!($tool, $args, $name, $description, {
-      async fn execute(
-        &self,
-        args_json: &str,
-        _context: &$crate::agent::ExecutionContext,
-      ) -> anyhow::Result<String> {
+      async fn execute(&self, args_json: &str) -> anyhow::Result<String> {
         $run(args_json).await
       }
     });

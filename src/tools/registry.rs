@@ -4,19 +4,16 @@ use std::{path::Path, sync::Arc};
 
 use async_openai::types::chat::ChatCompletionTools;
 
-use crate::{
-  agent::ExecutionContext,
-  tools::{
-    calculator::{self, Calculator},
-    file_delete::{self, DeleteFileTool},
-    file_list::{self, ListFileTool},
-    file_read::{self, ReadFileTool},
-    file_upzip::{self, UnzipFileTool},
-    mcp::{McpConfig, McpConnection},
-    read_image::{self, ReadImageTool},
-    tool::Tool,
-    web_search::{self, WebSearch},
-  },
+use crate::tools::{
+  calculator::{self, Calculator},
+  file_delete::{self, DeleteFileTool},
+  file_list::{self, ListFileTool},
+  file_read::{self, ReadFileTool},
+  file_upzip::{self, UnzipFileTool},
+  mcp::{McpConfig, McpConnection},
+  read_image::{self, ReadImageTool},
+  tool::Tool,
+  web_search::{self, WebSearch},
 };
 
 /// Tools offered for a conversation.
@@ -175,13 +172,13 @@ impl ToolRegistry {
   /// The error text goes back to the model so it can correct itself, which is why
   /// [`Tool::execute`] returns a `Result` and the formatting happens here instead of in
   /// every tool.
-  pub async fn execute(&self, name: &str, arguments: &str, context: &ExecutionContext) -> String {
+  pub async fn execute(&self, name: &str, arguments: &str) -> String {
     // Linear scan: registries hold a handful of tools, so a map would not pay for itself.
     let Some(tool) = self.tools.iter().find(|tool| tool.name() == name) else {
       return format!("Error: unknown tool `{name}`");
     };
 
-    match tool.execute(arguments, context).await {
+    match tool.execute(arguments).await {
       Ok(output) => output,
       Err(err) => {
         // Keep the full chain in the logs; the model only needs the summary.
@@ -274,20 +271,13 @@ mod tests {
   #[tokio::test]
   async fn reports_unknown_tool_instead_of_failing() {
     let registry = ToolRegistry::builtin().unwrap();
-    assert!(
-      registry
-        .execute("nope", "{}", &ExecutionContext::default())
-        .await
-        .starts_with("Error:")
-    );
+    assert!(registry.execute("nope", "{}").await.starts_with("Error:"));
   }
 
   #[tokio::test]
   async fn reports_tool_failure_as_text() {
     let registry = ToolRegistry::builtin().unwrap();
-    let output = registry
-      .execute(calculator::NAME, "not json", &ExecutionContext::default())
-      .await;
+    let output = registry.execute(calculator::NAME, "not json").await;
     assert!(output.starts_with("Error:"), "got: {output}");
   }
 
@@ -298,7 +288,6 @@ mod tests {
       .execute(
         calculator::NAME,
         r#"{"operator":"add","first_number":2,"second_number":3}"#,
-        &ExecutionContext::default(),
       )
       .await;
 

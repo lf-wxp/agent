@@ -15,7 +15,6 @@ use async_openai::types::chat::{
 use futures::future::join_all;
 
 use crate::{
-  agent::ExecutionContext,
   config,
   llm::{
     client::{first_choice, request_builder},
@@ -221,9 +220,7 @@ async fn execute(
         arguments = %truncate_chars(&arguments, TOOL_LOG_PREVIEW_CHARS),
         "executing tool"
       );
-      let result = registry
-        .execute(&name, &arguments, &ExecutionContext::default())
-        .await;
+      let result = registry.execute(&name, &arguments).await;
       tracing::debug!(
         tool = %name,
         result = %truncate_chars(&result, TOOL_LOG_PREVIEW_CHARS),

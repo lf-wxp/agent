@@ -108,7 +108,7 @@ cargo fmt                   # 格式化
 
 - **会话与记忆**：`SessionStore` 的 Redis/DB 实现、`/v1/sessions` 资源化、长期记忆分层、租户+终端用户两级隔离
 - **协议与可扩展性**：`Tool` trait 与 `async-openai` 解耦、类型化错误（`thiserror`）
-- **架构边界**：`gaia` 拆为独立 crate、`Tool::execute` 的 `context` 参数用途明确化、结构化输出接入 HTTP 层
+- **架构边界**：`gaia` 拆为独立 crate、结构化输出接入 HTTP 层
 - **运维**：`Dockerfile` 与部署文档、sweep 任务补充 metrics
 
 </details>

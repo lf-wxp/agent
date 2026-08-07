@@ -293,12 +293,11 @@ impl Agent {
   /// Tool-call fragments are reassembled by [`ToolCallAccumulator`], the same way
   /// [`crate::llm::stream`] does it, but tools are executed through
   /// [`Self::execute_tool_calls`] rather than [`crate::tools::ToolRegistry::execute`], so
-  /// every call sees the real [`ExecutionContext`] being built for this run — same as
-  /// [`Self::run_continuing`] — instead of a throwaway one. Every round is recorded into
-  /// that `ExecutionContext` exactly as the non-streaming path does (assistant text that
-  /// accompanies a tool call is forwarded to the caller but, like [`Self::run_continuing`],
-  /// not persisted into the transcript — only the call itself is), so a caller switching
-  /// between the two gets the same transcript shape either way.
+  /// every round is recorded into this run's [`ExecutionContext`] exactly as
+  /// [`Self::run_continuing`] does (assistant text that accompanies a tool call is
+  /// forwarded to the caller but, like [`Self::run_continuing`], not persisted into the
+  /// transcript — only the call itself is), so a caller switching between the two gets the
+  /// same transcript shape either way.
   ///
   /// Text is forwarded as [`AgentStreamEvent::Token`]s as soon as it arrives; the final
   /// [`AgentStreamEvent::Done`] carries the same fields as [`AgentResult`] and is always the
@@ -789,23 +788,18 @@ impl Agent {
     ));
   }
 
-  /// Execute every call in one model turn, feeding each tool the same context the caller
-  /// will get back — unlike [`ToolRegistry::execute`] (used by [`crate::llm::tool_loop`]),
-  /// which only ever sees a throwaway [`ExecutionContext::default`].
+  /// Execute every call in one model turn.
   ///
-  /// Calls run concurrently rather than one after another: every [`Tool::execute`] only
-  /// reads `context` (`&ExecutionContext`), so independent tool calls requested in the
-  /// same turn (e.g. two `web_search` calls) do not have to pay for each other's network
-  /// latency in sequence.
+  /// Calls run concurrently rather than one after another: [`Tool::execute`] no longer
+  /// takes the caller's [`ExecutionContext`] at all (see [`Tool::execute`]'s docs for why),
+  /// so independent tool calls requested in the same turn (e.g. two `web_search` calls) do
+  /// not have to pay for each other's network latency in sequence, and there is no shared
+  /// state to serialize access to.
   async fn execute_tool_calls(
     &self,
     context: &mut ExecutionContext,
     tool_calls: &[ChatCompletionMessageToolCalls],
   ) {
-    // Reborrowed as immutable for the duration of the concurrent calls below;
-    // `context.add_event` takes a fresh `&mut` once every result is back.
-    let context_ref: &ExecutionContext = context;
-
     let result_items = join_all(tool_calls.iter().filter_map(|tool_call| {
       let ChatCompletionMessageToolCalls::Function(function_call) = tool_call else {
         return None;
@@ -822,7 +816,7 @@ impl Agent {
         );
 
         let (status, content) = match self.toolbox.get(function_name) {
-          Some(tool) => match tool.execute(arguments, context_ref).await {
+          Some(tool) => match tool.execute(arguments).await {
             Ok(result) => {
               tracing::debug!(
                 tool = %function_name,

@@ -9,7 +9,7 @@ pub mod execute;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::{agent::ExecutionContext, tools::tool::Tool};
+use crate::tools::tool::Tool;
 
 /// Tool name, used both in the definition and in dispatch.
 pub const NAME: &str = "calculator";
@@ -32,7 +32,7 @@ impl Tool for Calculator {
     definition::parameters()
   }
 
-  async fn execute(&self, args_json: &str, _context: &ExecutionContext) -> anyhow::Result<String> {
+  async fn execute(&self, args_json: &str) -> anyhow::Result<String> {
     // Pure CPU work: nothing to await, and fast enough not to need spawn_blocking.
     execute::run(args_json)
   }
@@ -93,10 +93,7 @@ mod tests {
   #[tokio::test]
   async fn executes_through_the_trait() {
     let output = Calculator
-      .execute(
-        r#"{"operator":"add","first_number":1,"second_number":2}"#,
-        &ExecutionContext::default(),
-      )
+      .execute(r#"{"operator":"add","first_number":1,"second_number":2}"#)
       .await
       .unwrap();
 
