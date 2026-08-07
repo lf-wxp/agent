@@ -1,18 +1,15 @@
 use async_openai::types::chat::FinishReason;
-use backon::{ExponentialBuilder, Retryable};
 
 use crate::{
   gaia::models::{GaiaOutput, Solution},
   llm::{
     provider::Provider,
+    retry::with_retry,
     structured::{TruncatedOutput, chat_complete_structured_raw},
     tool_loop::BudgetExhausted,
   },
   tools::ToolRegistry,
 };
-
-/// Max retry attempts.
-const MAX_RETRY_TIMES: usize = 3;
 
 pub async fn solve_problem_with_retry(
   provider: &Provider,
@@ -21,17 +18,17 @@ pub async fn solve_problem_with_retry(
   prompt: &str,
   registry: &ToolRegistry,
 ) -> anyhow::Result<Solution> {
-  let op = || solve_problem(provider, model, system, prompt, registry);
-  op.retry(ExponentialBuilder::default().with_max_times(MAX_RETRY_TIMES))
+  with_retry(
+    || solve_problem(provider, model, system, prompt, registry),
     // Skip deterministic failures, where a retry only burns resources for the same outcome:
     // a max_tokens truncation repeats token spend, and a budget-exhausted attempt replays
     // the entire tool round budget.
-    .when(|err: &anyhow::Error| {
+    |err: &anyhow::Error| {
       err.downcast_ref::<TruncatedOutput>().is_none()
         && err.downcast_ref::<BudgetExhausted>().is_none()
-    })
-    .notify(|err, dur| tracing::warn!("retrying after {dur:?}: {err}"))
-    .await
+    },
+  )
+  .await
 }
 
 async fn solve_problem(

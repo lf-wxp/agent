@@ -29,6 +29,9 @@ const ENV_SUPPORTS_TOOL_CHOICE: &str = "LLM_SUPPORTS_TOOL_CHOICE";
 /// Environment variable: rounds of tool execution allowed before a final answer is forced.
 const ENV_MAX_TOOL_ROUNDS: &str = "LLM_MAX_TOOL_ROUNDS";
 
+/// Environment variable: max attempts for a retryable LLM request ([`crate::llm::retry::with_retry`]).
+const ENV_MAX_RETRIES: &str = "LLM_MAX_RETRIES";
+
 /// Environment variable: path to the MCP server config file.
 const ENV_MCP_CONFIG_PATH: &str = "MCP_CONFIG_PATH";
 
@@ -83,6 +86,9 @@ const DEFAULT_MAX_CONCURRENCY: usize = 3;
 
 /// Default tool-round budget: enough for multi-step tasks while keeping cost bounded.
 const DEFAULT_MAX_TOOL_ROUNDS: usize = 10;
+
+/// Default retry attempts for a transient LLM request failure.
+const DEFAULT_MAX_RETRIES: usize = 3;
 
 /// Default MCP config location, relative to the working directory.
 const DEFAULT_MCP_CONFIG_PATH: &str = "mcp.json";
@@ -176,6 +182,16 @@ pub fn max_tool_rounds() -> usize {
   non_empty_var(ENV_MAX_TOOL_ROUNDS)
     .and_then(|value| value.parse::<usize>().ok())
     .unwrap_or(DEFAULT_MAX_TOOL_ROUNDS)
+}
+
+/// Max attempts for a retryable LLM request ([`crate::llm::retry::with_retry`]), which
+/// every retry-capable call site in this crate shares (a single model request, a whole
+/// stream, a whole GAIA structured solve). Override with `LLM_MAX_RETRIES`; `0` disables
+/// retrying. Invalid (non-numeric) values fall back to the default.
+pub fn max_retries() -> usize {
+  non_empty_var(ENV_MAX_RETRIES)
+    .and_then(|value| value.parse::<usize>().ok())
+    .unwrap_or(DEFAULT_MAX_RETRIES)
 }
 
 /// Path to the `mcp.json` declaring MCP servers. Override with `MCP_CONFIG_PATH`.

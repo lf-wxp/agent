@@ -20,6 +20,7 @@ use crate::{
   llm::{
     client::{first_choice, request_builder},
     provider::Provider,
+    retry::with_retry,
   },
   tools::ToolRegistry,
   util::truncate_chars,
@@ -102,10 +103,17 @@ pub async fn run(
       );
     }
 
-    let response = {
-      let _permit = provider.acquire().await?;
-      provider.client().chat().create(builder.build()?).await?
-    };
+    // Transient failures (rate limits, network blips) are retried with backoff; there is
+    // nothing deterministic to skip at this level, so every failure is eligible.
+    let response = with_retry(
+      || async {
+        let _permit = provider.acquire().await?;
+        let response = provider.client().chat().create(builder.build()?).await?;
+        anyhow::Ok(response)
+      },
+      |_| true,
+    )
+    .await?;
     // The full response can be long; only log metadata to inspect usage and trace id.
     tracing::debug!(id = %response.id, round, usage = ?response.usage, "completion finished");
 

@@ -1,5 +1,4 @@
 use async_stream::stream;
-use backon::{ExponentialBuilder, Retryable};
 use futures::{Stream, StreamExt};
 
 use crate::{
@@ -7,14 +6,12 @@ use crate::{
   llm::{
     client::{DEFAULT_MAX_TOKENS, build_messages, ensure_valid_params, request_builder},
     provider::Provider,
+    retry::with_retry,
     tool_calls::ToolCallAccumulator,
     tool_loop::{append_tool_results, disable_tools},
   },
   tools::ToolRegistry,
 };
-
-/// Max retry attempts.
-const MAX_RETRY_TIMES: usize = 3;
 
 /// Streaming completion, yielding incremental text segments.
 ///
@@ -136,23 +133,25 @@ pub async fn chat_stream_with_retry(
   prompt: &str,
   registry: &ToolRegistry,
 ) -> anyhow::Result<String> {
-  let op = || async {
-    let stream = chat_stream(provider, model, system, prompt, registry);
-    futures::pin_mut!(stream);
+  with_retry(
+    || async {
+      let stream = chat_stream(provider, model, system, prompt, registry);
+      futures::pin_mut!(stream);
 
-    let mut output = String::new();
-    while let Some(result) = stream.next().await {
-      match result {
-        Ok(text) => output.push_str(&text),
-        Err(err) => {
-          tracing::error!("stream error: {err}");
-          return Err(err);
+      let mut output = String::new();
+      while let Some(result) = stream.next().await {
+        match result {
+          Ok(text) => output.push_str(&text),
+          Err(err) => {
+            tracing::error!("stream error: {err}");
+            return Err(err);
+          }
         }
       }
-    }
-    Ok(output)
-  };
-
-  op.retry(ExponentialBuilder::default().with_max_times(MAX_RETRY_TIMES))
-    .await
+      Ok(output)
+    },
+    // No deterministic-failure marker at this level yet; retry every failure.
+    |_| true,
+  )
+  .await
 }

@@ -66,6 +66,7 @@ curl -X POST localhost:8080/v1/agent/run \
 | `LLM_MODEL` | `deepseek-v4-flash` | 默认模型 |
 | `LLM_MAX_CONCURRENCY` | `3` | 单租户并发上限 |
 | `LLM_MAX_TOOL_ROUNDS` | `10` | 单次调用工具轮次预算 |
+| `LLM_MAX_RETRIES` | `3` | 单次模型请求失败后的重试次数（指数退避，`0` 关闭重试） |
 | `LLM_MAX_HISTORY_TOKENS` | `6000` | 多轮历史 token 软上限 |
 | `MCP_CONFIG_PATH` | `mcp.json` | MCP Server 配置路径 |
 | `AGENT_HTTP_ADDR` | `0.0.0.0:8080` | HTTP 服务监听地址 |
@@ -106,7 +107,7 @@ cargo fmt                   # 格式化
 <summary>点击展开后续规划</summary>
 
 - **会话与记忆**：`SessionStore` 的 Redis/DB 实现、`/v1/sessions` 资源化、长期记忆分层、租户+终端用户两级隔离
-- **协议与可扩展性**：`Tool` trait 与 `async-openai` 解耦、类型化错误（`thiserror`）、`Agent` 流式版本、统一重试策略
+- **协议与可扩展性**：`Tool` trait 与 `async-openai` 解耦、类型化错误（`thiserror`）、`Agent` 流式版本
 - **架构边界**：`gaia` 拆为独立 crate、`Tool::execute` 的 `context` 参数用途明确化、结构化输出接入 HTTP 层
 - **运维**：`Dockerfile` 与部署文档、sweep 任务补充 metrics
 

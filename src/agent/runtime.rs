@@ -36,6 +36,7 @@ use crate::{
   llm::{
     client::{DEFAULT_MAX_TOKENS, first_choice, request_builder},
     provider::Provider,
+    retry::with_retry,
     schema::{
       FINAL_ANSWER_TOOL_NAME, final_answer_tool, native_schema_format, schema_instruction,
       strip_code_fence,
@@ -202,15 +203,20 @@ impl Agent {
         disable_tools(&mut builder, self.toolbox.definitions());
       }
 
-      let response = {
-        let _permit = self.provider.acquire().await?;
-        self
-          .provider
-          .client()
-          .chat()
-          .create(builder.build()?)
-          .await?
-      };
+      let response = with_retry(
+        || async {
+          let _permit = self.provider.acquire().await?;
+          let response = self
+            .provider
+            .client()
+            .chat()
+            .create(builder.build()?)
+            .await?;
+          anyhow::Ok(response)
+        },
+        |_| true,
+      )
+      .await?;
       self.record_usage(&mut context, &response);
       let message = first_choice(response)?.message;
 
@@ -310,15 +316,20 @@ impl Agent {
         ToolChoiceOptions::Required,
       ));
 
-      let response = {
-        let _permit = self.provider.acquire().await?;
-        self
-          .provider
-          .client()
-          .chat()
-          .create(builder.build()?)
-          .await?
-      };
+      let response = with_retry(
+        || async {
+          let _permit = self.provider.acquire().await?;
+          let response = self
+            .provider
+            .client()
+            .chat()
+            .create(builder.build()?)
+            .await?;
+          anyhow::Ok(response)
+        },
+        |_| true,
+      )
+      .await?;
       self.record_usage(&mut context, &response);
       let choice = first_choice(response)?;
 
@@ -437,15 +448,20 @@ impl Agent {
         disable_tools(&mut builder, self.toolbox.definitions());
       }
 
-      let response = {
-        let _permit = self.provider.acquire().await?;
-        self
-          .provider
-          .client()
-          .chat()
-          .create(builder.build()?)
-          .await?
-      };
+      let response = with_retry(
+        || async {
+          let _permit = self.provider.acquire().await?;
+          let response = self
+            .provider
+            .client()
+            .chat()
+            .create(builder.build()?)
+            .await?;
+          anyhow::Ok(response)
+        },
+        |_| true,
+      )
+      .await?;
       self.record_usage(&mut context, &response);
       let choice = first_choice(response)?;
 
