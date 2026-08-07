@@ -8,7 +8,12 @@ use crate::{
   agent::ExecutionContext,
   tools::{
     calculator::{self, Calculator},
+    file_delete::{self, DeleteFileTool},
+    file_list::{self, ListFileTool},
+    file_read::{self, ReadFileTool},
+    file_upzip::{self, UnzipFileTool},
     mcp::{McpConfig, McpConnection},
+    read_image::{self, ReadImageTool},
     tool::Tool,
     web_search::{self, WebSearch},
   },
@@ -34,10 +39,22 @@ impl ToolRegistry {
   }
 
   /// The built-in tools, which need no external process to construct.
+  ///
+  /// Includes the filesystem tools (`file_delete`, `file_list`, `file_read`,
+  /// `file_upzip`, `read_image`) by default, alongside `calculator` / `web_search`:
+  /// this agent is meant to run with local filesystem access, so there is no
+  /// safer-by-default subset to fall back to. Callers that need to withhold them
+  /// (e.g. a sandboxed or read-only deployment) should build a registry with
+  /// [`Self::select`] instead.
   pub fn builtin() -> anyhow::Result<Self> {
     let mut registry = Self::empty();
     registry.add(Arc::new(Calculator))?;
     registry.add(Arc::new(WebSearch))?;
+    registry.add(Arc::new(DeleteFileTool))?;
+    registry.add(Arc::new(ListFileTool))?;
+    registry.add(Arc::new(ReadFileTool))?;
+    registry.add(Arc::new(UnzipFileTool))?;
+    registry.add(Arc::new(ReadImageTool))?;
     Ok(registry)
   }
 
@@ -53,6 +70,11 @@ impl ToolRegistry {
       let tool: Arc<dyn Tool> = match name.as_str() {
         calculator::NAME => Arc::new(Calculator),
         web_search::NAME => Arc::new(WebSearch),
+        file_delete::NAME => Arc::new(DeleteFileTool),
+        file_list::NAME => Arc::new(ListFileTool),
+        file_read::NAME => Arc::new(ReadFileTool),
+        file_upzip::NAME => Arc::new(UnzipFileTool),
+        read_image::NAME => Arc::new(ReadImageTool),
         other => anyhow::bail!("unknown tool `{other}`"),
       };
       registry.add(tool)?;
@@ -189,7 +211,9 @@ impl std::fmt::Debug for ToolRegistry {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::tools::{calculator, web_search};
+  use crate::tools::{
+    calculator, file_delete, file_list, file_read, file_upzip, read_image, web_search,
+  };
 
   #[test]
   fn empty_registry_advertises_nothing() {
@@ -202,8 +226,17 @@ mod tests {
   fn builtin_registers_every_tool_once() {
     let registry = ToolRegistry::builtin().unwrap();
     assert_eq!(registry.len(), registry.definitions().len());
-    assert!(registry.contains(calculator::NAME));
-    assert!(registry.contains(web_search::NAME));
+    for name in [
+      calculator::NAME,
+      web_search::NAME,
+      file_delete::NAME,
+      file_list::NAME,
+      file_read::NAME,
+      file_upzip::NAME,
+      read_image::NAME,
+    ] {
+      assert!(registry.contains(name), "missing built-in tool `{name}`");
+    }
   }
 
   #[test]
@@ -211,6 +244,13 @@ mod tests {
     let registry = ToolRegistry::select(&[calculator::NAME.to_owned()]).unwrap();
     assert!(registry.contains(calculator::NAME));
     assert!(!registry.contains(web_search::NAME));
+  }
+
+  #[test]
+  fn select_accepts_filesystem_tool_names() {
+    let registry = ToolRegistry::select(&[file_delete::NAME.to_owned()]).unwrap();
+    assert!(registry.contains(file_delete::NAME));
+    assert!(!registry.contains(calculator::NAME));
   }
 
   #[test]

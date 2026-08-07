@@ -28,3 +28,5 @@ target
 
 mcp.json
 tenants.json
+
+.DS_Store

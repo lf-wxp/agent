@@ -28,6 +28,7 @@
         "rmcp",
         "rsplit",
         "rustc",
+        "sandboxed",
         "schemars",
         "serde",
         "streamable",
