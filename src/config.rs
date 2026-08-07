@@ -4,7 +4,7 @@
 //! [`crate::telemetry::init`] (which loads `.env` internally); otherwise values
 //! set in `.env` will not take effect.
 
-use std::{path::PathBuf, sync::LazyLock};
+use std::{path::PathBuf, str::FromStr, sync::LazyLock};
 
 use tracing::Level;
 
@@ -134,17 +134,12 @@ pub fn model() -> &'static str {
 
 /// Max concurrency. Override with `LLM_MAX_CONCURRENCY`; invalid values (non-numeric or 0) fall back to the default.
 pub fn max_concurrency() -> usize {
-  non_empty_var(ENV_MAX_CONCURRENCY)
-    .and_then(|value| value.parse::<usize>().ok())
-    .filter(|value| *value > 0)
-    .unwrap_or(DEFAULT_MAX_CONCURRENCY)
+  parsed_var_nonzero(ENV_MAX_CONCURRENCY, DEFAULT_MAX_CONCURRENCY)
 }
 
 /// Log level. Override with `RUST_LOG`; falls back to `INFO` when unparseable.
 pub fn log_level() -> Level {
-  non_empty_var(ENV_LOG_LEVEL)
-    .and_then(|value| value.parse::<Level>().ok())
-    .unwrap_or(Level::INFO)
+  parsed_var(ENV_LOG_LEVEL, Level::INFO)
 }
 
 /// Forced override for the structured-output mode; auto-inferred from the model name when unset.
@@ -179,9 +174,7 @@ fn infer_tool_choice_support(model: &str) -> bool {
 ///
 /// Unlike the other limits, `0` is meaningful here: it disables tool calling entirely.
 pub fn max_tool_rounds() -> usize {
-  non_empty_var(ENV_MAX_TOOL_ROUNDS)
-    .and_then(|value| value.parse::<usize>().ok())
-    .unwrap_or(DEFAULT_MAX_TOOL_ROUNDS)
+  parsed_var(ENV_MAX_TOOL_ROUNDS, DEFAULT_MAX_TOOL_ROUNDS)
 }
 
 /// Max attempts for a retryable LLM request ([`crate::llm::retry::with_retry`]), which
@@ -189,9 +182,7 @@ pub fn max_tool_rounds() -> usize {
 /// stream, a whole GAIA structured solve). Override with `LLM_MAX_RETRIES`; `0` disables
 /// retrying. Invalid (non-numeric) values fall back to the default.
 pub fn max_retries() -> usize {
-  non_empty_var(ENV_MAX_RETRIES)
-    .and_then(|value| value.parse::<usize>().ok())
-    .unwrap_or(DEFAULT_MAX_RETRIES)
+  parsed_var(ENV_MAX_RETRIES, DEFAULT_MAX_RETRIES)
 }
 
 /// Path to the `mcp.json` declaring MCP servers. Override with `MCP_CONFIG_PATH`.
@@ -218,11 +209,10 @@ pub fn tenants_config_path() -> PathBuf {
 /// kept before eviction. Override with `AGENT_SESSION_TTL_SECS`; invalid values
 /// (non-numeric or 0) fall back to the default.
 pub fn session_ttl() -> std::time::Duration {
-  let secs = non_empty_var(ENV_SESSION_TTL_SECS)
-    .and_then(|value| value.parse::<u64>().ok())
-    .filter(|value| *value > 0)
-    .unwrap_or(DEFAULT_SESSION_TTL_SECS);
-  std::time::Duration::from_secs(secs)
+  std::time::Duration::from_secs(parsed_var_nonzero(
+    ENV_SESSION_TTL_SECS,
+    DEFAULT_SESSION_TTL_SECS,
+  ))
 }
 
 /// How long a cached response stays valid for its `Idempotency-Key`
@@ -230,21 +220,17 @@ pub fn session_ttl() -> std::time::Duration {
 /// `AGENT_IDEMPOTENCY_TTL_SECS`; invalid values (non-numeric or 0) fall back to the
 /// default.
 pub fn idempotency_ttl() -> std::time::Duration {
-  let secs = non_empty_var(ENV_IDEMPOTENCY_TTL_SECS)
-    .and_then(|value| value.parse::<u64>().ok())
-    .filter(|value| *value > 0)
-    .unwrap_or(DEFAULT_IDEMPOTENCY_TTL_SECS);
-  std::time::Duration::from_secs(secs)
+  std::time::Duration::from_secs(parsed_var_nonzero(
+    ENV_IDEMPOTENCY_TTL_SECS,
+    DEFAULT_IDEMPOTENCY_TTL_SECS,
+  ))
 }
 
 /// Soft token budget for conversation history handed to [`crate::agent::Agent::run_continuing`]
 /// (see [`crate::agent::history::trim_to_budget`]). Override with `LLM_MAX_HISTORY_TOKENS`;
 /// invalid values (non-numeric or 0) fall back to the default.
 pub fn max_history_tokens() -> usize {
-  non_empty_var(ENV_MAX_HISTORY_TOKENS)
-    .and_then(|value| value.parse::<usize>().ok())
-    .filter(|value| *value > 0)
-    .unwrap_or(DEFAULT_MAX_HISTORY_TOKENS)
+  parsed_var_nonzero(ENV_MAX_HISTORY_TOKENS, DEFAULT_MAX_HISTORY_TOKENS)
 }
 
 /// Tavily API key used by the `web_search` tool. `None` when unset.
@@ -291,6 +277,28 @@ fn non_empty_var(key: &str) -> Option<String> {
     .filter(|value| !value.is_empty())
 }
 
+/// Parse a numeric/enum env var, falling back to `default` when unset, blank, or
+/// unparseable. Every parsed value is accepted as-is, including a type's zero value; see
+/// [`parsed_var_nonzero`] for the common case where zero should also fall back to
+/// `default`.
+fn parsed_var<T: FromStr>(key: &str, default: T) -> T {
+  non_empty_var(key)
+    .and_then(|value| value.parse::<T>().ok())
+    .unwrap_or(default)
+}
+
+/// Like [`parsed_var`], but also falls back to `default` when the parsed value equals the
+/// type's zero value — for settings where `0` would be nonsensical (a concurrency budget,
+/// a TTL in seconds, a token budget, ...) rather than a deliberate choice. Contrast with
+/// [`max_tool_rounds`] / [`max_retries`], which use [`parsed_var`] because `0` is
+/// meaningful for them (disables tool calling / retrying).
+fn parsed_var_nonzero<T: FromStr + PartialEq + Default>(key: &str, default: T) -> T {
+  non_empty_var(key)
+    .and_then(|value| value.parse::<T>().ok())
+    .filter(|value| *value != T::default())
+    .unwrap_or(default)
+}
+
 /// Parse a boolean-ish env var; unrecognized values are treated as unset (returns `None`).
 fn parse_bool_var(key: &str) -> Option<bool> {
   match non_empty_var(key)?.to_ascii_lowercase().as_str() {
@@ -326,5 +334,49 @@ mod tests {
     for model in ["gpt-4o", "gpt-4o-mini", "claude-3-5-sonnet"] {
       assert!(infer_tool_choice_support(model), "{model} should support");
     }
+  }
+
+  // Each test below uses its own env var name (never read by any `pub fn` in this
+  // module) so it cannot collide with another test running in parallel.
+
+  #[test]
+  fn parsed_var_falls_back_on_unset_blank_or_unparseable() {
+    for key in [
+      "AGENT_TEST_PARSED_VAR_UNSET",
+      "AGENT_TEST_PARSED_VAR_BLANK",
+      "AGENT_TEST_PARSED_VAR_JUNK",
+    ] {
+      assert_eq!(parsed_var::<usize>(key, 7), 7, "{key} should fall back");
+    }
+  }
+
+  #[test]
+  fn parsed_var_accepts_zero_and_any_other_valid_value() {
+    unsafe { std::env::set_var("AGENT_TEST_PARSED_VAR_ZERO", "0") };
+    assert_eq!(parsed_var::<usize>("AGENT_TEST_PARSED_VAR_ZERO", 7), 0);
+
+    unsafe { std::env::set_var("AGENT_TEST_PARSED_VAR_VALUE", "5") };
+    assert_eq!(parsed_var::<usize>("AGENT_TEST_PARSED_VAR_VALUE", 7), 5);
+  }
+
+  #[test]
+  fn parsed_var_nonzero_treats_zero_as_invalid() {
+    unsafe { std::env::set_var("AGENT_TEST_PARSED_VAR_NONZERO_ZERO", "0") };
+    assert_eq!(
+      parsed_var_nonzero::<usize>("AGENT_TEST_PARSED_VAR_NONZERO_ZERO", 7),
+      7,
+      "0 should fall back to the default"
+    );
+
+    unsafe { std::env::set_var("AGENT_TEST_PARSED_VAR_NONZERO_VALUE", "5") };
+    assert_eq!(
+      parsed_var_nonzero::<usize>("AGENT_TEST_PARSED_VAR_NONZERO_VALUE", 7),
+      5
+    );
+
+    assert_eq!(
+      parsed_var_nonzero::<usize>("AGENT_TEST_PARSED_VAR_NONZERO_UNSET", 7),
+      7
+    );
   }
 }
