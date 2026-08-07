@@ -4,6 +4,7 @@
 //! otherwise get tangled together.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::agent::TokenUsage;
 
@@ -34,13 +35,39 @@ pub struct RunRequest {
   /// a one-off, stateless call (the previous, and still default, behavior).
   #[serde(default)]
   pub session_id: Option<String>,
+  /// Ask for a structured (JSON, not free text) answer matching a schema supplied with the
+  /// request, via [`crate::agent::Agent::run_structured_raw`], instead of the default free-text
+  /// answer via [`crate::agent::Agent::run_continuing`]. Cannot be combined with
+  /// [`Self::session_id`] yet: `run_structured_raw` has no history-seeding counterpart of
+  /// [`crate::agent::Agent::run_continuing`], so there would be nowhere to feed the prior turns.
+  #[serde(default)]
+  pub response_schema: Option<StructuredSchemaRequest>,
+}
+
+/// A JSON Schema plus the name the model will see for it, carried on [`RunRequest`] for a
+/// caller that wants a structured answer but has no compile-time Rust type to derive one from
+/// (that path is [`crate::agent::Agent::run_structured`], for library callers that do).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StructuredSchemaRequest {
+  /// Becomes `function.name` / `response_format.json_schema.name`. Must match
+  /// `^[a-zA-Z0-9_-]{1,64}$` (checked in `handlers::run_authenticated` via
+  /// [`crate::llm::schema::validate_schema_name`], not by `serde` — a plain [`String`] here
+  /// keeps this type a direct mirror of the wire format, with no partially-validated
+  /// newtype to keep in sync with the deserializer).
+  pub name: String,
+  pub schema: Value,
 }
 
 /// Body of a successful `POST /v1/agent/run` response.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunResponse {
-  pub output: String,
+  /// A free-text answer serializes the same as before (`"output": "..."`, see
+  /// [`Value::String`]); [`RunRequest::response_schema`] makes this a JSON object/array
+  /// instead. Either way the wire format is unchanged for existing callers that never send
+  /// `responseSchema`.
+  pub output: Value,
   /// `true` when the round budget ran out before the model naturally stopped calling
   /// tools, i.e. this answer was forced from partial information. See
   /// [`crate::agent::AgentResult::budget_exhausted`].
@@ -83,6 +110,7 @@ mod tests {
     assert!(request.instructions.is_none());
     assert!(request.tools.is_none());
     assert!(request.session_id.is_none());
+    assert!(request.response_schema.is_none());
   }
 
   #[test]
@@ -93,9 +121,23 @@ mod tests {
   }
 
   #[test]
+  fn run_request_accepts_a_response_schema() {
+    let request: RunRequest = serde_json::from_str(
+      r#"{"input": "hi", "responseSchema": {"name": "Answer", "schema": {"type": "object"}}}"#,
+    )
+    .unwrap();
+    let response_schema = request.response_schema.unwrap();
+    assert_eq!(response_schema.name, "Answer");
+    assert_eq!(
+      response_schema.schema,
+      serde_json::json!({"type": "object"})
+    );
+  }
+
+  #[test]
   fn run_response_serializes_as_camel_case() {
     let response = RunResponse {
-      output: "42".to_owned(),
+      output: serde_json::json!("42"),
       budget_exhausted: false,
       usage: TokenUsage::default().into(),
       steps: 1,
@@ -103,15 +145,30 @@ mod tests {
     };
 
     let json = serde_json::to_value(&response).unwrap();
+    assert_eq!(json["output"], "42");
     assert_eq!(json["budgetExhausted"], false);
     assert_eq!(json["usage"]["totalTokens"], 0);
     assert!(json.get("sessionId").is_none(), "omitted when absent");
   }
 
   #[test]
+  fn run_response_output_can_be_a_structured_value() {
+    let response = RunResponse {
+      output: serde_json::json!({"answer": 42}),
+      budget_exhausted: false,
+      usage: TokenUsage::default().into(),
+      steps: 1,
+      session_id: None,
+    };
+
+    let json = serde_json::to_value(&response).unwrap();
+    assert_eq!(json["output"]["answer"], 42);
+  }
+
+  #[test]
   fn run_response_echoes_the_session_id_when_present() {
     let response = RunResponse {
-      output: "42".to_owned(),
+      output: serde_json::json!("42"),
       budget_exhausted: false,
       usage: TokenUsage::default().into(),
       steps: 1,

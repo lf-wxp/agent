@@ -28,10 +28,12 @@
 //! tokens, and re-triggering any side-effecting tools) more than once for the same
 //! logical request.
 //!
-//! Structured output ([`crate::Agent::run_structured`]) is not exposed here: it is
-//! generic over a Rust type known at compile time, which has no equivalent for an
-//! arbitrary HTTP client. That is a natural next step, not a fundamental limitation of
-//! this design.
+//! Structured output ([`crate::Agent::run_structured`]) is generic over a Rust type known at
+//! compile time, which has no equivalent for an arbitrary HTTP client; [`dto::RunRequest::
+//! response_schema`] is the HTTP-facing counterpart instead, backed by
+//! [`crate::Agent::run_structured_raw`] — a JSON Schema supplied in the request body rather
+//! than a Rust type. It cannot be combined with `sessionId` yet: `run_structured_raw` has no
+//! history-seeding counterpart of [`crate::Agent::run_continuing`] to feed prior turns into.
 //!
 //! See `src/bin/server.rs` for the binary that wires this router up, starts listening,
 //! and periodically sweeps expired sessions/idempotency records.

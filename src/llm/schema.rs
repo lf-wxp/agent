@@ -16,6 +16,7 @@ use async_openai::types::chat::{
   ChatCompletionTool, ChatCompletionTools, FunctionObjectArgs, ResponseFormat,
   ResponseFormatJsonSchema,
 };
+use serde_json::Value;
 
 /// The synthetic tool name the model uses to submit the final answer in a structured agent loop.
 ///
@@ -38,6 +39,29 @@ pub fn schema_name<T: ?Sized>() -> String {
     .to_owned()
 }
 
+/// Validate a schema `name` supplied at runtime (as opposed to [`schema_name`], which derives
+/// one from a compile-time type and is therefore always valid).
+///
+/// OpenAI's constraint on `function.name` / `response_format.json_schema.name`: 1-64 characters,
+/// `[a-zA-Z0-9_-]` only. A name that violates this reaches this crate from the outside — e.g. a
+/// `response_schema` field on an HTTP request — so it must be rejected here, with a message
+/// naming the actual problem, rather than left to fail as an opaque error from the model API.
+pub fn validate_schema_name(name: &str) -> anyhow::Result<()> {
+  if name.is_empty() || name.len() > 64 {
+    anyhow::bail!(
+      "schema name must be 1-64 characters long, got {} ({name:?})",
+      name.len()
+    );
+  }
+  if !name
+    .chars()
+    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+  {
+    anyhow::bail!("schema name must only contain [a-zA-Z0-9_-], got {name:?}");
+  }
+  Ok(())
+}
+
 /// Build the `final_answer` tool: carries `T`'s JSON Schema for a structured agent loop to end.
 ///
 /// Used by [`crate::agent::runtime::Agent::run_structured`]. The name is fixed to
@@ -50,14 +74,32 @@ pub fn schema_name<T: ?Sized>() -> String {
 /// definition; this is a programming error, not a runtime condition.
 pub fn final_answer_tool<T: schemars::JsonSchema>() -> anyhow::Result<ChatCompletionTools> {
   let schema_json = serde_json::to_value(schemars::schema_for!(T))?;
+  final_answer_tool_from_schema(&schema_name::<T>(), schema_json)
+}
 
+/// Build the `final_answer` tool from a caller-supplied JSON Schema `Value` rather than a
+/// compile-time Rust type, for [`crate::agent::runtime::Agent::run_structured_raw`] — the
+/// counterpart to [`final_answer_tool`] for callers (e.g. the HTTP API) that only have a schema
+/// at runtime.
+///
+/// `name` is used only in the tool's description (the tool itself is always named
+/// [`FINAL_ANSWER_TOOL_NAME`]); callers that accept it from the outside should validate it with
+/// [`validate_schema_name`] first.
+///
+/// # Errors
+///
+/// Returns `Err` when the description / parameters cannot be assembled into an API-accepted
+/// definition.
+pub fn final_answer_tool_from_schema(
+  name: &str,
+  schema: Value,
+) -> anyhow::Result<ChatCompletionTools> {
   let function = FunctionObjectArgs::default()
     .name(FINAL_ANSWER_TOOL_NAME)
     .description(format!(
-      "Return the final answer as a `{}` object matching the required schema.",
-      schema_name::<T>()
+      "Return the final answer as a `{name}` object matching the required schema."
     ))
-    .parameters(schema_json)
+    .parameters(schema)
     .build()
     .map_err(|e| anyhow::anyhow!("Failed to build `{FINAL_ANSWER_TOOL_NAME}` tool: {e}"))?;
 
@@ -72,11 +114,25 @@ pub fn final_answer_tool<T: schemars::JsonSchema>() -> anyhow::Result<ChatComple
 /// fields, all properties `required`); the target type should add
 /// `#[schemars(deny_unknown_fields)]` and avoid `Option` fields.
 pub fn native_schema_format<T: schemars::JsonSchema>() -> ResponseFormat {
+  native_schema_format_from_value(
+    &schema_name::<T>(),
+    schemars::schema_for!(T).as_value().clone(),
+  )
+}
+
+/// Build the native `json_schema` response format from a caller-supplied JSON Schema `Value`,
+/// the counterpart to [`native_schema_format`] for [`crate::agent::runtime::Agent::run_structured_raw`].
+///
+/// Same `strict = true` caveat as [`native_schema_format`], except the caller — not this crate —
+/// is responsible for the schema satisfying OpenAI's strict subset, since there is no Rust type
+/// to add `#[schemars(deny_unknown_fields)]` to; a schema that does not will fail at the model
+/// API rather than at this call.
+pub fn native_schema_format_from_value(name: &str, schema: Value) -> ResponseFormat {
   ResponseFormat::JsonSchema {
     json_schema: ResponseFormatJsonSchema {
       description: None,
-      name: schema_name::<T>(),
-      schema: schemars::schema_for!(T).as_value().clone(),
+      name: name.to_owned(),
+      schema,
       strict: Some(true),
     },
   }
@@ -89,8 +145,13 @@ pub fn native_schema_format<T: schemars::JsonSchema>() -> ResponseFormat {
 /// per type, so this regenerates each call — negligible next to one network request.
 pub fn schema_instruction<T: schemars::JsonSchema>() -> String {
   let schema = schemars::schema_for!(T);
-  let schema_json =
-    serde_json::to_string_pretty(&schema).unwrap_or_else(|_| schema.as_value().to_string());
+  schema_instruction_from_value(schema.as_value())
+}
+
+/// Render a caller-supplied JSON Schema `Value` as a system instruction, the counterpart to
+/// [`schema_instruction`] for [`crate::agent::runtime::Agent::run_structured_raw`].
+pub fn schema_instruction_from_value(schema: &Value) -> String {
+  let schema_json = serde_json::to_string_pretty(schema).unwrap_or_else(|_| schema.to_string());
   format!(
     "You must reply with a single valid JSON object that conforms to the following JSON Schema. \
      Do not include any explanation, markdown code fences, or extra text.\n\nJSON Schema:\n\
@@ -144,6 +205,72 @@ mod tests {
     assert_eq!(function.function.name, FINAL_ANSWER_TOOL_NAME);
     let description = function.function.description.unwrap_or_default();
     assert!(description.contains("ActionPlan"), "got: {description}");
+  }
+
+  #[test]
+  fn validate_schema_name_accepts_the_openai_charset() {
+    assert!(validate_schema_name("Action_Plan-1").is_ok());
+  }
+
+  #[test]
+  fn validate_schema_name_rejects_empty_and_oversized_names() {
+    assert!(validate_schema_name("").is_err());
+    assert!(validate_schema_name(&"a".repeat(65)).is_err());
+    assert!(validate_schema_name(&"a".repeat(64)).is_ok());
+  }
+
+  #[test]
+  fn validate_schema_name_rejects_disallowed_characters() {
+    assert!(validate_schema_name("action plan").is_err());
+    assert!(validate_schema_name("action.plan").is_err());
+  }
+
+  #[test]
+  fn final_answer_tool_from_schema_uses_the_given_name_and_schema() {
+    let schema = serde_json::json!({"type": "object", "properties": {"x": {"type": "integer"}}});
+    let ChatCompletionTools::Function(function) =
+      final_answer_tool_from_schema("Custom", schema.clone()).unwrap()
+    else {
+      panic!("expected a function tool");
+    };
+    assert_eq!(function.function.name, FINAL_ANSWER_TOOL_NAME);
+    assert!(
+      function
+        .function
+        .description
+        .unwrap_or_default()
+        .contains("Custom")
+    );
+    assert_eq!(function.function.parameters, Some(schema));
+  }
+
+  #[test]
+  fn native_schema_format_from_value_carries_the_given_name_and_schema() {
+    let schema = serde_json::json!({"type": "object"});
+    let ResponseFormat::JsonSchema { json_schema } =
+      native_schema_format_from_value("Custom", schema.clone())
+    else {
+      panic!("expected a json_schema response format");
+    };
+    assert_eq!(json_schema.name, "Custom");
+    assert_eq!(json_schema.schema, schema);
+    assert_eq!(json_schema.strict, Some(true));
+  }
+
+  #[test]
+  fn native_schema_format_delegates_to_the_value_based_builder() {
+    let ResponseFormat::JsonSchema { json_schema } = native_schema_format::<ActionPlan>() else {
+      panic!("expected a json_schema response format");
+    };
+    assert_eq!(json_schema.name, "ActionPlan");
+  }
+
+  #[test]
+  fn schema_instruction_from_value_embeds_the_schema() {
+    let schema = serde_json::json!({"type": "object"});
+    let instruction = schema_instruction_from_value(&schema);
+    assert!(instruction.contains("JSON Schema"));
+    assert!(instruction.contains("\"type\""));
   }
 
   #[test]

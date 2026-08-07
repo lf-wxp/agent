@@ -34,6 +34,7 @@ use async_openai::types::chat::{
 };
 use async_stream::stream;
 use futures::{Stream, StreamExt, future::join_all};
+use serde_json::Value;
 
 use crate::{
   config,
@@ -42,8 +43,9 @@ use crate::{
     provider::Provider,
     retry::with_retry,
     schema::{
-      FINAL_ANSWER_TOOL_NAME, final_answer_tool, native_schema_format, schema_instruction,
-      strip_code_fence,
+      FINAL_ANSWER_TOOL_NAME, final_answer_tool, final_answer_tool_from_schema,
+      native_schema_format, native_schema_format_from_value, schema_instruction,
+      schema_instruction_from_value, strip_code_fence, validate_schema_name,
     },
     structured::{StructuredMode, TruncatedOutput},
     tool_calls::ToolCallAccumulator,
@@ -662,6 +664,264 @@ impl Agent {
         })?;
 
       let parsed: T = serde_json::from_str(strip_code_fence(&content)).map_err(|err| {
+        tag_budget(
+          anyhow::anyhow!(
+            "failed to parse structured content: {err}; raw: {}",
+            crate::util::truncate_chars(&content, 512)
+          ),
+          budget_exhausted,
+        )
+      })?;
+
+      self.record_final_answer(&mut context, &content);
+
+      return Ok(StructuredAgentResult {
+        output: parsed,
+        context,
+        budget_exhausted,
+      });
+    }
+  }
+
+  /// Run to a structured final answer given a JSON Schema `Value` at runtime, instead of a
+  /// compile-time Rust type — the counterpart to [`Self::run_structured`] for callers that do
+  /// not have (or want) a Rust type for the answer, e.g. the HTTP API (see
+  /// [`crate::api::dto::StructuredSchemaRequest`]), where the schema arrives as part of the
+  /// request body.
+  ///
+  /// `name` is OpenAI's naming constraint on `function.name` / `response_format.json_schema.name`
+  /// (1-64 characters, `[a-zA-Z0-9_-]`), checked with [`validate_schema_name`] up front — a
+  /// schema-as-data caller has no compile-time type to derive a valid one from the way
+  /// [`Self::run_structured`] does via `schema_name::<T>()`, so unlike that path, an invalid
+  /// `name` here is a caller mistake to be rejected immediately rather than a condition this
+  /// crate could ever hit on its own.
+  ///
+  /// Otherwise behaves exactly like [`Self::run_structured`]: same two routes chosen by
+  /// [`config::model_supports_tool_choice`], same round budget and [`Event`] recording; the
+  /// only difference is the final step returns the parsed [`serde_json::Value`] as-is instead
+  /// of deserializing into `T`.
+  pub async fn run_structured_raw(
+    &self,
+    user_input: &str,
+    name: &str,
+    schema: Value,
+  ) -> anyhow::Result<StructuredAgentResult<Value>> {
+    validate_schema_name(name)?;
+
+    if config::model_supports_tool_choice(&self.model) {
+      self
+        .run_structured_raw_via_tool_choice(user_input, name, schema)
+        .await
+    } else {
+      tracing::debug!(
+        model = %self.model,
+        "model rejects tool_choice; using response_format for structured output"
+      );
+      self
+        .run_structured_raw_via_response_format(user_input, schema)
+        .await
+    }
+  }
+
+  /// Schema-as-data counterpart of [`Self::run_structured_via_tool_choice`], used by
+  /// [`Self::run_structured_raw`].
+  async fn run_structured_raw_via_tool_choice(
+    &self,
+    user_input: &str,
+    name: &str,
+    schema: Value,
+  ) -> anyhow::Result<StructuredAgentResult<Value>> {
+    let mut context = ExecutionContext::new();
+    self.record_user_input(&mut context, user_input);
+
+    let final_answer = final_answer_tool_from_schema(name, schema)?;
+    let mut tool_definitions = self.toolbox.definitions().to_vec();
+    tool_definitions.push(final_answer.clone());
+    let final_answer_only = std::slice::from_ref(&final_answer);
+
+    loop {
+      let (tools_allowed, budget_exhausted) = self.round_budget(&context);
+
+      let definitions: &[ChatCompletionTools] = if tools_allowed {
+        &tool_definitions
+      } else {
+        final_answer_only
+      };
+
+      let messages = self.build_messages(&context)?;
+      let mut builder = request_builder(&self.model, messages, DEFAULT_MAX_TOKENS, definitions);
+      builder.tool_choice(ChatCompletionToolChoiceOption::Mode(
+        ToolChoiceOptions::Required,
+      ));
+
+      let response = with_retry(
+        || async {
+          let _permit = self.provider.acquire().await?;
+          let response = self
+            .provider
+            .client()
+            .chat()
+            .create(builder.build()?)
+            .await?;
+          anyhow::Ok(response)
+        },
+        |_| true,
+      )
+      .await?;
+      self.record_usage(&mut context, &response);
+      let choice = first_choice(response)?;
+
+      if choice.finish_reason == Some(FinishReason::Length) {
+        return Err(
+          TruncatedOutput {
+            limit: DEFAULT_MAX_TOKENS,
+          }
+          .into(),
+        );
+      }
+
+      let message = choice.message;
+
+      let tool_calls = message.tool_calls.ok_or_else(|| {
+        tag_budget(
+          anyhow::anyhow!("Model returned no tool call despite tool_choice = required"),
+          budget_exhausted,
+        )
+      })?;
+
+      self.record_tool_calls(&mut context, &tool_calls);
+
+      let final_call = tool_calls.iter().find_map(|tool_call| match tool_call {
+        ChatCompletionMessageToolCalls::Function(f)
+          if f.function.name == FINAL_ANSWER_TOOL_NAME =>
+        {
+          Some(f)
+        }
+        _ => None,
+      });
+
+      if let Some(final_call) = final_call {
+        let raw_arguments = final_call.function.arguments.clone();
+        let parsed: Value = serde_json::from_str(&raw_arguments).map_err(|err| {
+          tag_budget(
+            anyhow::anyhow!("failed to parse `{FINAL_ANSWER_TOOL_NAME}` arguments: {err}"),
+            budget_exhausted,
+          )
+        })?;
+
+        self.record_final_structured(&mut context, final_call.id.clone(), raw_arguments);
+
+        return Ok(StructuredAgentResult {
+          output: parsed,
+          context,
+          budget_exhausted,
+        });
+      }
+
+      if !tools_allowed {
+        anyhow::bail!(tag_budget(
+          anyhow::anyhow!(
+            "model did not call `{FINAL_ANSWER_TOOL_NAME}` after the round budget was spent"
+          ),
+          true
+        ));
+      }
+
+      self.execute_tool_calls(&mut context, &tool_calls).await;
+      context.increment_step();
+    }
+  }
+
+  /// Schema-as-data counterpart of [`Self::run_structured_via_response_format`], used by
+  /// [`Self::run_structured_raw`].
+  async fn run_structured_raw_via_response_format(
+    &self,
+    user_input: &str,
+    schema: Value,
+  ) -> anyhow::Result<StructuredAgentResult<Value>> {
+    let mode = StructuredMode::for_model(&self.model);
+    let schema_hint = match mode {
+      StructuredMode::JsonObject => Some(schema_instruction_from_value(&schema)),
+      StructuredMode::NativeSchema => None,
+    };
+    let response_format = match mode {
+      // `name` only appears in the tool_choice route's `final_answer` description; here it is
+      // never surfaced to the model, so a fixed placeholder is fine.
+      StructuredMode::NativeSchema => native_schema_format_from_value("StructuredAnswer", schema),
+      StructuredMode::JsonObject => ResponseFormat::JsonObject,
+    };
+
+    let mut context = ExecutionContext::new();
+    self.record_user_input(&mut context, user_input);
+
+    loop {
+      let (tools_allowed, budget_exhausted) = self.round_budget(&context);
+
+      let messages = match &schema_hint {
+        Some(hint) => self.messages_with_schema_hint(&context, hint)?,
+        None => self.build_messages(&context)?,
+      };
+      let mut builder = request_builder(
+        &self.model,
+        messages,
+        mode.max_tokens(),
+        self.toolbox.definitions(),
+      );
+      builder.response_format(response_format.clone());
+      if !tools_allowed {
+        disable_tools(&mut builder, self.toolbox.definitions());
+      }
+
+      let response = with_retry(
+        || async {
+          let _permit = self.provider.acquire().await?;
+          let response = self
+            .provider
+            .client()
+            .chat()
+            .create(builder.build()?)
+            .await?;
+          anyhow::Ok(response)
+        },
+        |_| true,
+      )
+      .await?;
+      self.record_usage(&mut context, &response);
+      let choice = first_choice(response)?;
+
+      if choice.finish_reason == Some(FinishReason::Length) {
+        return Err(
+          TruncatedOutput {
+            limit: mode.max_tokens(),
+          }
+          .into(),
+        );
+      }
+
+      let message = choice.message;
+
+      if let Some(tool_calls) = message.tool_calls.filter(|calls| !calls.is_empty()) {
+        if !tools_allowed {
+          tracing::warn!("model requested tools after they were disabled");
+        } else {
+          self.record_tool_calls(&mut context, &tool_calls);
+          self.execute_tool_calls(&mut context, &tool_calls).await;
+          context.increment_step();
+          continue;
+        }
+      }
+
+      let content = message
+        .content
+        .filter(|c| !c.trim().is_empty())
+        .ok_or_else(|| {
+          tag_budget(
+            anyhow::anyhow!("empty content while expecting a structured answer"),
+            budget_exhausted,
+          )
+        })?;
+
+      let parsed: Value = serde_json::from_str(strip_code_fence(&content)).map_err(|err| {
         tag_budget(
           anyhow::anyhow!(
             "failed to parse structured content: {err}; raw: {}",

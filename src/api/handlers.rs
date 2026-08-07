@@ -8,6 +8,7 @@ use axum::{
   http::{HeaderMap, request::Parts},
   response::{IntoResponse, Response},
 };
+use serde_json::Value;
 
 use crate::{
   Agent,
@@ -18,6 +19,7 @@ use crate::{
     idempotency::Reservation,
   },
   config,
+  llm::schema::validate_schema_name,
   tools::ToolRegistry,
 };
 
@@ -148,6 +150,19 @@ async fn run_authenticated(
   state: &AppState,
   request: RunRequest,
 ) -> Result<RunResponse, ApiError> {
+  if let Some(schema_request) = &request.response_schema {
+    if request.session_id.is_some() {
+      return Err(ApiError::bad_request(
+        "`responseSchema` cannot be combined with `sessionId` yet: a structured run has no \
+         history-seeding counterpart of `run_continuing` to feed the prior turns into",
+      ));
+    }
+    // Validated here, ahead of the run, so a bad `name` is a `400` naming the actual
+    // problem rather than a `500` surfaced from deep inside the agent loop.
+    validate_schema_name(&schema_request.name)
+      .map_err(|err| ApiError::bad_request(err.to_string()))?;
+  }
+
   let registry = match &request.tools {
     Some(names) => {
       ToolRegistry::select(names).map_err(|err| ApiError::bad_request(err.to_string()))?
@@ -170,36 +185,53 @@ async fn run_authenticated(
     agent = agent.with_max_steps(max_steps);
   }
 
-  let history = match &request.session_id {
-    Some(session_id) => state.sessions.history(&tenant.token, session_id).await,
-    None => Vec::new(),
+  let (output, budget_exhausted, context) = match request.response_schema {
+    Some(schema_request) => {
+      let result = agent
+        .run_structured_raw(&request.input, &schema_request.name, schema_request.schema)
+        .await
+        .map_err(ApiError::internal)?;
+      (result.output, result.budget_exhausted, result.context)
+    }
+    None => {
+      let history = match &request.session_id {
+        Some(session_id) => state.sessions.history(&tenant.token, session_id).await,
+        None => Vec::new(),
+      };
+      let result = agent
+        .run_continuing(history, &request.input)
+        .await
+        .map_err(ApiError::internal)?;
+      (
+        Value::String(result.output),
+        result.budget_exhausted,
+        result.context,
+      )
+    }
   };
 
-  let result = agent
-    .run_continuing(history, &request.input)
-    .await
-    .map_err(ApiError::internal)?;
-
+  // `response_schema` and `session_id` are mutually exclusive (rejected above), so this
+  // only ever runs for the free-text path — nothing to persist for a structured run yet.
   if let Some(session_id) = &request.session_id {
     state
       .sessions
-      .save(&tenant.token, session_id, result.context.events.clone())
+      .save(&tenant.token, session_id, context.events.clone())
       .await;
   }
 
   tracing::info!(
     tenant = %tenant.label,
     session_id = request.session_id.as_deref().unwrap_or("-"),
-    budget_exhausted = result.budget_exhausted,
-    steps = result.context.current_step,
+    budget_exhausted,
+    steps = context.current_step,
     "agent run finished"
   );
 
   Ok(RunResponse {
-    output: result.output,
-    budget_exhausted: result.budget_exhausted,
-    usage: result.context.usage.into(),
-    steps: result.context.current_step,
+    output,
+    budget_exhausted,
+    usage: context.usage.into(),
+    steps: context.current_step,
     session_id: request.session_id,
   })
 }

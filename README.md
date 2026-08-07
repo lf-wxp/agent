@@ -25,7 +25,7 @@
 | 🧠 **`Agent` 运行时** | 完整事件记录（`ExecutionContext`）+ 无状态多轮续接（`run_continuing`）+ 流式输出（`run_stream`），历史按 token 预算自动裁剪 |
 | 🧰 **工具生态** | 内置 `calculator`、`web_search`（Tavily），并通过 `mcp.json` 接入任意 MCP Server |
 | 🏢 **多租户** | `Provider` 封装每租户凭据 + 并发限流，互不干扰 |
-| 🌐 **HTTP 服务** | `/v1/agent/run` 支持会话续接（`sessionId`）与幂等重试（`Idempotency-Key`） |
+| 🌐 **HTTP 服务** | `/v1/agent/run` 支持会话续接（`sessionId`）、幂等重试（`Idempotency-Key`）与结构化输出（`responseSchema`） |
 | 📚 **向量检索** | 文本分块 / embedding / 余弦相似度检索，适配 RAG 场景 |
 | 📊 **基准评测** | 内置 GAIA 数据集评测，量化模型 + 工具组合效果 |
 | ✅ **工程质量** | 无 `.unwrap()` 生产路径、零硬编码密钥、130+ 单测、clippy 全绿 |
@@ -55,6 +55,22 @@ curl -X POST localhost:8080/v1/agent/run \
   -H "Authorization: Bearer <tenants.json 中配置的 token>" \
   -H "Content-Type: application/json" \
   -d '{"input": "5875 乘以 467 是多少", "tools": ["calculator"], "sessionId": "chat-1"}'
+```
+
+**调用 HTTP 服务（结构化输出，不支持与 `sessionId` 同时使用）：**
+
+```bash
+curl -X POST localhost:8080/v1/agent/run \
+  -H "Authorization: Bearer <tenants.json 中配置的 token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": "5875 乘以 467 是多少",
+    "tools": ["calculator"],
+    "responseSchema": {
+      "name": "MultiplicationResult",
+      "schema": {"type": "object", "properties": {"product": {"type": "number"}}, "required": ["product"]}
+    }
+  }'
 ```
 
 ## ⚙️ 配置说明
@@ -108,7 +124,7 @@ cargo fmt                   # 格式化
 
 - **会话与记忆**：`SessionStore` 的 Redis/DB 实现、`/v1/sessions` 资源化、长期记忆分层、租户+终端用户两级隔离
 - **协议与可扩展性**：`Tool` trait 与 `async-openai` 解耦、类型化错误（`thiserror`）
-- **架构边界**：`gaia` 拆为独立 crate、结构化输出接入 HTTP 层
+- **架构边界**：`gaia` 拆为独立 crate
 - **运维**：`Dockerfile` 与部署文档、sweep 任务补充 metrics
 
 </details>
