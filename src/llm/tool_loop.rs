@@ -242,3 +242,156 @@ async fn execute(
     }
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use async_openai::types::chat::{
+    ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestMessage, CustomTool,
+  };
+
+  use super::*;
+  use crate::tools::calculator::{self, Calculator};
+
+  fn function_call(id: &str, name: &str, arguments: &str) -> ChatCompletionMessageToolCalls {
+    ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+      id: id.to_owned(),
+      function: FunctionCall {
+        name: name.to_owned(),
+        arguments: arguments.to_owned(),
+      },
+    })
+  }
+
+  #[test]
+  fn disable_tools_is_noop_without_any_tools() {
+    let mut builder = request_builder("gpt-test", Vec::new(), 16, &[]);
+    disable_tools(&mut builder, &[]);
+    let request = builder.build().unwrap();
+    assert_eq!(request.tool_choice, None);
+  }
+
+  #[test]
+  fn disable_tools_pins_choice_to_none_when_tools_are_present() {
+    let registry = ToolRegistry::builtin().unwrap();
+    let mut builder = request_builder("gpt-test", Vec::new(), 16, registry.definitions());
+    disable_tools(&mut builder, registry.definitions());
+    let request = builder.build().unwrap();
+    assert_eq!(
+      request.tool_choice,
+      Some(ChatCompletionToolChoiceOption::Mode(
+        ToolChoiceOptions::None
+      ))
+    );
+    // The definitions stay on the request; only the choice is pinned.
+    assert!(request.tools.is_some());
+  }
+
+  #[tokio::test]
+  async fn append_tool_results_pairs_every_call_with_a_tool_message() {
+    let mut registry = ToolRegistry::empty();
+    registry.add(std::sync::Arc::new(Calculator)).unwrap();
+    let mut messages = Vec::new();
+
+    let calls = vec![function_call(
+      "call_1",
+      calculator::NAME,
+      r#"{"operator":"add","first_number":1,"second_number":2}"#,
+    )];
+
+    append_tool_results(&registry, &mut messages, calls, None)
+      .await
+      .unwrap();
+
+    assert_eq!(messages.len(), 2, "assistant message + one tool message");
+    assert!(matches!(
+      messages[0],
+      ChatCompletionRequestMessage::Assistant(_)
+    ));
+    let ChatCompletionRequestMessage::Tool(tool_message) = &messages[1] else {
+      panic!("expected a tool message");
+    };
+    assert_eq!(tool_message.tool_call_id, "call_1");
+  }
+
+  #[tokio::test]
+  async fn append_tool_results_keeps_narration_alongside_the_tool_call() {
+    let registry = ToolRegistry::empty();
+    let mut messages = Vec::new();
+
+    let calls = vec![function_call("call_1", "nope", "{}")];
+    append_tool_results(
+      &registry,
+      &mut messages,
+      calls,
+      Some("let me check".to_owned()),
+    )
+    .await
+    .unwrap();
+
+    let ChatCompletionRequestMessage::Assistant(assistant) = &messages[0] else {
+      panic!("expected an assistant message");
+    };
+    assert_eq!(
+      assistant.content,
+      Some(ChatCompletionRequestAssistantMessageContent::Text(
+        "let me check".to_owned()
+      ))
+    );
+  }
+
+  #[tokio::test]
+  async fn append_tool_results_drops_blank_narration() {
+    let registry = ToolRegistry::empty();
+    let mut messages = Vec::new();
+
+    let calls = vec![function_call("call_1", "nope", "{}")];
+    append_tool_results(&registry, &mut messages, calls, Some("   ".to_owned()))
+      .await
+      .unwrap();
+
+    let ChatCompletionRequestMessage::Assistant(assistant) = &messages[0] else {
+      panic!("expected an assistant message");
+    };
+    assert!(assistant.content.is_none());
+  }
+
+  #[tokio::test]
+  async fn execute_dispatches_function_calls_through_the_registry() {
+    let mut registry = ToolRegistry::empty();
+    registry.add(std::sync::Arc::new(Calculator)).unwrap();
+
+    let (id, result) = execute(
+      &registry,
+      function_call(
+        "call_1",
+        calculator::NAME,
+        r#"{"operator":"add","first_number":2,"second_number":3}"#,
+      ),
+    )
+    .await;
+
+    assert_eq!(id, "call_1");
+    assert_eq!(result, "5");
+  }
+
+  #[tokio::test]
+  async fn execute_reports_custom_tool_calls_as_unsupported() {
+    let registry = ToolRegistry::empty();
+
+    let (id, result) = execute(
+      &registry,
+      ChatCompletionMessageToolCalls::Custom(ChatCompletionMessageCustomToolCall {
+        id: "call_1".to_owned(),
+        custom_tool: CustomTool {
+          name: "shell".to_owned(),
+          input: "ls".to_owned(),
+        },
+      }),
+    )
+    .await;
+
+    assert_eq!(id, "call_1");
+    assert!(result.contains("shell"), "got: {result}");
+    assert!(result.contains("not supported"), "got: {result}");
+  }
+}

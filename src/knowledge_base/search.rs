@@ -84,3 +84,56 @@ pub async fn vector_search(
       .collect(),
   )
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn cosine_similarity_of_identical_vectors_is_one() {
+    let similarity = cosine_similarity(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0]);
+    assert!((similarity - 1.0).abs() < f32::EPSILON, "got {similarity}");
+  }
+
+  #[test]
+  fn cosine_similarity_of_orthogonal_vectors_is_zero() {
+    let similarity = cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]);
+    assert!(similarity.abs() < f32::EPSILON, "got {similarity}");
+  }
+
+  #[test]
+  fn cosine_similarity_of_opposite_vectors_is_negative_one() {
+    let similarity = cosine_similarity(&[1.0, 0.0], &[-1.0, 0.0]);
+    assert!((similarity + 1.0).abs() < f32::EPSILON, "got {similarity}");
+  }
+
+  #[test]
+  fn cosine_similarity_is_scale_invariant() {
+    let a = cosine_similarity(&[1.0, 2.0], &[3.0, 4.0]);
+    let b = cosine_similarity(&[2.0, 4.0], &[30.0, 40.0]);
+    assert!((a - b).abs() < 1e-6, "got {a} vs {b}");
+  }
+
+  #[test]
+  fn cosine_similarity_of_a_zero_vector_is_zero_rather_than_nan() {
+    // A zero-norm vector would otherwise divide by zero and produce `NaN`, which breaks
+    // the `total_cmp`-based ranking in `vector_search`.
+    assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 2.0]), 0.0);
+    assert_eq!(cosine_similarity(&[1.0, 2.0], &[0.0, 0.0]), 0.0);
+    assert_eq!(cosine_similarity(&[0.0, 0.0], &[0.0, 0.0]), 0.0);
+  }
+
+  #[tokio::test]
+  async fn vector_search_of_empty_chunks_returns_no_hits_without_calling_the_embedder() {
+    // `top_k > 0` but no chunks: must short-circuit before needing `EMBED_MODEL` to be
+    // configured, since there is nothing to embed against.
+    let hits = vector_search("query", &[], 5).await.unwrap();
+    assert!(hits.is_empty());
+  }
+
+  #[tokio::test]
+  async fn vector_search_of_zero_top_k_returns_no_hits_without_calling_the_embedder() {
+    let hits = vector_search("query", &["a".to_owned()], 0).await.unwrap();
+    assert!(hits.is_empty());
+  }
+}

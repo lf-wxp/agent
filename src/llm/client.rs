@@ -76,3 +76,122 @@ pub fn first_choice(response: CreateChatCompletionResponse) -> anyhow::Result<Ch
 pub fn log_response_meta(response: &CreateChatCompletionResponse, label: &'static str) {
   tracing::debug!(id = %response.id, usage = ?response.usage, "{label}");
 }
+
+#[cfg(test)]
+mod tests {
+  use serde_json::json;
+
+  use super::*;
+
+  /// Deserializing from JSON avoids touching `CreateChatCompletionResponse`'s
+  /// `#[deprecated]` `system_fingerprint` field, which a struct literal would have to
+  /// name explicitly.
+  fn response_with_choices(choices: usize) -> CreateChatCompletionResponse {
+    serde_json::from_value(json!({
+      "id": "resp_1",
+      "object": "chat.completion",
+      "created": 0,
+      "model": "gpt-test",
+      "choices": (0..choices)
+        .map(|index| json!({
+          "index": index,
+          "message": {"role": "assistant", "content": format!("choice {index}")},
+          "finish_reason": "stop",
+        }))
+        .collect::<Vec<_>>(),
+    }))
+    .unwrap()
+  }
+
+  #[test]
+  fn ensure_valid_params_accepts_non_blank_model_and_prompt() {
+    assert!(ensure_valid_params("gpt-test", "hi").is_ok());
+  }
+
+  #[test]
+  fn ensure_valid_params_rejects_blank_model() {
+    assert!(ensure_valid_params("  ", "hi").is_err());
+  }
+
+  #[test]
+  fn ensure_valid_params_rejects_blank_prompt() {
+    assert!(ensure_valid_params("gpt-test", "   ").is_err());
+  }
+
+  #[test]
+  fn build_messages_without_system_is_just_the_user_message() {
+    let messages = build_messages(None, "hi").unwrap();
+    assert_eq!(messages.len(), 1);
+    assert!(matches!(messages[0], ChatCompletionRequestMessage::User(_)));
+  }
+
+  #[test]
+  fn build_messages_treats_blank_system_as_absent() {
+    let messages = build_messages(Some("   "), "hi").unwrap();
+    assert_eq!(messages.len(), 1);
+  }
+
+  #[test]
+  fn build_messages_with_system_prepends_it() {
+    let messages = build_messages(Some("be nice"), "hi").unwrap();
+    assert_eq!(messages.len(), 2);
+    assert!(matches!(
+      messages[0],
+      ChatCompletionRequestMessage::System(_)
+    ));
+    assert!(matches!(messages[1], ChatCompletionRequestMessage::User(_)));
+  }
+
+  #[test]
+  fn request_builder_omits_empty_tools_rather_than_sending_an_empty_array() {
+    let request = request_builder("gpt-test", Vec::new(), 16, &[])
+      .build()
+      .unwrap();
+    assert!(request.tools.is_none());
+  }
+
+  #[test]
+  fn request_builder_carries_the_given_tools() {
+    let registry = crate::tools::ToolRegistry::builtin().unwrap();
+    let request = request_builder("gpt-test", Vec::new(), 16, registry.definitions())
+      .build()
+      .unwrap();
+    let tools = request.tools.unwrap();
+    assert_eq!(tools.len(), registry.definitions().len());
+  }
+
+  #[test]
+  fn request_builder_sets_model_messages_and_max_tokens() {
+    let messages = build_messages(None, "hi").unwrap();
+    let request = request_builder("gpt-test", messages, 16, &[])
+      .build()
+      .unwrap();
+    assert_eq!(request.model, "gpt-test");
+    assert_eq!(request.messages.len(), 1);
+    // `max_tokens` itself is `#[deprecated]` in favor of `max_completion_tokens` (the
+    // crate's field, not this crate's choice); `request_builder` still targets it because
+    // that is what every provider this agent has been run against actually honors.
+    #[allow(deprecated)]
+    let max_tokens = request.max_tokens;
+    assert_eq!(max_tokens, Some(16));
+  }
+
+  #[test]
+  fn first_choice_returns_the_first_of_several() {
+    let response = response_with_choices(2);
+    let choice = first_choice(response).unwrap();
+    assert_eq!(choice.index, 0);
+  }
+
+  #[test]
+  fn first_choice_errors_when_there_are_none() {
+    let response = response_with_choices(0);
+    assert!(first_choice(response).is_err());
+  }
+
+  #[test]
+  fn log_response_meta_does_not_panic() {
+    // No assertion beyond "does not panic": this only writes a tracing event.
+    log_response_meta(&response_with_choices(1), "test");
+  }
+}

@@ -248,3 +248,40 @@ fn idempotency_key_from(headers: &HeaderMap) -> Result<Option<String>, ApiError>
     })
     .transpose()
 }
+
+#[cfg(test)]
+mod tests {
+  use axum::http::HeaderValue;
+
+  use super::*;
+
+  #[test]
+  fn idempotency_key_from_absent_header_is_none() {
+    let headers = HeaderMap::new();
+    assert_eq!(idempotency_key_from(&headers).unwrap(), None);
+  }
+
+  #[test]
+  fn idempotency_key_from_present_header_is_some() {
+    let mut headers = HeaderMap::new();
+    headers.insert(IDEMPOTENCY_KEY_HEADER, HeaderValue::from_static("abc-123"));
+    assert_eq!(
+      idempotency_key_from(&headers).unwrap(),
+      Some("abc-123".to_owned())
+    );
+  }
+
+  #[test]
+  fn idempotency_key_from_non_utf8_header_is_a_bad_request() {
+    let mut headers = HeaderMap::new();
+    // `0xff` is not valid UTF-8 in any position; `to_str()` must fail rather than panic.
+    headers.insert(
+      IDEMPOTENCY_KEY_HEADER,
+      HeaderValue::from_bytes(&[0xff]).unwrap(),
+    );
+    let err = idempotency_key_from(&headers).unwrap_err();
+    let debug = format!("{err:?}");
+    assert!(debug.contains("400"), "got: {debug}");
+    assert!(debug.contains("not valid UTF-8"), "got: {debug}");
+  }
+}
