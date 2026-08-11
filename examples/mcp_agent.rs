@@ -11,9 +11,11 @@
 //! step is needed. Cargo's own progress output goes to stderr, leaving stdout free for
 //! the MCP stream.
 
+use std::sync::Arc;
+
 use agent::{
-  config,
-  llm::{complete::chat_complete, provider::Provider},
+  Agent, config,
+  llm::provider::Provider,
   telemetry,
   tools::{ToolRegistry, mcp::McpConnection},
 };
@@ -36,25 +38,38 @@ async fn main() -> anyhow::Result<()> {
 
   // Built-in and MCP tools land in one registry, so the model sees a single flat tool
   // list and the agent loop treats them identically.
+  // Registration needs `&mut`, so it happens while the registry is still uniquely owned;
+  // only the finished registry is shared through `Arc`.
   let mut registry = ToolRegistry::builtin()?;
   registry.extend(connection.tools().await?)?;
-  tracing::info!(tools = ?registry, "registry ready");
+  let toolbox = Arc::new(registry);
+  tracing::info!(tools = ?toolbox, "registry ready");
 
-  // Needs both a remote tool (date arithmetic) and a local one (multiplication).
-  let answer = chat_complete(
-    Provider::shared(),
+  let agent = Agent::new(
+    Provider::shared().clone(),
     config::model(),
     Some(SYSTEM_PROMPT),
-    "How many days are there from 2026-08-06 to 2026-12-25? \
-     Then multiply that number of days by 24 to get the hours.",
-    &registry,
-  )
-  .await?;
+    Arc::clone(&toolbox),
+  );
 
-  tracing::info!("Answer: {answer}");
+  // Needs both a remote tool (date arithmetic) and a local one (multiplication).
+  let answer = agent
+    .run(
+      "How many days are there from 2026-08-06 to 2026-12-25? \
+       Then multiply that number of days by 24 to get the hours.",
+    )
+    .await?;
 
-  // Drop the registry first: the connection cannot shut down while its tools are alive.
-  drop(registry);
+  tracing::info!(
+    budget_exhausted = answer.budget_exhausted,
+    "Answer: {}",
+    answer.output
+  );
+
+  // Drop every holder of the MCP tools first: `shutdown` needs the last reference to the
+  // server, and the agent keeps a handle on the registry of its own.
+  drop(agent);
+  drop(toolbox);
   connection.shutdown().await?;
 
   Ok(())
