@@ -23,6 +23,9 @@ rmcp = { version = "3.1.1", features = [
   "transport-child-process",
   "transport-io",
   "transport-streamable-http-client-reqwest",
+  # Server side of Streamable HTTP: only the `mcp_http_*` examples need it, but Cargo
+  # features are per-package rather than per-target, so it is enabled here.
+  "transport-streamable-http-server",
 ] }
 schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }

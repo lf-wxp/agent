@@ -23,7 +23,7 @@
 |---|---|
 | 🔁 **对话循环** | 纯文本 / 流式 / 结构化输出（JSON Schema 自动推断）三种模式的工具调用循环 |
 | 🧠 **`Agent` 运行时** | 完整事件记录（`ExecutionContext`）+ 无状态多轮续接（`run_continuing`）+ 流式输出（`run_stream`），历史按 token 预算自动裁剪 |
-| 🧰 **工具生态** | 内置 `calculator`、`web_search`（Tavily），并通过 `mcp.json` 接入任意 MCP Server |
+| 🧰 **工具生态** | 内置 `calculator`、`web_search`（Tavily），并通过 `mcp.json` 接入任意 MCP Server（stdio / Streamable HTTP 两种传输） |
 | 🏢 **多租户** | `Provider` 封装每租户凭据 + 并发限流，互不干扰 |
 | 🌐 **HTTP 服务** | `/v1/agent/run` 支持会话续接（`sessionId`）、幂等重试（`Idempotency-Key`）与结构化输出（`responseSchema`） |
 | 📚 **向量检索** | 文本分块 / embedding / 余弦相似度检索，适配 RAG 场景 |
@@ -106,7 +106,7 @@ src/
 ├── gaia/           GAIA 基准数据集与评测
 ├── knowledge_base/ 文本分块、embedding、向量检索
 └── config.rs       环境变量统一读取入口
-examples/           15 个可运行示例
+examples/           18 个可运行示例（`shared/` 为示例间共用的 demo MCP server，非独立示例）
 ```
 
 ## 🧪 开发
