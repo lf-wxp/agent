@@ -3,6 +3,7 @@
 
 pub mod agent;
 pub mod api;
+pub mod callback;
 pub mod config;
 pub mod gaia;
 pub mod http;

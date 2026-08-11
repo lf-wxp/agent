@@ -102,10 +102,11 @@ src/
 ├── api/            HTTP 服务：路由、鉴权、SessionStore、IdempotencyStore
 ├── llm/            Provider、tool_loop、stream、structured、complete
 ├── tools/          Tool trait 与内置工具（calculator / web_search / mcp）
+├── callback/       工具调用前后的回调实现（人工审批 / 搜索结果压缩）
 ├── gaia/           GAIA 基准数据集与评测
 ├── knowledge_base/ 文本分块、embedding、向量检索
 └── config.rs       环境变量统一读取入口
-examples/           13 个可运行示例
+examples/           15 个可运行示例
 ```
 
 ## 🧪 开发

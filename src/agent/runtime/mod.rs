@@ -47,6 +47,7 @@ use futures::{Stream, StreamExt, future::join_all};
 use serde_json::Value;
 
 use crate::{
+  agent::callback::{AfterToolCallback, BeforeToolCallback, ToolCallView},
   config,
   llm::{
     client::{DEFAULT_MAX_TOKENS, first_choice, request_builder},
@@ -114,6 +115,12 @@ pub struct Agent {
   toolbox: Arc<ToolRegistry>,
   max_steps: u32,
   max_history_tokens: usize,
+  /// Hooks run before each tool call, in registration order; see
+  /// [`Self::with_before_tool_callback`].
+  before_tool_callbacks: Vec<Arc<dyn BeforeToolCallback>>,
+  /// Hooks run after each tool call, in registration order; see
+  /// [`Self::with_after_tool_callback`].
+  after_tool_callbacks: Vec<Arc<dyn AfterToolCallback>>,
 }
 
 impl Agent {
@@ -139,6 +146,8 @@ impl Agent {
       toolbox,
       max_steps: config::max_tool_rounds() as u32,
       max_history_tokens: config::max_history_tokens(),
+      before_tool_callbacks: Vec::new(),
+      after_tool_callbacks: Vec::new(),
     }
   }
 
@@ -147,6 +156,42 @@ impl Agent {
   /// calling tools. See [`Self::run`] / [`Self::run_structured`].
   pub fn with_max_steps(mut self, max_steps: u32) -> Self {
     self.max_steps = max_steps;
+    self
+  }
+
+  /// Register a hook invoked before each tool call ([`Self::execute_tool_calls`]).
+  /// Callbacks run in registration order, one at a time: as soon as one returns
+  /// `Some((status, content))`, the chain stops there — the real tool is not executed,
+  /// remaining before-hooks are not run, and that pair is recorded as the result instead
+  /// (the callback picks `status` itself, since a short-circuit is not always a failure,
+  /// e.g. [`ToolResultStatus::Error`] for a permission check vs. [`ToolResultStatus::Success`]
+  /// for a cache hit that substitutes a ready-made answer). If every callback returns
+  /// `None`, the call proceeds to the real tool as normal.
+  ///
+  /// Can be called more than once to register several independent hooks (e.g. an audit
+  /// log that never denies anything, plus a permission check that might) — each call adds
+  /// one, it does not replace the others.
+  pub fn with_before_tool_callback(mut self, callback: Arc<dyn BeforeToolCallback>) -> Self {
+    self.before_tool_callbacks.push(callback);
+    self
+  }
+
+  /// Register a hook invoked after each tool call completes ([`Self::execute_tool_calls`]).
+  /// Callbacks run in registration order, each seeing the `(status, content)` left by the
+  /// one before it; whenever one returns `Some((status, content))`, that pair becomes the
+  /// input to the next callback and, once the chain finishes, the recorded result — e.g.
+  /// redacting sensitive content in one hook, then compressing what is left in another.
+  /// A callback returning `None` leaves the current `(status, content)` untouched for the
+  /// next one.
+  ///
+  /// Can be called more than once to register several independent hooks — each call adds
+  /// one, it does not replace the others.
+  ///
+  /// Calls short-circuited by [`Self::with_before_tool_callback`] never reach any of
+  /// these, since their result did not come from a tool; a hook that has to see every
+  /// recorded result has to be registered on both ends.
+  pub fn with_after_tool_callback(mut self, callback: Arc<dyn AfterToolCallback>) -> Self {
+    self.after_tool_callbacks.push(callback);
     self
   }
 
@@ -513,11 +558,24 @@ impl Agent {
   /// so independent tool calls requested in the same turn (e.g. two `web_search` calls) do
   /// not have to pay for each other's network latency in sequence, and there is no shared
   /// state to serialize access to.
+  ///
+  /// [`Self::with_before_tool_callback`] hooks run first, in registration order, and the
+  /// first one to short-circuit (e.g. a permission check that denies the call) stops the
+  /// chain right there, before the real tool ever runs; [`Self::with_after_tool_callback`]
+  /// hooks run last, each seeing the result left by the one before it, and may rewrite it
+  /// (e.g. redact sensitive content, then compress what is left) before it is recorded.
+  /// All of them are read-only borrows of `context`, so they do not conflict with running
+  /// the calls concurrently.
   async fn execute_tool_calls(
     &self,
     context: &mut ExecutionContext,
     tool_calls: &[ChatCompletionMessageToolCalls],
   ) {
+    // Reborrowed immutably: every concurrent call below may read `context` (e.g. to make
+    // an allow/deny decision), while the mutable borrow needed to record the resulting
+    // event is only taken back once all of them have resolved, below.
+    let context_ref: &ExecutionContext = &*context;
+
     let result_items = join_all(tool_calls.iter().filter_map(|tool_call| {
       let ChatCompletionMessageToolCalls::Function(function_call) = tool_call else {
         return None;
@@ -533,7 +591,38 @@ impl Agent {
           "executing tool"
         );
 
-        let (status, content) = match self.toolbox.get(function_name) {
+        // Run every before-hook in registration order; the first to short-circuit wins
+        // and the rest (including the real tool) are skipped. The callback decides the
+        // status itself: a short-circuit is not always a denial (e.g. a cache hit
+        // substituting a real result is `Success`), so it is not this call site's place
+        // to guess.
+        for before in &self.before_tool_callbacks {
+          // Both forms are handed over: parsed for callbacks that inspect a field, raw
+          // for those that show the call to a human, since a payload that fails to parse
+          // would otherwise be rendered as a bare `null`.
+          let parsed_arguments: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
+          let view = ToolCallView {
+            tool_call_id: &function_call.id,
+            name: function_name,
+            arguments: &parsed_arguments,
+            raw_arguments: arguments,
+          };
+          if let Some((status, content)) = before.call(context_ref, view).await {
+            tracing::debug!(
+              tool = %function_name,
+              status = ?status,
+              "tool call short-circuited by before-tool callback"
+            );
+            return ContentItem::ToolResult {
+              tool_call_id: function_call.id.clone(),
+              name: function_name.clone(),
+              status,
+              content,
+            };
+          }
+        }
+
+        let (mut status, mut content) = match self.toolbox.get(function_name) {
           Some(tool) => match tool.execute(arguments).await {
             Ok(result) => {
               tracing::debug!(
@@ -555,6 +644,25 @@ impl Agent {
             (ToolResultStatus::Error, msg)
           }
         };
+
+        // Run every after-hook in registration order, threading the (possibly rewritten)
+        // result from one into the next, so e.g. a redaction hook and a compression hook
+        // can both apply to the same result without knowing about each other.
+        for after in &self.after_tool_callbacks {
+          if let Some((new_status, new_content)) = after
+            .call(
+              context_ref,
+              &function_call.id,
+              function_name,
+              status,
+              &content,
+            )
+            .await
+          {
+            status = new_status;
+            content = new_content;
+          }
+        }
 
         ContentItem::ToolResult {
           tool_call_id: function_call.id.clone(),
@@ -661,239 +769,7 @@ fn tool_rounds_remaining(current_step: u32, max_steps: u32) -> bool {
   current_step < max_steps
 }
 
+/// See `runtime/tests.rs`: split out of this file because the implementation above and
+/// its tests together no longer fit comfortably in one file to read through.
 #[cfg(test)]
-mod tests {
-  use serde_json::json;
-
-  use super::*;
-  use crate::tools::calculator::{self, Calculator};
-
-  fn agent_with(toolbox: ToolRegistry) -> Agent {
-    Agent::new(
-      Provider::shared().clone(),
-      "gpt-test",
-      Option::<String>::None,
-      Arc::new(toolbox),
-    )
-  }
-
-  #[test]
-  fn tool_rounds_remaining_until_budget_spent() {
-    assert!(tool_rounds_remaining(0, 3));
-    assert!(tool_rounds_remaining(2, 3));
-    assert!(!tool_rounds_remaining(3, 3));
-  }
-
-  #[test]
-  fn new_defaults_max_steps_to_the_shared_tool_round_budget() {
-    let agent = agent_with(ToolRegistry::empty());
-    assert_eq!(agent.max_steps, config::max_tool_rounds() as u32);
-  }
-
-  #[test]
-  fn with_max_steps_overrides_the_default() {
-    let agent = agent_with(ToolRegistry::empty()).with_max_steps(1);
-    assert_eq!(agent.max_steps, 1);
-  }
-
-  #[test]
-  fn new_defaults_max_history_tokens_to_the_shared_config() {
-    let agent = agent_with(ToolRegistry::empty());
-    assert_eq!(agent.max_history_tokens, config::max_history_tokens());
-  }
-
-  #[test]
-  fn with_max_history_tokens_overrides_the_default() {
-    let agent = agent_with(ToolRegistry::empty()).with_max_history_tokens(42);
-    assert_eq!(agent.max_history_tokens, 42);
-  }
-
-  #[test]
-  fn build_messages_replays_system_user_tool_call_and_result() {
-    let agent = Agent::new(
-      Provider::shared().clone(),
-      "gpt-test",
-      Some("be nice"),
-      Arc::new(ToolRegistry::empty()),
-    );
-    let mut context = ExecutionContext::new();
-    let id = context.execution_id.clone();
-
-    context.add_event(Event::new(
-      id.clone(),
-      "user",
-      vec![ContentItem::Message {
-        role: "user".to_owned(),
-        content: "hi".to_owned(),
-      }],
-    ));
-    context.add_event(Event::new(
-      id.clone(),
-      "agent",
-      vec![ContentItem::ToolCall {
-        tool_call_id: "call_1".to_owned(),
-        name: calculator::NAME.to_owned(),
-        arguments: json!({"operator": "add"}),
-      }],
-    ));
-    context.add_event(Event::new(
-      id,
-      "tool",
-      vec![ContentItem::ToolResult {
-        tool_call_id: "call_1".to_owned(),
-        name: calculator::NAME.to_owned(),
-        status: ToolResultStatus::Success,
-        content: "3".to_owned(),
-      }],
-    ));
-
-    let messages = agent.build_messages(&context).unwrap();
-
-    assert_eq!(messages.len(), 4, "system + user + assistant + tool");
-    assert!(matches!(
-      messages[0],
-      ChatCompletionRequestMessage::System(_)
-    ));
-    assert!(matches!(messages[1], ChatCompletionRequestMessage::User(_)));
-    assert!(matches!(
-      messages[2],
-      ChatCompletionRequestMessage::Assistant(_)
-    ));
-    assert!(matches!(messages[3], ChatCompletionRequestMessage::Tool(_)));
-  }
-
-  #[test]
-  fn build_messages_merges_consecutive_tool_calls_into_one_assistant_message() {
-    let agent = agent_with(ToolRegistry::empty());
-    let mut context = ExecutionContext::new();
-    let id = context.execution_id.clone();
-
-    context.add_event(Event::new(
-      id.clone(),
-      "agent",
-      vec![
-        ContentItem::ToolCall {
-          tool_call_id: "call_1".to_owned(),
-          name: "a".to_owned(),
-          arguments: json!({}),
-        },
-        ContentItem::ToolCall {
-          tool_call_id: "call_2".to_owned(),
-          name: "b".to_owned(),
-          arguments: json!({}),
-        },
-      ],
-    ));
-
-    let messages = agent.build_messages(&context).unwrap();
-    assert_eq!(messages.len(), 1);
-    let ChatCompletionRequestMessage::Assistant(assistant) = &messages[0] else {
-      panic!("expected an assistant message");
-    };
-    assert_eq!(assistant.tool_calls.as_ref().unwrap().len(), 2);
-  }
-
-  #[tokio::test]
-  async fn execute_tool_calls_records_success_and_unknown_tool() {
-    let mut registry = ToolRegistry::empty();
-    registry.add(Arc::new(Calculator)).unwrap();
-    let agent = agent_with(registry);
-    let mut context = ExecutionContext::new();
-
-    let calls = vec![
-      ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
-        id: "call_1".to_owned(),
-        function: FunctionCall {
-          name: calculator::NAME.to_owned(),
-          arguments: r#"{"operator":"add","first_number":1,"second_number":2}"#.to_owned(),
-        },
-      }),
-      ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
-        id: "call_2".to_owned(),
-        function: FunctionCall {
-          name: "nope".to_owned(),
-          arguments: "{}".to_owned(),
-        },
-      }),
-    ];
-
-    agent.execute_tool_calls(&mut context, &calls).await;
-
-    let event = context.events.last().unwrap();
-    assert_eq!(event.author, "tool");
-    assert_eq!(event.content.len(), 2);
-
-    let ContentItem::ToolResult {
-      status, content, ..
-    } = &event.content[0]
-    else {
-      panic!("expected a tool result");
-    };
-    assert_eq!(*status, ToolResultStatus::Success);
-    assert_eq!(content, "3");
-
-    let ContentItem::ToolResult {
-      status, content, ..
-    } = &event.content[1]
-    else {
-      panic!("expected a tool result");
-    };
-    assert_eq!(*status, ToolResultStatus::Error);
-    assert!(content.contains("unknown tool"), "got: {content}");
-  }
-
-  #[test]
-  fn seed_context_appends_the_new_turn_after_prior_history() {
-    let agent = agent_with(ToolRegistry::empty());
-    let prior = vec![Event::new(
-      "prev-execution",
-      "user",
-      vec![ContentItem::Message {
-        role: "user".to_owned(),
-        content: "hi".to_owned(),
-      }],
-    )];
-
-    let context = agent.seed_context(prior, "follow up");
-
-    assert_eq!(context.events.len(), 2, "prior turn plus the new user turn");
-    assert_eq!(context.events[0].author, "user");
-    let new_turn = &context.events[1];
-    assert_eq!(new_turn.execution_id, context.execution_id);
-    let ContentItem::Message { content, .. } = &new_turn.content[0] else {
-      panic!("expected a message");
-    };
-    assert_eq!(content, "follow up");
-  }
-
-  #[test]
-  fn seed_context_with_empty_history_only_has_the_new_turn() {
-    let agent = agent_with(ToolRegistry::empty());
-    let context = agent.seed_context(Vec::new(), "hi");
-    assert_eq!(context.events.len(), 1);
-  }
-
-  #[test]
-  fn record_tool_calls_falls_back_to_null_on_malformed_arguments() {
-    let agent = agent_with(ToolRegistry::empty());
-    let mut context = ExecutionContext::new();
-
-    let calls = vec![ChatCompletionMessageToolCalls::Function(
-      ChatCompletionMessageToolCall {
-        id: "call_1".to_owned(),
-        function: FunctionCall {
-          name: "calculator".to_owned(),
-          arguments: "not json".to_owned(),
-        },
-      },
-    )];
-
-    agent.record_tool_calls(&mut context, &calls);
-
-    let event = context.events.last().unwrap();
-    let ContentItem::ToolCall { arguments, .. } = &event.content[0] else {
-      panic!("expected a tool call");
-    };
-    assert!(arguments.is_null());
-  }
-}
+mod tests;
