@@ -30,3 +30,5 @@ mcp.json
 tenants.json
 
 .DS_Store
+.agent/sessions
+tmp

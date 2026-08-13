@@ -41,14 +41,20 @@ const ENV_HTTP_ADDR: &str = "AGENT_HTTP_ADDR";
 /// Environment variable: path to the tenant config file used by the HTTP agent server.
 const ENV_TENANTS_CONFIG_PATH: &str = "AGENT_TENANTS_PATH";
 
-/// Environment variable: idle timeout (seconds) for HTTP multi-turn sessions before
-/// [`crate::api::session::SessionStore`] evicts them.
+/// Environment variable: idle timeout (seconds) before the HTTP API's
+/// [`crate::agent::session::MemorySessionStore`] evicts a multi-turn session. The `cli`
+/// binary deliberately does not use this — its [`crate::agent::session::FileSessionStore`]
+/// is persistent (never expires) so a conversation can be resumed at any later time.
 const ENV_SESSION_TTL_SECS: &str = "AGENT_SESSION_TTL_SECS";
 
 /// Environment variable: how long (seconds) a successful `POST /v1/agent/run` response
 /// is cached against its `Idempotency-Key` before [`crate::api::idempotency::IdempotencyStore`]
 /// evicts it.
 const ENV_IDEMPOTENCY_TTL_SECS: &str = "AGENT_IDEMPOTENCY_TTL_SECS";
+
+/// Environment variable: directory the `cli` binary persists its
+/// [`crate::agent::session::FileSessionStore`] sessions under.
+const ENV_CLI_SESSION_DIR: &str = "AGENT_CLI_SESSION_DIR";
 
 /// Environment variable: soft token budget for conversation history passed to
 /// [`crate::agent::Agent::run_continuing`]; see [`crate::agent::history::trim_to_budget`].
@@ -99,8 +105,12 @@ const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:8080";
 /// Default tenant config location, relative to the working directory.
 const DEFAULT_TENANTS_CONFIG_PATH: &str = "tenants.json";
 
-/// Default idle timeout for HTTP multi-turn sessions: 30 minutes.
+/// Default idle timeout for an HTTP multi-turn session: 30 minutes.
 const DEFAULT_SESSION_TTL_SECS: u64 = 1800;
+
+/// Default directory for the `cli` binary's session files, relative to the working
+/// directory.
+const DEFAULT_CLI_SESSION_DIR: &str = ".agent/sessions";
 
 /// Default cache lifetime for an idempotency key: 24 hours, the same window Stripe uses
 /// for its `Idempotency-Key` header.
@@ -205,9 +215,20 @@ pub fn tenants_config_path() -> PathBuf {
     .unwrap_or_else(|| PathBuf::from(DEFAULT_TENANTS_CONFIG_PATH))
 }
 
-/// How long an idle multi-turn HTTP session ([`crate::api::session::SessionStore`]) is
-/// kept before eviction. Override with `AGENT_SESSION_TTL_SECS`; invalid values
-/// (non-numeric or 0) fall back to the default.
+/// Directory the `cli` binary persists its
+/// [`crate::agent::session::FileSessionStore`] sessions under. Override with
+/// `AGENT_CLI_SESSION_DIR`.
+pub fn cli_session_dir() -> PathBuf {
+  non_empty_var(ENV_CLI_SESSION_DIR)
+    .map(PathBuf::from)
+    .unwrap_or_else(|| PathBuf::from(DEFAULT_CLI_SESSION_DIR))
+}
+
+/// How long an idle HTTP multi-turn session (see [`ENV_SESSION_TTL_SECS`]) is kept before
+/// the [`crate::agent::session::MemorySessionStore`] evicts it. Override with
+/// `AGENT_SESSION_TTL_SECS`; invalid values (non-numeric or 0) fall back to the default.
+/// The `cli` binary does not use this (its sessions are persistent — see
+/// [`ENV_SESSION_TTL_SECS`]).
 pub fn session_ttl() -> std::time::Duration {
   std::time::Duration::from_secs(parsed_var_nonzero(
     ENV_SESSION_TTL_SECS,

@@ -36,7 +36,7 @@ const IDEMPOTENCY_KEY_HEADER: &str = "Idempotency-Key";
 /// having resolved (and thus authorized) a tenant first.
 pub struct AuthenticatedTenant {
   /// The raw bearer token itself, kept around (not just the human-readable `label`) so
-  /// [`crate::api::session::SessionStore`] and [`crate::api::idempotency::IdempotencyStore`]
+  /// [`crate::agent::session::SessionStore`] and [`crate::api::idempotency::IdempotencyStore`]
   /// can scope a `sessionId`/`Idempotency-Key` to the exact tenant that owns it — two
   /// tenants sharing a `label` (a config mistake, but not one this layer should silently
   /// paper over into a data leak) must still never see each other's data.
@@ -91,7 +91,7 @@ pub async fn health() -> axum::Json<serde_json::Value> {
 /// [`crate::agent::ExecutionContext`] every call, nothing persisted (`run_continuing`
 /// with an empty history is equivalent to [`Agent::run`]). With `sessionId`, prior turns
 /// are loaded from — and the updated transcript saved back to —
-/// [`crate::api::session::SessionStore`], scoped to this tenant's token.
+/// [`crate::agent::session::SessionStore`], scoped to this tenant's token.
 ///
 /// With an `Idempotency-Key` header (see [`crate::api::idempotency`]), a retry of the
 /// exact same request is safe: a repeat with the same key returns the cached response

@@ -127,6 +127,13 @@ impl ToolRegistry {
     self.tools.iter().any(|tool| tool.name() == name)
   }
 
+  /// Every registered tool's name, in registration order. Mainly for callers (e.g.
+  /// [`crate::callback::path_guard`]'s tests) that need to walk the actual tool list
+  /// rather than hand-maintaining a second copy of it.
+  pub fn names(&self) -> impl Iterator<Item = &str> {
+    self.tools.iter().map(|tool| tool.name())
+  }
+
   /// Look up one tool by name.
   ///
   /// Unlike [`Self::execute`], this returns the tool itself rather than a formatted

@@ -14,4 +14,5 @@ pub mod telemetry;
 pub mod tools;
 pub mod util;
 
+pub use agent::session;
 pub use agent::{Agent, AgentResult, AgentStreamEvent, StructuredAgentResult};

@@ -12,9 +12,11 @@ axum = "0.8.9"
 backon = "1.6.0"
 base64 = "0.23.1"
 chrono = "0.4.45"
+crossterm = "0.29.0"
 csv = "1.4.0"
 dotenvy = "0.15.7"
 futures = "0.3.33"
+reedline = "0.49.0"
 reqwest = { version = "0.13.4", features = ["json"] }
 rmcp = { version = "3.1.1", features = [
   "client",

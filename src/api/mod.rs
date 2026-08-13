@@ -42,8 +42,12 @@ pub mod dto;
 pub mod error;
 pub mod handlers;
 pub mod idempotency;
-pub mod session;
 pub mod tenant;
+
+/// Re-exported so existing `crate::api::session::*` paths keep working: the trait now
+/// lives in [`crate::agent::session`] (not HTTP-specific — see that module's docs) so a
+/// future non-HTTP front-end (e.g. a CLI) can reuse it without depending on this module.
+pub use crate::agent::session;
 
 use std::sync::Arc;
 

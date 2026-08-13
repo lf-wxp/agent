@@ -339,8 +339,7 @@ async fn before_tool_callback_short_circuits_without_running_the_tool() {
 #[tokio::test]
 async fn after_tool_callback_replaces_the_recorded_result() {
   let executed = Arc::new(AtomicBool::new(false));
-  let agent =
-    agent_with(spy_registry(&executed)).with_after_tool_callback(Arc::new(RewriteResult));
+  let agent = agent_with(spy_registry(&executed)).with_after_tool_callback(Arc::new(RewriteResult));
   let mut context = ExecutionContext::new();
 
   agent.execute_tool_calls(&mut context, &[spy_call()]).await;

@@ -88,3 +88,105 @@ impl BeforeToolCallback for ApprovalCallback {
     }
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use serde_json::{Value, json};
+
+  use super::*;
+
+  fn view<'a>(name: &'a str, arguments: &'a Value) -> ToolCallView<'a> {
+    ToolCallView {
+      tool_call_id: "call-1",
+      name,
+      arguments,
+      raw_arguments: "",
+    }
+  }
+
+  // None of the cases below name a tool the callback treats as dangerous, so `call`
+  // returns from its guard clause before ever prompting — meaning it never touches
+  // stdin/stderr and cannot block the test suite waiting for a console answer.
+
+  #[tokio::test]
+  async fn lets_a_tool_outside_the_dangerous_list_through_untouched() {
+    let approval = ApprovalCallback::new(["delete_file"]);
+    let context = ExecutionContext::new();
+    let args = json!({ "path": "notes.txt" });
+
+    assert!(
+      approval
+        .call(&context, view("read_file", &args))
+        .await
+        .is_none()
+    );
+  }
+
+  #[tokio::test]
+  async fn an_empty_dangerous_list_lets_every_tool_through() {
+    let approval = ApprovalCallback::new(Vec::<String>::new());
+    let context = ExecutionContext::new();
+    let args = json!({});
+
+    assert!(
+      approval
+        .call(&context, view("delete_file", &args))
+        .await
+        .is_none()
+    );
+  }
+
+  #[tokio::test]
+  async fn matches_dangerous_tool_names_exactly_not_as_a_substring() {
+    // "delete" is configured as dangerous, but the call names "delete_file" — a
+    // different, if related, string — so it must not match.
+    let approval = ApprovalCallback::new(["delete"]);
+    let context = ExecutionContext::new();
+    let args = json!({});
+
+    assert!(
+      approval
+        .call(&context, view("delete_file", &args))
+        .await
+        .is_none()
+    );
+  }
+
+  #[tokio::test]
+  async fn matching_is_case_sensitive() {
+    let approval = ApprovalCallback::new(["delete_file"]);
+    let context = ExecutionContext::new();
+    let args = json!({});
+
+    assert!(
+      approval
+        .call(&context, view("Delete_File", &args))
+        .await
+        .is_none()
+    );
+  }
+
+  #[tokio::test]
+  async fn accepts_both_owned_strings_and_str_slices_in_new() {
+    // `new` takes `impl IntoIterator<Item = impl Into<String>>`; exercise both common
+    // call shapes to make sure neither one fails to compile or behaves differently.
+    let from_str_slices = ApprovalCallback::new(["delete_file", "shell_exec"]);
+    let from_owned_strings =
+      ApprovalCallback::new(vec!["delete_file".to_owned(), "shell_exec".to_owned()]);
+    let context = ExecutionContext::new();
+    let args = json!({});
+
+    assert!(
+      from_str_slices
+        .call(&context, view("read_file", &args))
+        .await
+        .is_none()
+    );
+    assert!(
+      from_owned_strings
+        .call(&context, view("read_file", &args))
+        .await
+        .is_none()
+    );
+  }
+}
