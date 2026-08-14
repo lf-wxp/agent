@@ -3,6 +3,17 @@ edition = "2024"
 name = "agent"
 version = "0.1.0"
 
+# This crate is both a regular Cargo package (native, tokio/axum-based) and the root of a
+# workspace whose other members target `wasm32-unknown-unknown` (the Leptos web UI, see
+# `crates/web-ui`) — Cargo supports a package directory doubling as the workspace root, so
+# nothing under `src/`/`examples/` needs to move. Kept as a separate resolver so native and
+# wasm members can pick different feature sets for shared dependencies instead of unifying
+# them across targets (the default behavior that used to cause wasm builds to accidentally
+# pull in native-only features).
+[workspace]
+members = ["crates/shared", "crates/web-ui"]
+resolver = "2"
+
 [dependencies]
 anyhow = "1.0.104"
 async-openai = { version = "0.41", features = ["chat-completion", "embedding"] }
@@ -32,6 +43,7 @@ rmcp = { version = "3.1.1", features = [
 schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+shared = { path = "crates/shared" }
 tiktoken-rs = "0.12.0"
 tokio = { version = "1.53.1", features = [
   "fs",
@@ -41,7 +53,7 @@ tokio = { version = "1.53.1", features = [
   "sync",
   "time",
 ] }
-tower-http = { version = "0.7.0", features = ["trace", "cors"] }
+tower-http = { version = "0.7.0", features = ["cors", "fs", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 uuid = { version = "1.24.0", features = ["v4"] }
@@ -50,3 +62,11 @@ zip = "8.6.0"
 [profile.release]
 codegen-units = 1
 lto = "thin"
+
+# Wasm bundle size matters for a page load in a way it does not for the native binary;
+# optimize `web-ui` (and its dependency tree) for size instead of speed within the same
+# workspace-wide `release` profile above. Cargo only allows a handful of settings to vary
+# per package this way (`opt-level` is one of them); `lto`/`codegen-units` stay
+# workspace-wide.
+[profile.release.package.web-ui]
+opt-level = "z"

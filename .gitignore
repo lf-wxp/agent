@@ -32,3 +32,4 @@ tenants.json
 .DS_Store
 .agent/sessions
 tmp
+dist

@@ -14,8 +14,8 @@ use crate::agent::{
 /// error result in place of the call, and the model carries on without it.
 ///
 /// For interactive CLI use only. The prompt blocks on stdin with no timeout, so a run
-/// waits indefinitely for an answer — inside a request handler (see [`crate::api`]) that
-/// would hang the request and pin a thread from the blocking pool. A non-interactive
+/// waits indefinitely for an answer — inside a web request handler that would hang the
+/// request and pin a thread from the blocking pool. A non-interactive
 /// process denies everything instead, since reading a closed stdin yields no `y`.
 ///
 /// Prompts go to stderr, not stdout: stdout is a protocol channel for anything speaking

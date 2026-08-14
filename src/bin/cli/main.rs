@@ -1,12 +1,10 @@
 //! Interactive CLI chat client: `cargo run --bin cli`.
 //!
-//! A terminal front-end for [`agent::Agent`], the same way `bin/server.rs` is an HTTP
-//! front-end for it: same `Agent`, same tool-calling loop, just a different way for a
-//! human to drive it. Every line typed is one turn; the assistant's reply streams back
-//! token by token by default (see [`agent::AgentStreamEvent`]), or all at once with
-//! `--no-stream`.
+//! A terminal front-end for [`agent::Agent`]. Every line typed is one turn; the
+//! assistant's reply streams back token by token by default (see
+//! [`agent::AgentStreamEvent`]), or all at once with `--no-stream`.
 //!
-//! Unlike the HTTP API, a CLI invocation is short-lived — the process exits when the
+//! A CLI invocation is short-lived — the process exits when the
 //! user leaves the chat, and a later invocation should be able to pick the same
 //! conversation back up. That is exactly what [`agent::session::FileSessionStore`] is
 //! for (see its docs, and [`agent::session::SessionStore`]'s): each turn's transcript is
@@ -32,12 +30,30 @@
 //! human to weigh in. `--no-sandbox` turns that enforcement off; the working directory
 //! itself is still pinned either way.
 //!
-//! Destructive tools (`delete_file` by default) prompt for a `y`/`n` on the console
-//! before running, via [`agent::callback::approval::ApprovalCallback`] — see `--dangerous-
-//! tools` / `--no-approval` below. A bulky `web_search` result is compressed to the
-//! passages that answer the query before it enters the transcript, via
+//! Destructive tools (`delete_file` by default) prompt for a `y`/`n` before running, via
+//! [`agent::callback::dual_approval::DualApprovalCallback`] — see `--dangerous-tools` /
+//! `--no-approval` below. The prompt goes to the console for a terminal-originated turn
+//! and to the browser for a web-originated one (see [`mod@web`] and the `--mode` flag
+//! below), decided per turn rather than baked into one binary-wide choice. A bulky
+//! `web_search` result is compressed to the passages that answer the query before it
+//! enters the transcript, via
 //! [`agent::callback::search_compressor::SearchCompressorCallback`] — see
 //! `--no-search-compression` below.
+//!
+//! `--mode` picks which front-end(s) this invocation drives, all sharing the exact same
+//! `Agent`/session state — the browser is not a separate deployment, it is another way
+//! to interact with *this* process (see `docs/web-ui-plan.md`):
+//!
+//! - `cli` (default): terminal only, unchanged from before this flag existed.
+//! - `web`: no terminal REPL; only the local web server (see [`mod@web`]) runs, until it
+//!   errors or the process is killed (e.g. `Ctrl-C`).
+//! - `both`: terminal REPL and the web server at once. A turn typed in the terminal and
+//!   one submitted from a browser tab both go through the same `--session`'s history,
+//!   serialized against each other (see `run_turn_stream`'s `turn_lock` docs) rather
+//!   than racing — and both are broadcast live to every connected browser tab via
+//!   `GET /api/stream` (see [`web::WebState::events`]), so a message typed in the
+//!   terminal shows up in an already-open browser tab without that tab having sent
+//!   anything itself, and vice versa.
 //!
 //! ```sh
 //! cargo run --bin cli                              # chat in the `default` session
@@ -53,6 +69,8 @@
 //! cargo run --bin cli -- --no-search-compression   # keep web_search results uncompressed
 //! cargo run --bin cli -- --no-sandbox               # let filesystem tools roam anywhere
 //! cargo run --bin cli -- --no-vi-mode               # use Emacs keybindings instead
+//! cargo run --bin cli -- --mode both                # terminal + browser at once
+//! cargo run --bin cli -- --mode web --web-port 4000 # browser only, custom port
 //! ```
 //!
 //! Line editing at the `You>` prompt is handled by [`reedline`] (the line editor behind
@@ -76,24 +94,30 @@
 //! its result and exits immediately, without starting a chat or touching the configured
 //! LLM provider (see [`list_sessions`], [`remove_session_command`]).
 //!
-//! There is no multi-tenant concept here (contrast [`agent::api::handlers::
-//! AuthenticatedTenant`]): every session on this machine lives under one constant scope
-//! ([`LOCAL_SCOPE`]) and is distinguished purely by `--session`. Session files live under
-//! [`agent::config::cli_session_dir`] (`AGENT_CLI_SESSION_DIR`) and, unlike the HTTP
-//! server's TTL'd sessions, never expire ([`FileSessionStore::new_persistent`]) — a
-//! conversation from any time ago can be resumed; only `--fresh` / `/reset` clears one.
+//! There is no multi-tenant/multi-user concept here: every session on this machine lives
+//! under one constant scope ([`LOCAL_SCOPE`]) and is distinguished purely by `--session`.
+//! Session files live under [`agent::config::cli_session_dir`] (`AGENT_CLI_SESSION_DIR`)
+//! and never expire ([`FileSessionStore::new_persistent`]) — a conversation from any time
+//! ago can be resumed; only `--fresh` / `/reset` clears one. The web server (`--mode
+//! web`/`both`) binds `127.0.0.1` only and has no authentication of its own for the same
+//! reason: there is no second user to keep out on this machine (see
+//! `docs/web-ui-plan.md`'s "非目标" section).
+
+mod web;
 
 use std::{
   collections::HashMap,
   io::{self, Write},
+  net::SocketAddr,
   sync::Arc,
 };
 
 use agent::{
-  Agent, AgentStreamEvent,
+  Agent, AgentResult, AgentStreamEvent,
   agent::Event,
   callback::{
-    approval::ApprovalCallback, path_guard::WorkspaceGuardCallback,
+    dual_approval::{ApprovalChannel, DualApprovalCallback, with_approval_channel},
+    path_guard::WorkspaceGuardCallback,
     search_compressor::SearchCompressorCallback,
   },
   config,
@@ -103,12 +127,15 @@ use agent::{
   tools::{ToolRegistry, file_delete},
 };
 use anyhow::Context;
+use async_stream::stream;
 use crossterm::cursor::SetCursorStyle;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use reedline::{
   CursorConfig, EditMode as ReedlineEditMode, Emacs, Prompt, PromptEditMode, PromptHistorySearch,
   Reedline, Signal, Vi, default_vi_insert_keybindings, default_vi_normal_keybindings,
 };
+use shared::{ChatEvent, MessageOrigin};
+use tokio::sync::{Mutex as AsyncMutex, broadcast};
 
 const SYSTEM_PROMPT: &str =
   "You are a helpful, general-purpose assistant running in a command-line chat session.";
@@ -156,9 +183,9 @@ impl Prompt for ChatPrompt {
   }
 }
 
-/// Every CLI session lives under this constant scope: a CLI has no bearer-token tenant
-/// the way the HTTP API does, so there is nothing meaningful to isolate sessions by
-/// besides the session id itself (see [`agent::session::SessionStore`]'s `scope`
+/// Every CLI session lives under this constant scope: there is no multi-user concept
+/// here, so there is nothing meaningful to isolate sessions by besides the session id
+/// itself (see [`agent::session::SessionStore`]'s `scope`
 /// parameter).
 const LOCAL_SCOPE: &str = "local";
 
@@ -190,8 +217,8 @@ async fn main() -> anyhow::Result<()> {
     .with_context(|| format!("failed to switch to workspace `{}`", workspace.display()))?;
 
   // Persistent (never-expiring) store: resuming "the conversation I had last week" is a
-  // normal thing to want from a CLI, unlike the HTTP server's ephemeral, TTL'd sessions.
-  // Nothing is ever swept; only an explicit `--fresh` / `/reset` clears a session.
+  // normal thing to want from a CLI. Nothing is ever swept; only an explicit `--fresh` /
+  // `/reset` clears a session.
   let store = FileSessionStore::new_persistent(config::cli_session_dir());
 
   // `--list` / `--rm` are one-shot session-management commands, handled before touching
@@ -202,6 +229,15 @@ async fn main() -> anyhow::Result<()> {
   if let Some(target) = args.get("rm") {
     return remove_session_command(&store, target).await;
   }
+
+  let mode = args.get("mode").map(String::as_str).unwrap_or("cli");
+  if !["cli", "web", "both"].contains(&mode) {
+    anyhow::bail!("--mode must be one of `cli`, `web`, `both` (got `{mode}`)");
+  }
+  // Same `Agent`/session state either way — `--mode` only decides which front-end(s)
+  // are actually driving turns against it this run (see the module docs).
+  let run_terminal = mode != "web";
+  let run_web = mode != "cli";
 
   let session_id = args
     .get("session")
@@ -257,7 +293,7 @@ async fn main() -> anyhow::Result<()> {
   let agent = if dangerous_tools.is_empty() {
     agent
   } else {
-    agent.with_before_tool_callback(Arc::new(ApprovalCallback::new(dangerous_tools)))
+    agent.with_before_tool_callback(Arc::new(DualApprovalCallback::new(dangerous_tools)))
   };
   // On by default: a raw `web_search` result is mostly padding that gets re-sent to the
   // model on every subsequent tool round, so compressing it once, as it enters the
@@ -271,15 +307,75 @@ async fn main() -> anyhow::Result<()> {
     agent.with_after_tool_callback(Arc::new(SearchCompressorCallback))
   };
 
+  // `Arc` from here on: shared as-is (not cloned into independent copies) between the
+  // terminal loop below and the web server (`--mode web`/`both`, see [`mod@web`]) — one
+  // `Agent`, one on-disk history, one lock guarding it, no matter how many front-ends
+  // are driving turns against it this run.
+  let agent = Arc::new(agent);
+  let store = Arc::new(store);
+  // Serializes concurrent turns against `store` for the same session (see
+  // `run_turn_stream`'s docs) — needed for real once `--mode both` lets a terminal-
+  // originated and a web-originated turn race on the same session.
+  let turn_lock = Arc::new(AsyncMutex::new(()));
+
+  // Created unconditionally (even in `--mode cli`, where nothing ever subscribes to
+  // it): every turn this loop runs broadcasts onto it below, and gating that behind
+  // `if run_web` would mean duplicating the loop body instead of just letting a
+  // send with no subscribers be the harmless no-op `broadcast::Sender::send` already
+  // makes it. `web::WebState` (built below, only when `run_web`) holds a clone of this
+  // exact sender — see `web::new_event_channel`'s docs for why it is not built inside
+  // `WebState::new` itself.
+  let web_events_tx = web::new_event_channel();
+
+  if args.contains_key("fresh") {
+    clear_session(&store, &session_id).await;
+  }
+
+  if run_web {
+    let port = args
+      .get("web-port")
+      .filter(|value| !value.is_empty())
+      .and_then(|value| value.parse::<u16>().ok())
+      .unwrap_or_else(config::cli_web_port);
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let state = Arc::new(web::WebState::new(
+      Arc::clone(&agent),
+      Arc::clone(&store),
+      Arc::clone(&turn_lock),
+      session_id.clone(),
+      web_events_tx.clone(),
+    ));
+    let dist_dir = config::cli_web_dist_dir();
+    println!("Web UI: http://{addr} (session `{session_id}`)\n");
+    let handle = tokio::spawn(async move { web::serve(state, addr, &dist_dir).await });
+
+    if !run_terminal {
+      // `--mode web`: no REPL to keep the process alive, so this *is* the run — block
+      // here until the server errors or the process is killed (e.g. `Ctrl-C`), the same
+      // way any other long-running server would.
+      handle.await.context("web server task panicked")??;
+      return Ok(());
+    }
+    // `--mode both`: intentionally not awaited/stored anywhere further — dropping the
+    // `JoinHandle` detaches the task (it keeps running; only *awaiting* the handle would
+    // block here). It shares the exact same `Arc` clones as the REPL loop below, so it
+    // needs no further wiring to participate in the same session.
+  }
+
+  // Reaching here means `run_terminal` is true (the `--mode web` branch above always
+  // returns before this point) — subscribe now, before the REPL loop starts consuming
+  // any input, so a web-originated turn that starts while this process is still setting
+  // up cannot have its events land on the broadcast before anyone is listening for them.
+  // See [`print_chat_events`] for what this prints and, more importantly, what it does
+  // *not* re-print (the terminal's own `Terminal`-origin messages — already visible from
+  // typing them).
+  tokio::spawn(print_chat_events(web_events_tx.subscribe()));
+
   // Bare flag, like `--fresh`: `--no-stream` prints the whole reply at once instead of
   // token by token. Streaming is the default because it is the more responsive
   // interactive experience; non-streaming exists for piping output or a terminal that
   // renders partial lines badly.
   let streaming = !args.contains_key("no-stream");
-
-  if args.contains_key("fresh") {
-    clear_session(&store, &session_id).await;
-  }
 
   // vi's modal keybindings by default (see the module docs); `--no-vi-mode` falls back
   // to `reedline`'s other mode, Emacs-style. This only affects how a line is *typed*;
@@ -328,45 +424,71 @@ async fn main() -> anyhow::Result<()> {
       continue;
     }
 
-    let history = store.history(LOCAL_SCOPE, &session_id).await;
+    // Identifies this turn on the shared broadcast, the same way a browser-submitted
+    // one is identified by the id `POST /api/chat` hands back (see `web::new_turn_id`).
+    // Nothing in this loop needs it — a terminal runs one turn at a time by
+    // construction — but a browser tab watching along does: it is how a tab tells its
+    // own turn's `Done` from this one's.
+    let turn = web::new_turn_id();
 
+    // Broadcast before the turn even starts (see `web::WebState::events`'s docs): a
+    // browser tab watching `/api/stream` — and [`print_chat_events`], watching on this
+    // process's own behalf — should see the same input this loop is about to run, the
+    // same instant it starts. Tagged `Terminal` so that task knows *not* to re-print
+    // this particular message: `reedline` already echoed it to this same terminal as
+    // it was typed.
+    let _ = web_events_tx.send(ChatEvent::UserMessage {
+      text: input.to_owned(),
+      origin: MessageOrigin::Terminal,
+    });
+
+    // Neither branch below prints anything itself: [`print_chat_events`] (spawned once,
+    // before this loop started) is the single renderer for every [`ChatEvent`] this
+    // process broadcasts, this turn's included — see that function's docs for why
+    // unifying rendering there (rather than also printing directly here, which is what
+    // an earlier version of this loop did) is what makes a web-originated turn's output
+    // show up in *this* terminal too, not just a browser tab's.
     if streaming {
-      let stream = agent.run_continuing_stream(history, input);
+      let stream = run_turn_stream(
+        &agent,
+        &store,
+        &turn_lock,
+        &session_id,
+        input,
+        ApprovalChannel::Terminal,
+      );
       futures::pin_mut!(stream);
 
-      print!("Agent> ");
-      io::stdout().flush()?;
-
       while let Some(event) = stream.next().await {
-        match event? {
-          // Printed without a newline: chunks are meant to be concatenated as they arrive.
-          AgentStreamEvent::Token(text) => {
-            print!("{text}");
-            io::stdout().flush()?;
-          }
-          AgentStreamEvent::Done {
-            context,
-            budget_exhausted,
-            ..
-          } => {
-            println!("\n");
-            record_turn(&store, &session_id, context.events, budget_exhausted).await;
-          }
+        let event = event?;
+        for chat_event in web::to_chat_events(&event, &turn) {
+          let _ = web_events_tx.send(chat_event);
         }
       }
     } else {
-      // `--no-stream`: one `run_continuing` call instead of the streaming counterpart, so
+      // `--no-stream`: one `run_turn` call instead of the streaming counterpart, so
       // nothing is printed until the model — and every tool round it runs along the way —
       // has fully finished.
-      let result = agent.run_continuing(history, input).await?;
-      println!("Agent> {}\n", result.output);
-      record_turn(
+      let result = run_turn(
+        &agent,
         &store,
+        &turn_lock,
         &session_id,
-        result.context.events,
-        result.budget_exhausted,
+        input,
+        ApprovalChannel::Terminal,
       )
-      .await;
+      .await?;
+      // No per-round `ToolCallsStarted`/`Finished` to broadcast here (this branch never
+      // sees them at all — see `run_turn`'s docs), just the final text and completion,
+      // so a browser watching along at least sees *something* for a non-streaming turn
+      // instead of silence until the next streaming one.
+      let _ = web_events_tx.send(ChatEvent::Token {
+        text: result.output,
+      });
+      let _ = web_events_tx.send(ChatEvent::Done {
+        turn,
+        budget_exhausted: result.budget_exhausted,
+      });
     }
   }
 
@@ -375,7 +497,10 @@ async fn main() -> anyhow::Result<()> {
   // toolbox is the last thing still holding one (see `ToolRegistry::with_mcp`). Not doing
   // this is not a resource leak — the process is about to exit either way, and a stdio
   // server's child process dies with it — but it does let a well-behaved server clean up
-  // instead of being killed out from under it.
+  // instead of being killed out from under it. In `--mode both`, the detached web server
+  // task above still holds its own `Arc` clone, so this drop alone will not bring the
+  // count to zero and the shutdown attempt below is a best-effort no-op in that case —
+  // acceptable for the same reason: the whole process is exiting regardless.
   drop(agent);
   for connection in mcp_connections {
     if let Err(err) = connection.shutdown().await {
@@ -387,9 +512,161 @@ async fn main() -> anyhow::Result<()> {
   Ok(())
 }
 
+/// The single renderer for every [`ChatEvent`] this process broadcasts on
+/// [`web::WebState::events`]/`web_events_tx` — spawned once, in `main`, right before
+/// the REPL loop starts, and running for as long as the process does. Neither branch of
+/// the loop above prints anything directly; this task is what actually puts characters
+/// on this terminal, for a turn typed here *or* submitted from a browser tab, treating
+/// both the same way except for [`ChatEvent::UserMessage`] (see the match arm below).
+///
+/// A [`broadcast::error::RecvError::Lagged`] is handled the same way
+/// [`web::stream_handler`] handles it for a browser tab: skip ahead rather than treat it
+/// as fatal — a terminal that missed a few intermediate token chunks because this task
+/// briefly fell behind should keep printing what comes next, not stop rendering
+/// entirely.
+async fn print_chat_events(mut events: broadcast::Receiver<ChatEvent>) {
+  loop {
+    let event = match events.recv().await {
+      Ok(event) => event,
+      Err(broadcast::error::RecvError::Lagged(_)) => continue,
+      Err(broadcast::error::RecvError::Closed) => break,
+    };
+    print_chat_event(event);
+  }
+}
+
+fn print_chat_event(event: ChatEvent) {
+  match event {
+    ChatEvent::UserMessage { text, origin } => {
+      match origin {
+        // Already visible: `reedline` echoed it to this terminal as it was typed, and
+        // re-printing it here would just duplicate it.
+        MessageOrigin::Terminal => {}
+        // Not otherwise visible here at all — this is the one thing this task prints
+        // that a web-originated turn would not show up without.
+        MessageOrigin::Web => println!("\n[web] {text}"),
+      }
+      print!("Agent> ");
+      let _ = io::stdout().flush();
+    }
+    // Printed without a newline: chunks are meant to be concatenated as they arrive.
+    ChatEvent::Token { text } => {
+      print!("{text}");
+      let _ = io::stdout().flush();
+    }
+    ChatEvent::ToolCallsStarted { calls } => {
+      for call in calls {
+        println!("\n[tool] {}({})", call.name, call.arguments);
+      }
+      let _ = io::stdout().flush();
+    }
+    ChatEvent::ToolCallsFinished { results } => {
+      for result in results {
+        println!("[tool] {} -> {:?}", result.name, result.status);
+      }
+      let _ = io::stdout().flush();
+    }
+    ChatEvent::ApprovalRequired { tool, .. } => {
+      // Purely informational here: the actual decision for a web-originated call is
+      // made in the browser (see `web::approve_handler`), and a terminal-originated
+      // call's own `DualApprovalCallback::prompt_terminal` already prints its own
+      // blocking `y`/`n` prompt directly — this print only covers the case this task
+      // would otherwise stay silent about, a *web*-originated call waiting on the
+      // browser.
+      println!("\n[approval] `{tool}` is waiting on a decision in the browser");
+    }
+    ChatEvent::ApprovalResolved { approved, .. } => {
+      println!(
+        "[approval] {}",
+        if approved { "approved" } else { "denied" }
+      );
+    }
+    ChatEvent::Done { .. } => {
+      println!("\n");
+    }
+    // `turn` is ignored here, unlike in a browser tab: this terminal has no per-turn UI
+    // state to unwind (it prints as events arrive and blocks on its own turns), so which
+    // turn an error belongs to changes nothing about how it is shown.
+    ChatEvent::Error { message, .. } => {
+      println!("\n[error] {message}");
+    }
+  }
+}
+
+/// One streaming turn: load `session_id`'s prior history, run the agent, and persist the
+/// updated transcript once it finishes — the same "load -> run -> save" sequence
+/// [`run_turn`] does non-streaming. Shared by every front-end this process drives a turn
+/// for (the terminal loop above; [`web::chat_handler`] below), so none of them can drift
+/// on what "starting a turn" (which history to load) or "finishing one" (persisting it,
+/// even if the round budget ran out) means.
+///
+/// `turn_lock` is held for the *whole* sequence, including while the caller is still
+/// consuming the returned stream: [`FileSessionStore`] is last-write-wins (see its
+/// docs), so two turns racing on the same `session_id` — e.g. one typed in the terminal
+/// and one submitted from a browser tab at the same moment (`--mode both`) — could
+/// otherwise have the second one's save silently overwrite the first one's. Holding the
+/// lock for the whole turn instead serializes that race into a queue: the second turn's
+/// `history` load waits until the first one's `save` has completed.
+///
+/// `channel` is where any [`DualApprovalCallback`] prompt this turn triggers should go —
+/// [`ApprovalChannel::Terminal`] for the loop above, `ApprovalChannel::Web(..)` for
+/// [`web::chat_handler`]. It is re-attached (via [`with_approval_channel`]) around each
+/// individual `inner.next()` poll rather than around the whole stream once: a
+/// [`tokio::task_local!`] only stays set for the duration of the future it wraps, and
+/// `inner` (an `async_stream` generator, not something that itself takes a channel
+/// parameter) is that future one poll at a time, not once for its entire lifetime.
+fn run_turn_stream<'a>(
+  agent: &'a Agent,
+  store: &'a FileSessionStore,
+  turn_lock: &'a AsyncMutex<()>,
+  session_id: &'a str,
+  input: &'a str,
+  channel: ApprovalChannel,
+) -> impl Stream<Item = anyhow::Result<AgentStreamEvent>> + 'a {
+  stream! {
+    let _guard = turn_lock.lock().await;
+    let history = store.history(LOCAL_SCOPE, session_id).await;
+
+    let inner = agent.run_continuing_stream(history, input);
+    futures::pin_mut!(inner);
+
+    while let Some(event) = with_approval_channel(channel.clone(), inner.next()).await {
+      if let Ok(AgentStreamEvent::Done { context, budget_exhausted, .. }) = &event {
+        record_turn(store, session_id, context.events.clone(), *budget_exhausted).await;
+      }
+      yield event;
+    }
+  }
+}
+
+/// Non-streaming counterpart of [`run_turn_stream`]: the same load/run/save sequence and
+/// the same `turn_lock`/`channel` contract, but waits for the whole turn to finish
+/// instead of forwarding tokens as they arrive.
+async fn run_turn(
+  agent: &Agent,
+  store: &FileSessionStore,
+  turn_lock: &AsyncMutex<()>,
+  session_id: &str,
+  input: &str,
+  channel: ApprovalChannel,
+) -> anyhow::Result<AgentResult> {
+  let _guard = turn_lock.lock().await;
+  let history = store.history(LOCAL_SCOPE, session_id).await;
+
+  let result = with_approval_channel(channel, agent.run_continuing(history, input)).await?;
+  record_turn(
+    store,
+    session_id,
+    result.context.events.clone(),
+    result.budget_exhausted,
+  )
+  .await;
+  Ok(result)
+}
+
 /// Persist a completed turn's transcript, warning first if the round budget ran out
-/// before producing it. Shared by both the streaming and `--no-stream` branches of the
-/// chat loop so the two cannot drift on what "finishing a turn" means.
+/// before producing it. Shared by both [`run_turn_stream`] and [`run_turn`] so the two
+/// cannot drift on what "finishing a turn" means.
 async fn record_turn(
   store: &FileSessionStore,
   session_id: &str,
@@ -494,12 +771,12 @@ fn configure_cursor() -> CursorConfig {
 /// The blocking read runs inside [`tokio::task::spawn_blocking`] rather than directly on
 /// a runtime worker thread: `Reedline::read_line` blocks its thread indefinitely waiting
 /// for a human, and doing that on a `tokio` worker thread would starve every other task
-/// sharing the runtime (see [`agent::callback::approval::ApprovalCallback`] for the same
-/// reasoning). Nothing else runs concurrently with this chat loop today, but staying off
-/// worker threads while blocked on the user is the right default regardless. `editor` is
-/// moved into the blocking closure and handed back alongside the result rather than kept
-/// on the async side, since [`Reedline`] is not `Clone`. History is tracked by `editor`
-/// itself on a successful line — no manual bookkeeping needed here.
+/// sharing the runtime (see [`DualApprovalCallback`] for the same reasoning). Staying off
+/// worker threads while blocked on the user matters even more now that `--mode both`
+/// can have the web server's tasks sharing this same runtime concurrently with this loop.
+/// `editor` is moved into the blocking closure and handed back alongside the result
+/// rather than kept on the async side, since [`Reedline`] is not `Clone`. History is
+/// tracked by `editor` itself on a successful line — no manual bookkeeping needed here.
 async fn read_line(mut editor: Reedline) -> anyhow::Result<(Option<String>, Reedline)> {
   tokio::task::spawn_blocking(move || match editor.read_line(&ChatPrompt) {
     Ok(Signal::Success(line)) => Ok((Some(line), editor)),

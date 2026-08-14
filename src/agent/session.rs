@@ -4,54 +4,42 @@
 //! [`Agent`](crate::agent::Agent) itself has no notion of a "session" — it is a stateless
 //! function of "prior events + new input" (see [`crate::agent::Agent::run_continuing`]).
 //! A `SessionStore` is what turns that into an actual multi-turn conversation for a given
-//! front-end: a caller picks its own `session_id` (e.g. [`crate::api::dto::RunRequest::
-//! session_id`] for the HTTP API, or a CLI's own `--session` flag) and sends it on every
-//! turn; we hand back whatever history is stored under `(scope, session_id)` before the
-//! call, and save the updated transcript after.
+//! front-end: a caller picks its own `session_id` (e.g. a CLI's own `--session` flag, or a
+//! web front-end's own conversation id) and sends it on every turn; we hand back whatever
+//! history is stored under `(scope, session_id)` before the call, and save the updated
+//! transcript after.
 //!
 //! `scope` isolates one caller-defined namespace from another under the same
-//! `session_id` — the HTTP API uses the authenticated tenant's bearer token (see
-//! [`crate::api::handlers::AuthenticatedTenant::token`]) so one tenant can never read or
-//! overwrite another tenant's conversation; a CLI with no multi-tenant concept can just
-//! pass a constant.
+//! `session_id` — e.g. a terminal-originated turn and a web-originated turn sharing one
+//! process could use different scopes if they should never see each other's history; a
+//! single-front-end caller can just pass a constant.
 //!
-//! Two implementations exist today:
+//! [`FileSessionStore`] persists one JSON file per `(scope, session_id)` on disk, so a
+//! short-lived process — a CLI invocation, most obviously — can pick a conversation back
+//! up on its *next* invocation.
 //!
-//! - [`MemorySessionStore`]: good enough for a single HTTP server process (see
-//!   [`crate::api::AppState::sessions`]), but history is lost on restart and is not
-//!   shared across replicas.
-//! - [`FileSessionStore`]: one JSON file per `(scope, session_id)` on disk, so a
-//!   short-lived process — a CLI invocation, most obviously — can pick a conversation
-//!   back up on its *next* invocation, which an in-memory store cannot do at all.
-//!
-//! The trait exists precisely so a Redis- or database-backed store can be dropped in
-//! later too (anywhere this is held as `Arc<dyn SessionStore>`) without touching the
-//! caller at all.
+//! The trait exists so a Redis- or database-backed store could be dropped in later too
+//! (anywhere this is held as `Arc<dyn SessionStore>`) without touching the caller at all.
 //!
 //! # Known limitations
 //!
-//! Both implementations here are single-machine:
-//!
-//! - **Not shared across replicas**: a session lives in one process's memory or on one
-//!   machine's disk; a horizontally scaled HTTP server needs a Redis-/database-backed
-//!   implementation instead.
+//! - **Single-machine**: a session lives on one machine's disk; nothing here is shared
+//!   across replicas.
 //! - **Last-write-wins**: two concurrent callers for the same `(scope, session_id)` race;
 //!   whichever finishes last overwrites the other's turn. Callers that need strict
 //!   ordering must serialize their own requests per session.
 //! - **Unbounded turn count**: a very long conversation keeps every turn until the whole
 //!   session expires — though [`crate::agent::Agent::run_continuing`] does trim the
 //!   *token* budget per call (see [`crate::agent::history::trim_to_budget`]), so this
-//!   mainly costs memory/disk here, not prompt size sent to the model.
-//! - **Plaintext on disk** ([`FileSessionStore`] only): transcripts are written as
-//!   plaintext JSON. The directory is created `0700` (owner-only) on Unix so other local
-//!   users cannot read them, but this is not encryption at rest — do not point it at a
-//!   world-readable location, and treat the machine's disk as trusted.
+//!   mainly costs disk here, not prompt size sent to the model.
+//! - **Plaintext on disk**: transcripts are written as plaintext JSON. The directory is
+//!   created `0700` (owner-only) on Unix so other local users cannot read them, but this
+//!   is not encryption at rest — do not point it at a world-readable location, and treat
+//!   the machine's disk as trusted.
 
 use std::{
-  collections::HashMap,
   path::{Path, PathBuf},
-  sync::Mutex,
-  time::{Duration, Instant, SystemTime},
+  time::{Duration, SystemTime},
 };
 
 use base64::Engine;
@@ -91,89 +79,16 @@ pub trait SessionStore: Send + Sync {
   async fn save(&self, scope: &str, session_id: &str, history: Vec<Event>);
 
   /// Drop every session idle past whatever retention policy this implementation uses.
-  /// Meant to be called periodically (see `bin/server.rs`); a no-op implementation
-  /// (e.g. a store backed by Redis `EXPIRE`/a database TTL index that already expires
-  /// entries on its own) is a perfectly valid choice here.
+  /// Meant to be called periodically by whatever long-running process owns this store;
+  /// a no-op implementation (e.g. a store backed by Redis `EXPIRE`/a database TTL index
+  /// that already expires entries on its own) is a perfectly valid choice here.
   async fn sweep_expired(&self);
 }
 
-struct Session {
-  history: Vec<Event>,
-  last_used: Instant,
-}
-
-/// In-memory [`SessionStore`]: good enough for a single-process deployment or local
-/// development; see the module docs for what it does not cover.
-pub struct MemorySessionStore {
-  sessions: Mutex<HashMap<String, Session>>,
-  ttl: Duration,
-}
-
-impl MemorySessionStore {
-  pub fn new(ttl: Duration) -> Self {
-    Self {
-      sessions: Mutex::new(HashMap::new()),
-      ttl,
-    }
-  }
-
-  /// Number of sessions currently stored, expired or not. Exposed mainly for tests and
-  /// operational logging.
-  pub fn len(&self) -> usize {
-    self.sessions.lock().unwrap().len()
-  }
-
-  pub fn is_empty(&self) -> bool {
-    self.sessions.lock().unwrap().is_empty()
-  }
-
-  fn expired(&self, session: &Session) -> bool {
-    session.last_used.elapsed() > self.ttl
-  }
-
-  /// `\0` cannot appear in a bearer token, a CLI-supplied scope, or a JSON string
-  /// session id, so this cannot collide between e.g. `("a", "bc")` and `("ab", "c")`.
-  fn key(scope: &str, session_id: &str) -> String {
-    format!("{scope}\0{session_id}")
-  }
-}
-
-#[async_trait::async_trait]
-impl SessionStore for MemorySessionStore {
-  async fn history(&self, scope: &str, session_id: &str) -> Vec<Event> {
-    let key = Self::key(scope, session_id);
-    let sessions = self.sessions.lock().unwrap();
-    match sessions.get(&key) {
-      Some(session) if !self.expired(session) => session.history.clone(),
-      _ => Vec::new(),
-    }
-  }
-
-  async fn save(&self, scope: &str, session_id: &str, history: Vec<Event>) {
-    let key = Self::key(scope, session_id);
-    self.sessions.lock().unwrap().insert(
-      key,
-      Session {
-        history,
-        last_used: Instant::now(),
-      },
-    );
-  }
-
-  async fn sweep_expired(&self) {
-    self
-      .sessions
-      .lock()
-      .unwrap()
-      .retain(|_, session| session.last_used.elapsed() <= self.ttl);
-  }
-}
-
 /// [`SessionStore`] that persists each `(scope, session_id)` as one JSON file under
-/// `dir` — one process's [`MemorySessionStore`] loses everything on exit, which is fine
-/// for a long-running HTTP server (the next request just starts a fresh conversation)
-/// but wrong for a CLI, where "continue my last conversation" has to survive the process
-/// exiting between invocations.
+/// `dir` — a purely in-memory store loses everything once the process exits, which is
+/// fine for a short-lived, stateless caller but wrong for a CLI, where "continue my last
+/// conversation" has to survive the process exiting between invocations.
 ///
 /// Recency for [`SessionStore::sweep_expired`] and expiry is tracked via the file's own
 /// mtime (updated by every [`SessionStore::save`]) rather than an in-memory clock, so it
@@ -217,9 +132,9 @@ impl FileSessionStore {
   /// One file per `(scope, session_id)`, named from a URL-safe base64 encoding of the
   /// pair rather than the raw strings: either could contain `/`, `..`, or other
   /// characters that are meaningful to a filesystem path, and letting them straight
-  /// through would risk writing outside `dir` entirely. `\0` as the separator (like
-  /// [`MemorySessionStore::key`]) means `("a", "bc")` and `("ab", "c")` still encode to
-  /// different strings before encoding, so they cannot collide after it either.
+  /// through would risk writing outside `dir` entirely. `\0` as the separator means
+  /// `("a", "bc")` and `("ab", "c")` still encode to different strings before encoding,
+  /// so they cannot collide after it either.
   fn path_for(&self, scope: &str, session_id: &str) -> PathBuf {
     let key = format!("{scope}\0{session_id}");
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
@@ -419,81 +334,6 @@ mod tests {
         content: text.to_owned(),
       }],
     )]
-  }
-
-  #[tokio::test]
-  async fn unknown_session_returns_empty_history() {
-    let store = MemorySessionStore::new(Duration::from_secs(60));
-    assert!(store.history("scope-a", "session-1").await.is_empty());
-  }
-
-  #[tokio::test]
-  async fn save_then_history_round_trips() {
-    let store = MemorySessionStore::new(Duration::from_secs(60));
-    store
-      .save("scope-a", "session-1", sample_history("hi"))
-      .await;
-
-    let history = store.history("scope-a", "session-1").await;
-    assert_eq!(history.len(), 1);
-  }
-
-  #[tokio::test]
-  async fn sessions_are_isolated_per_scope() {
-    let store = MemorySessionStore::new(Duration::from_secs(60));
-    store
-      .save("scope-a", "session-1", sample_history("hi"))
-      .await;
-
-    // Same session id, different scope: must not see scope-a's history.
-    assert!(store.history("scope-b", "session-1").await.is_empty());
-  }
-
-  #[tokio::test]
-  async fn save_replaces_the_previous_history_for_the_same_session() {
-    let store = MemorySessionStore::new(Duration::from_secs(60));
-    store
-      .save("scope-a", "session-1", sample_history("first"))
-      .await;
-    store
-      .save(
-        "scope-a",
-        "session-1",
-        vec![
-          sample_history("first")[0].clone(),
-          sample_history("second")[0].clone(),
-        ],
-      )
-      .await;
-
-    assert_eq!(store.history("scope-a", "session-1").await.len(), 2);
-    assert_eq!(store.len(), 1, "one session, not two");
-  }
-
-  #[tokio::test]
-  async fn sweep_expired_evicts_sessions_past_the_ttl() {
-    let store = MemorySessionStore::new(Duration::from_millis(1));
-    store
-      .save("scope-a", "session-1", sample_history("hi"))
-      .await;
-    std::thread::sleep(Duration::from_millis(20));
-
-    store.sweep_expired().await;
-
-    assert_eq!(store.len(), 0);
-    assert!(store.history("scope-a", "session-1").await.is_empty());
-  }
-
-  #[tokio::test]
-  async fn sweep_expired_keeps_sessions_still_within_the_ttl() {
-    let store = MemorySessionStore::new(Duration::from_secs(60));
-    store
-      .save("scope-a", "session-1", sample_history("hi"))
-      .await;
-
-    store.sweep_expired().await;
-
-    assert_eq!(store.len(), 1);
   }
 
   /// A freshly created directory under the OS temp dir that no other test can collide

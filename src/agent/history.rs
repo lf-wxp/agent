@@ -1,5 +1,5 @@
 //! Token-budget-aware trimming of conversation history, so a long-running multi-turn
-//! session (see [`crate::api::session`]) does not grow without bound and eventually blow
+//! session (see [`crate::agent::session`]) does not grow without bound and eventually blow
 //! past the model's context window or balloon per-turn cost.
 //!
 //! Truncation is coarse-grained on purpose: whole turns are dropped, never a lone tool

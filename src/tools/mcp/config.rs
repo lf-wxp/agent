@@ -231,8 +231,8 @@ async fn connect_http(label: &str, server: &ServerConfig) -> anyhow::Result<McpC
 /// variable is an error rather than being left as-is: passing a literal `${TOKEN}` to a
 /// server produces a far more confusing failure downstream.
 ///
-/// Shared with [`crate::api::tenant`], which needs the same substitution for its own
-/// (also usually-committed) tenant config file.
+/// Reusable anywhere else a config file needs the same substitution (e.g. a future
+/// deployment-specific config file that should not commit real credentials).
 pub(crate) fn expand(text: &str) -> anyhow::Result<String> {
   let mut out = String::with_capacity(text.len());
   let mut rest = text;

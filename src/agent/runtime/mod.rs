@@ -17,8 +17,8 @@
 //! Multi-turn conversations are supported via [`Agent::run_continuing`], which seeds a
 //! call with a prior turn's events instead of starting from an empty transcript. `Agent`
 //! itself stays a stateless function of "prior events + new input": it does not own a
-//! session/storage concept, that lives one layer up (see [`crate::api::session`] for how
-//! the HTTP API persists history across requests). It does, however, cap how much of
+//! session/storage concept, that lives one layer up (see [`crate::agent::session`] for one
+//! way a caller can persist history across turns). It does, however, cap how much of
 //! that history it will actually send per call (see [`Self::with_max_history_tokens`] and
 //! [`crate::agent::history::trim_to_budget`]), since an unbounded session could otherwise
 //! grow past the model's context window.
@@ -87,13 +87,30 @@ pub struct AgentResult {
 ///
 /// A caller interested only in the text (e.g. forwarding straight to an SSE response) can
 /// match on [`Self::Token`] and ignore everything else until the stream ends; a caller that
-/// needs to persist the turn (e.g. [`crate::api::session::SessionStore`]) reads
+/// needs to persist the turn (e.g. [`crate::agent::session::SessionStore`]) reads
 /// [`Self::Done`]'s `context` — the same fields as [`AgentResult`], just delivered as the
-/// stream's last item instead of a return value.
+/// stream's last item instead of a return value. A caller that wants to show the tool
+/// calls a round makes as they happen (e.g. a web UI's process timeline) reads
+/// [`Self::ToolCallsStarted`]/[`Self::ToolCallsFinished`] instead of waiting for `Done`
+/// and reconstructing them from its `context.events`.
 #[derive(Debug)]
 pub enum AgentStreamEvent {
   /// A chunk of assistant text, forwarded as soon as the model emits it.
   Token(String),
+  /// The model requested these tool calls and they are about to run, forwarded just
+  /// before [`Agent::execute_tool_calls`] starts them. Every item is a
+  /// [`ContentItem::ToolCall`] — one per call in this round, in the order the model
+  /// requested them, the same items [`Agent::record_tool_calls`] adds to the transcript.
+  ///
+  /// This is round-level, not per-individual-call: calls in the same round run
+  /// concurrently (see [`Agent::execute_tool_calls`]'s docs), so there is no meaningful
+  /// per-call "started" instant to report separately from the round's.
+  ToolCallsStarted(Vec<ContentItem>),
+  /// The tool calls from the immediately preceding [`Self::ToolCallsStarted`] have all
+  /// finished, forwarded right after [`Agent::execute_tool_calls`] returns. Every item is
+  /// a [`ContentItem::ToolResult`], in the same order as the [`Self::ToolCallsStarted`]
+  /// it answers.
+  ToolCallsFinished(Vec<ContentItem>),
   /// The run finished. Always the last item; nothing follows it.
   Done {
     output: String,
@@ -245,8 +262,8 @@ impl Agent {
   /// and hand it back here for the next turn, so the model sees the full exchange so
   /// far. This is what makes multi-turn conversations possible without `Agent` itself
   /// owning any session/storage concept: it stays a pure function of "prior events + new
-  /// input" (see [`crate::api::session`] for one way to manage that storage across HTTP
-  /// requests).
+  /// input" (see [`crate::agent::session`] for one way to manage that storage across
+  /// calls).
   ///
   /// The round budget ([`Self::with_max_steps`]) resets every call — `current_step`
   /// starts back at zero — so a long conversation is never penalized for rounds already
@@ -333,7 +350,7 @@ impl Agent {
   /// Text is forwarded as [`AgentStreamEvent::Token`]s as soon as it arrives; the final
   /// [`AgentStreamEvent::Done`] carries the same fields as [`AgentResult`] and is always the
   /// last item, so a caller can stream tokens to a client while still waiting for `Done` to
-  /// get the context to persist (e.g. into [`crate::api::session::SessionStore`]).
+  /// get the context to persist (e.g. into [`crate::agent::session::SessionStore`]).
   pub fn run_continuing_stream<'a>(
     &'a self,
     history: Vec<Event>,
@@ -424,8 +441,12 @@ impl Agent {
           }
         };
 
-        self.record_tool_calls(&mut context, &tool_calls);
-        self.execute_tool_calls(&mut context, &tool_calls).await;
+        let started_items = self.record_tool_calls(&mut context, &tool_calls);
+        yield Ok(AgentStreamEvent::ToolCallsStarted(started_items));
+
+        let finished_items = self.execute_tool_calls(&mut context, &tool_calls).await;
+        yield Ok(AgentStreamEvent::ToolCallsFinished(finished_items));
+
         context.increment_step();
       }
     }
@@ -527,11 +548,15 @@ impl Agent {
     }
   }
 
+  /// Record one round's tool calls into the transcript and return the same items, so a
+  /// caller that also wants to forward them live (see
+  /// [`AgentStreamEvent::ToolCallsStarted`]) does not have to recompute or reparse
+  /// anything already done here.
   fn record_tool_calls(
     &self,
     context: &mut ExecutionContext,
     tool_calls: &[ChatCompletionMessageToolCalls],
-  ) {
+  ) -> Vec<ContentItem> {
     let mut call_items = Vec::new();
     for tool_call in tool_calls {
       if let ChatCompletionMessageToolCalls::Function(function_call) = tool_call {
@@ -547,8 +572,9 @@ impl Agent {
     context.add_event(Event::new(
       context.execution_id.clone(),
       "agent",
-      call_items,
+      call_items.clone(),
     ));
+    call_items
   }
 
   /// Execute every call in one model turn.
@@ -566,11 +592,16 @@ impl Agent {
   /// (e.g. redact sensitive content, then compress what is left) before it is recorded.
   /// All of them are read-only borrows of `context`, so they do not conflict with running
   /// the calls concurrently.
+  ///
+  /// Returns the same [`ContentItem::ToolResult`] items added to the transcript, so a
+  /// caller that also wants to forward them live (see
+  /// [`AgentStreamEvent::ToolCallsFinished`]) does not have to reach back into
+  /// `context.events` to find them.
   async fn execute_tool_calls(
     &self,
     context: &mut ExecutionContext,
     tool_calls: &[ChatCompletionMessageToolCalls],
-  ) {
+  ) -> Vec<ContentItem> {
     // Reborrowed immutably: every concurrent call below may read `context` (e.g. to make
     // an allow/deny decision), while the mutable borrow needed to record the resulting
     // event is only taken back once all of them have resolved, below.
@@ -677,8 +708,9 @@ impl Agent {
     context.add_event(Event::new(
       context.execution_id.clone(),
       "tool",
-      result_items,
+      result_items.clone(),
     ));
+    result_items
   }
 
   /// Replay the transcript recorded in `context` into the message shape the API expects.

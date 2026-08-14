@@ -12,8 +12,9 @@
 //!
 //! Each route exists in two flavors that differ only in *where the schema comes from*:
 //! a compile-time Rust type (`run_structured*`, for library callers) or a
-//! [`serde_json::Value`] supplied at runtime (`run_structured_raw*`, for the HTTP API —
-//! see [`crate::api::dto::StructuredSchemaRequest`]). Since [`Value`] itself implements
+//! [`serde_json::Value`] supplied at runtime (`run_structured_raw*`, for a caller with no
+//! compile-time type, e.g. a web front-end forwarding a JSON Schema from a request).
+//! Since [`Value`] itself implements
 //! [`DeserializeOwned`], both flavors of a route share one generic core
 //! ([`Agent::run_final_answer_loop`] / [`Agent::run_response_format_loop`]) that is
 //! generic over the parsed output type `T`; the `_raw` variant is just a thin wrapper

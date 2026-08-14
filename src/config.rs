@@ -35,26 +35,17 @@ const ENV_MAX_RETRIES: &str = "LLM_MAX_RETRIES";
 /// Environment variable: path to the MCP server config file.
 const ENV_MCP_CONFIG_PATH: &str = "MCP_CONFIG_PATH";
 
-/// Environment variable: address the HTTP agent server ([`crate::api`]) listens on.
-const ENV_HTTP_ADDR: &str = "AGENT_HTTP_ADDR";
-
-/// Environment variable: path to the tenant config file used by the HTTP agent server.
-const ENV_TENANTS_CONFIG_PATH: &str = "AGENT_TENANTS_PATH";
-
-/// Environment variable: idle timeout (seconds) before the HTTP API's
-/// [`crate::agent::session::MemorySessionStore`] evicts a multi-turn session. The `cli`
-/// binary deliberately does not use this — its [`crate::agent::session::FileSessionStore`]
-/// is persistent (never expires) so a conversation can be resumed at any later time.
-const ENV_SESSION_TTL_SECS: &str = "AGENT_SESSION_TTL_SECS";
-
-/// Environment variable: how long (seconds) a successful `POST /v1/agent/run` response
-/// is cached against its `Idempotency-Key` before [`crate::api::idempotency::IdempotencyStore`]
-/// evicts it.
-const ENV_IDEMPOTENCY_TTL_SECS: &str = "AGENT_IDEMPOTENCY_TTL_SECS";
-
 /// Environment variable: directory the `cli` binary persists its
 /// [`crate::agent::session::FileSessionStore`] sessions under.
 const ENV_CLI_SESSION_DIR: &str = "AGENT_CLI_SESSION_DIR";
+
+/// Environment variable: port the `cli` binary's `--mode web`/`--mode both` local web
+/// server binds to (always on `127.0.0.1`, see `src/bin/cli/web.rs`).
+const ENV_CLI_WEB_PORT: &str = "AGENT_CLI_WEB_PORT";
+
+/// Environment variable: directory the `cli` binary's web server serves its static
+/// front-end assets from — the `crates/web-ui` crate's `trunk build` output.
+const ENV_CLI_WEB_DIST_DIR: &str = "AGENT_CLI_WEB_DIST_DIR";
 
 /// Environment variable: soft token budget for conversation history passed to
 /// [`crate::agent::Agent::run_continuing`]; see [`crate::agent::history::trim_to_budget`].
@@ -99,22 +90,12 @@ const DEFAULT_MAX_RETRIES: usize = 3;
 /// Default MCP config location, relative to the working directory.
 const DEFAULT_MCP_CONFIG_PATH: &str = "mcp.json";
 
-/// Default address for the HTTP agent server.
-const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:8080";
-
-/// Default tenant config location, relative to the working directory.
-const DEFAULT_TENANTS_CONFIG_PATH: &str = "tenants.json";
-
-/// Default idle timeout for an HTTP multi-turn session: 30 minutes.
-const DEFAULT_SESSION_TTL_SECS: u64 = 1800;
-
 /// Default directory for the `cli` binary's session files, relative to the working
 /// directory.
 const DEFAULT_CLI_SESSION_DIR: &str = ".agent/sessions";
 
-/// Default cache lifetime for an idempotency key: 24 hours, the same window Stripe uses
-/// for its `Idempotency-Key` header.
-const DEFAULT_IDEMPOTENCY_TTL_SECS: u64 = 86_400;
+/// Default port for the `cli` binary's local web server.
+const DEFAULT_CLI_WEB_PORT: u16 = 4173;
 
 /// Default soft token budget for conversation history. Deliberately well under typical
 /// 32k-128k model context windows: it leaves headroom for the system prompt, tool
@@ -202,19 +183,6 @@ pub fn mcp_config_path() -> PathBuf {
     .unwrap_or_else(|| PathBuf::from(DEFAULT_MCP_CONFIG_PATH))
 }
 
-/// Address the HTTP agent server ([`crate::api`]) binds to. Override with `AGENT_HTTP_ADDR`.
-pub fn http_addr() -> String {
-  non_empty_var(ENV_HTTP_ADDR).unwrap_or_else(|| DEFAULT_HTTP_ADDR.to_owned())
-}
-
-/// Path to the tenant config file used by [`crate::api::tenant::TenantRegistry`].
-/// Override with `AGENT_TENANTS_PATH`.
-pub fn tenants_config_path() -> PathBuf {
-  non_empty_var(ENV_TENANTS_CONFIG_PATH)
-    .map(PathBuf::from)
-    .unwrap_or_else(|| PathBuf::from(DEFAULT_TENANTS_CONFIG_PATH))
-}
-
 /// Directory the `cli` binary persists its
 /// [`crate::agent::session::FileSessionStore`] sessions under. Override with
 /// `AGENT_CLI_SESSION_DIR`.
@@ -224,27 +192,24 @@ pub fn cli_session_dir() -> PathBuf {
     .unwrap_or_else(|| PathBuf::from(DEFAULT_CLI_SESSION_DIR))
 }
 
-/// How long an idle HTTP multi-turn session (see [`ENV_SESSION_TTL_SECS`]) is kept before
-/// the [`crate::agent::session::MemorySessionStore`] evicts it. Override with
-/// `AGENT_SESSION_TTL_SECS`; invalid values (non-numeric or 0) fall back to the default.
-/// The `cli` binary does not use this (its sessions are persistent — see
-/// [`ENV_SESSION_TTL_SECS`]).
-pub fn session_ttl() -> std::time::Duration {
-  std::time::Duration::from_secs(parsed_var_nonzero(
-    ENV_SESSION_TTL_SECS,
-    DEFAULT_SESSION_TTL_SECS,
-  ))
+/// Port the `cli` binary's local web server binds to on `127.0.0.1`. Override with
+/// `AGENT_CLI_WEB_PORT`; invalid values (non-numeric or 0) fall back to the default.
+pub fn cli_web_port() -> u16 {
+  parsed_var_nonzero(ENV_CLI_WEB_PORT, DEFAULT_CLI_WEB_PORT)
 }
 
-/// How long a cached response stays valid for its `Idempotency-Key`
-/// ([`crate::api::idempotency::IdempotencyStore`]). Override with
-/// `AGENT_IDEMPOTENCY_TTL_SECS`; invalid values (non-numeric or 0) fall back to the
-/// default.
-pub fn idempotency_ttl() -> std::time::Duration {
-  std::time::Duration::from_secs(parsed_var_nonzero(
-    ENV_IDEMPOTENCY_TTL_SECS,
-    DEFAULT_IDEMPOTENCY_TTL_SECS,
-  ))
+/// Directory the `cli` binary's web server serves static front-end assets from.
+/// Override with `AGENT_CLI_WEB_DIST_DIR`; defaults to `crates/web-ui/dist` resolved
+/// against *this crate's* source directory (via `CARGO_MANIFEST_DIR`, fixed at compile
+/// time) rather than the process's current working directory — `--workspace` retargets
+/// the latter (see `src/bin/cli/main.rs`'s docs) to whatever directory the model's tools
+/// should operate in, which has nothing to do with where the compiled-in front-end
+/// assets live on disk. This default only resolves correctly on the machine the binary
+/// was built on; a binary copied elsewhere needs `AGENT_CLI_WEB_DIST_DIR` set explicitly.
+pub fn cli_web_dist_dir() -> PathBuf {
+  non_empty_var(ENV_CLI_WEB_DIST_DIR)
+    .map(PathBuf::from)
+    .unwrap_or_else(|| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/crates/web-ui/dist")))
 }
 
 /// Soft token budget for conversation history handed to [`crate::agent::Agent::run_continuing`]

@@ -36,6 +36,23 @@ async fn main() -> anyhow::Result<()> {
     match event? {
       // Printed without a newline: chunks are meant to be concatenated as they arrive.
       AgentStreamEvent::Token(text) => print!("{text}"),
+      AgentStreamEvent::ToolCallsStarted(calls) => {
+        for call in &calls {
+          if let agent::agent::ContentItem::ToolCall {
+            name, arguments, ..
+          } = call
+          {
+            println!("\n[calling {name} with {arguments}]");
+          }
+        }
+      }
+      AgentStreamEvent::ToolCallsFinished(results) => {
+        for result in &results {
+          if let agent::agent::ContentItem::ToolResult { name, status, .. } = result {
+            println!("[{name} finished: {status:?}]");
+          }
+        }
+      }
       AgentStreamEvent::Done {
         context,
         budget_exhausted,

@@ -57,8 +57,8 @@ impl ToolRegistry {
 
   /// A registry containing exactly the named built-in tools, e.g. `["calculator"]`.
   ///
-  /// For callers (the HTTP agent API, see [`crate::api`]) that let a request pick a
-  /// subset of tools by name rather than always getting the full [`Self::builtin`] set.
+  /// For callers that let a request pick a subset of tools by name rather than always
+  /// getting the full [`Self::builtin`] set.
   /// MCP tools are not selectable this way: they only exist once discovered from
   /// `mcp.json` (see [`Self::with_mcp`]), so there is no name to select before that.
   pub fn select(names: &[String]) -> anyhow::Result<Self> {

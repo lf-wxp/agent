@@ -2,7 +2,6 @@
 #![warn(clippy::suspicious, clippy::style, clippy::complexity, clippy::perf)]
 
 pub mod agent;
-pub mod api;
 pub mod callback;
 pub mod config;
 pub mod gaia;
