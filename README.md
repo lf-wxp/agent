@@ -106,6 +106,18 @@ cd crates/web-ui && trunk build           # 产物输出到 crates/web-ui/dist
 
 `cli` 的 Web 服务器会把这个 `dist/` 目录当静态资源伺服（`AGENT_CLI_WEB_DIST_DIR` 可覆盖路径）；开发前端时也可以单独 `trunk serve` 起热重载的开发服务器，接口请求转发到 `cli` 的 `/api/*` 路由。页面加载后会先拉取 `GET /api/history` 展示已有会话，随后打开一条持久的 `GET /api/stream` 长连接（浏览器原生 `EventSource`），终端和浏览器发起的每一轮对话都会广播到这条连接上——因此终端里打的字也会实时出现在网页里，反过来也一样；`POST /api/chat` 只负责提交这一轮的输入本身。展示内容包括 token 流、工具调用/结果时间线，遇到高危操作会弹出确认卡片，点击后调用 `POST /api/approve/{id}` 提交决策，决策结果也会广播给所有打开的标签页。
 
+### 界面截图
+
+| 对话时间线（工具调用 / 结果 / 审批） | Markdown 渲染（标题 / 引用 / 代码块 / 表格） |
+|---|---|
+| ![对话时间线](docs/images/desktop-conversation.png) | ![Markdown 渲染](docs/images/desktop-markdown.png) |
+
+| 空状态 | 移动端适配 |
+|---|---|
+| ![空状态](docs/images/desktop-empty.png) | ![移动端](docs/images/mobile-conversation.png) |
+
+暗色 "Terminal Noir" 主题，支持中/英/西三语切换（右上角），页面文案随语言切换实时热更新（包括已渲染的历史卡片）。
+
 ## 📦 作为库使用
 
 尚未发布到 crates.io，以 Git 依赖的方式引入：
