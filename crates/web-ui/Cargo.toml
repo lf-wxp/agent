@@ -16,13 +16,31 @@ serde_json = "1"
 gloo-net = "0.6"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
+# Pure-Rust CommonMark parser (no OS/filesystem calls), used by `markdown.rs` to turn
+# assistant/user message text into real DOM elements — see that module's docs for why
+# events are walked into Leptos views directly instead of going through
+# `pulldown_cmark::html` + `inner_html`.
+pulldown-cmark = { version = "0.13", default-features = false }
 
 # `GET /api/stream` is consumed via the browser's native `EventSource` (a plain `fetch`-
 # based reader was needed only for the old per-request `POST /api/chat` SSE response,
 # which `EventSource` cannot issue — see `main.rs`'s module docs for why that approach
-# was replaced) — these are the DOM types that requires, on top of what `gloo-net`
-# already covers for the plain JSON routes (`/api/history`, `/api/chat`,
-# `/api/approve/{id}`).
+# was replaced), the composer's auto-growing textarea needs direct DOM access to
+# measure/set its height, a markdown code block's copy button needs the Clipboard API
+# (see `markdown.rs`), and the language picker persists its choice to `localStorage`
+# and reads `navigator.language` (see `i18n.rs`) — these are the DOM types that
+# requires, on top of what `gloo-net` already covers for the plain JSON routes
+# (`/api/history`, `/api/chat`, `/api/approve/{id}`).
 [dependencies.web-sys]
 version = "0.3"
-features = ["EventSource", "EventTarget", "MessageEvent"]
+features = [
+  "Clipboard",
+  "Element",
+  "Event",
+  "EventSource",
+  "EventTarget",
+  "HtmlTextAreaElement",
+  "MessageEvent",
+  "Navigator",
+  "Storage",
+]

@@ -132,7 +132,20 @@
 - `print_chat_events`/`print_chat_event`：对 `UserMessage { origin: Web, .. }` 打印 `[web] <text>`，对 `Terminal` 来源不重复打印；`Token`/`ToolCallsStarted`/`ToolCallsFinished`/`Done`/`Error` 照常打印；`ApprovalRequired`（网页发起的）额外打印一行提示"正在等浏览器决策"（终端发起的危险操作确认走的是 `DualApprovalCallback::prompt_terminal` 自己的阻塞式 `y/n`，不经过这里，不会重复）。
 - 效果：现在终端和网页共享**同一条**广播、**同一个**渲染语义——无论从哪一端发起对话，两端都能看到完整过程。
 
-## 10. 待确认/后续可选项
+## 10. Web UI 界面美化、Markdown 渲染、多语言支持
+
+在核心同步问题修好之后，`crates/web-ui` 陆续补上了产品化打磨（这些不改动 native 侧的协议/路由，纯前端范围）：
+
+- **视觉/移动端适配**：`crates/web-ui/src/style.css`（暗色"Terminal Noir"主题）+ `index.html` 的 viewport/theme-color meta，处理了 flex 容器内容溢出时子项被压扁到 0 高度的坑（`.timeline > * { flex-shrink: 0; }`，原因是子项一旦设了 `overflow: hidden` 就会被判定"自动最小尺寸为 0"，进而在父容器溢出触发收缩时被压成几像素）。
+- **Markdown 渲染**：`crates/web-ui/src/markdown.rs`，用 `pulldown-cmark` 把消息文本解析成事件流后直接构建成 Leptos 视图树（不经过 `inner_html`），防止模型输出里的任意字符串被当成 HTML 解析执行；支持标题/列表/表格/代码块（带复制按钮）/任务列表等全部常见元素。
+- **多语言（中/英/西）**：`crates/web-ui/src/i18n.rs`。
+  - `Lang` 枚举 + `Key` 枚举 + `t(lang, key) -> &'static str`：翻译表用编译期检查的 `match`（无通配分支），漏翻译在编译期就会报错，而不是运行时静默回退。
+  - 检测顺序：`localStorage`（用户手动选过） > `navigator.language`（浏览器语言） > `Lang::Zh`（兜底，保持这个页面出现 i18n 之前的默认行为）。
+  - `Lang` 存在一个 `RwSignal<Lang>` 里，`App` 组件用 `provide_context` 注入，其余渐染函数用 `i18n::current_lang()`（包一层 `expect_context`）取用——不是把 `lang` 当参数一路传下去。
+  - **关键约束**：任何翻译文本必须写成 `{move || t(lang.get(), Key::X)}` 这种响应式闭包形式，而不是提前算好的普通值——这样切换语言时，哪怕是十轮对话之前就渲染好的工具卡片/审批按钮/角色标签，也会跟着一起更新，不需要重新渲染整棵时间线。已用 Playwright 实测：在审批弹窗"待决策"状态下切换语言，按钮文案、提示文案都能正确热更新。
+  - **例外**：像"请求失败：xxx"、预算耗尽提示这类一次性写入历史的自由文本，只在**产生的那一刻**按当时语言格式化一次，之后不随语言切换回溯翻译——跟消息内容本身（用户输入、模型输出）一视同仁，不属于这个页面自己的"界面词汇表"。
+
+## 11. 待确认/后续可选项
 
 - 是否需要按 `session_id` 做细粒度锁（当前默认全局一把锁，单人单会话场景足够）
 - Web 静态资源在生产模式下内嵌进二进制（`rust-embed` 之类）还是运行时从 `dist/` 目录读取，暂定运行时读取，简单够用

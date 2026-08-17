@@ -544,27 +544,24 @@ fn print_chat_event(event: ChatEvent) {
         MessageOrigin::Terminal => {}
         // Not otherwise visible here at all — this is the one thing this task prints
         // that a web-originated turn would not show up without.
-        MessageOrigin::Web => println!("\n[web] {text}"),
+        MessageOrigin::Web => term_write(&format!("\n[web] {text}\n")),
       }
-      print!("Agent> ");
-      let _ = io::stdout().flush();
+      term_write("Agent> ");
     }
-    // Printed without a newline: chunks are meant to be concatenated as they arrive.
-    ChatEvent::Token { text } => {
-      print!("{text}");
-      let _ = io::stdout().flush();
-    }
+    // Chunks are meant to be concatenated as they arrive, hence no trailing newline of
+    // its own here — but `text` itself can still contain one or more bare `\n`s (a
+    // multi-line assistant reply is normal), which is exactly what `term_write` exists
+    // to handle correctly.
+    ChatEvent::Token { text } => term_write(&text),
     ChatEvent::ToolCallsStarted { calls } => {
       for call in calls {
-        println!("\n[tool] {}({})", call.name, call.arguments);
+        term_write(&format!("\n[tool] {}({})\n", call.name, call.arguments));
       }
-      let _ = io::stdout().flush();
     }
     ChatEvent::ToolCallsFinished { results } => {
       for result in results {
-        println!("[tool] {} -> {:?}", result.name, result.status);
+        term_write(&format!("[tool] {} -> {:?}\n", result.name, result.status));
       }
-      let _ = io::stdout().flush();
     }
     ChatEvent::ApprovalRequired { tool, .. } => {
       // Purely informational here: the actual decision for a web-originated call is
@@ -573,24 +570,70 @@ fn print_chat_event(event: ChatEvent) {
       // blocking `y`/`n` prompt directly — this print only covers the case this task
       // would otherwise stay silent about, a *web*-originated call waiting on the
       // browser.
-      println!("\n[approval] `{tool}` is waiting on a decision in the browser");
+      term_write(&format!(
+        "\n[approval] `{tool}` is waiting on a decision in the browser\n"
+      ));
     }
     ChatEvent::ApprovalResolved { approved, .. } => {
-      println!(
-        "[approval] {}",
+      term_write(&format!(
+        "[approval] {}\n",
         if approved { "approved" } else { "denied" }
-      );
+      ));
     }
-    ChatEvent::Done { .. } => {
-      println!("\n");
-    }
+    ChatEvent::Done { .. } => term_write("\n\n"),
     // `turn` is ignored here, unlike in a browser tab: this terminal has no per-turn UI
     // state to unwind (it prints as events arrive and blocks on its own turns), so which
     // turn an error belongs to changes nothing about how it is shown.
-    ChatEvent::Error { message, .. } => {
-      println!("\n[error] {message}");
-    }
+    ChatEvent::Error { message, .. } => term_write(&format!("\n[error] {message}\n")),
   }
+}
+
+/// Writes `text` to stdout, translating every bare `\n` into `\r\n` first, then flushes.
+///
+/// This is not cosmetic: [`reedline`]'s `read_line` (see [`read_line`]'s docs) puts the
+/// terminal in raw mode for as long as this process is blocked inside it waiting for a
+/// human to type — which, once a web-originated turn can run concurrently with that wait
+/// (`--mode both`, or even `--mode web` while a human is sitting at the terminal without
+/// typing anything), is exactly when [`print_chat_event`] is printing *this* task's
+/// output. Raw mode disables the terminal driver's usual behavior of translating a bare
+/// `\n` into a full "return to column 0, then move down one row" — so a plain
+/// `println!` there only moves the cursor down while leaving it at whatever column it
+/// was already at, and each subsequent line drifts one line's worth of already-printed
+/// characters further to the right than the last. That is the exact "阶梯状缩进"
+/// (staircase indentation) bug this function exists to prevent — and it needed fixing
+/// everywhere this task writes a newline, not just between `println!` calls, since a
+/// streamed [`ChatEvent::Token`] chunk can itself contain a bare `\n` (ordinary
+/// multi-line assistant output) that needs the exact same treatment.
+///
+/// Explicit `\r\n` is always correct regardless of whether the terminal happens to be in
+/// raw mode at the time or not: in normal (cooked) mode the driver's own `\n` -> `\r\n`
+/// translation would have produced the same bytes anyway, so this changes nothing
+/// visible there — it only matters, and only fixes anything, while raw mode is active.
+fn term_write(text: &str) {
+  let mut stdout = io::stdout();
+  let _ = stdout.write_all(normalize_line_endings(text).as_bytes());
+  let _ = stdout.flush();
+}
+
+/// Rewrites every bare `\n` in `text` to `\r\n`. Split out of [`term_write`] as a pure
+/// function purely so it has something a unit test can call without capturing stdout.
+///
+/// A `\r` is skipped when `\n` is already preceded by one (checking the last character
+/// already *written to the output*, not the corresponding position in `text` itself —
+/// though for a single call the two amount to the same thing; the distinction only
+/// matters across chunk boundaries between two separate `term_write` calls, e.g. text
+/// already ending `...\r` immediately followed by another call starting `\n...`, which
+/// is unlikely for model output but cheap to guard against here regardless) to avoid
+/// ever emitting a redundant `\r\r\n` for text that already uses `\r\n` line endings.
+fn normalize_line_endings(text: &str) -> String {
+  let mut out = String::with_capacity(text.len());
+  for c in text.chars() {
+    if c == '\n' && !out.ends_with('\r') {
+      out.push('\r');
+    }
+    out.push(c);
+  }
+  out
 }
 
 /// One streaming turn: load `session_id`'s prior history, run the agent, and persist the
@@ -831,5 +874,24 @@ mod tests {
     assert_eq!(format_elapsed(Duration::from_secs(120)), "2m ago");
     assert_eq!(format_elapsed(Duration::from_secs(3 * 3_600)), "3h ago");
     assert_eq!(format_elapsed(Duration::from_secs(2 * 86_400)), "2d ago");
+  }
+
+  #[test]
+  fn normalize_line_endings_inserts_cr_before_every_bare_lf() {
+    assert_eq!(
+      normalize_line_endings("[web] hi\nAgent> "),
+      "[web] hi\r\nAgent> "
+    );
+    assert_eq!(normalize_line_endings("a\nb\nc"), "a\r\nb\r\nc");
+  }
+
+  #[test]
+  fn normalize_line_endings_does_not_double_an_existing_cr() {
+    assert_eq!(normalize_line_endings("a\r\nb"), "a\r\nb");
+  }
+
+  #[test]
+  fn normalize_line_endings_is_a_no_op_without_any_newline() {
+    assert_eq!(normalize_line_endings("Agent> "), "Agent> ");
   }
 }

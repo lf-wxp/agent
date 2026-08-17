@@ -33,3 +33,4 @@ tenants.json
 .agent/sessions
 tmp
 dist
+.playwright-mcp

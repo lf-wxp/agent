@@ -13,14 +13,23 @@
 //!   `/api/stream`, same as everyone else's.
 //! - `POST /api/approve/{id}` to answer an [`ChatEvent::ApprovalRequired`] prompt.
 
+mod i18n;
+mod markdown;
+
 use gloo_net::http::Request;
-use leptos::{ev::SubmitEvent, prelude::*};
+use i18n::{Key, Lang, t};
+use leptos::{
+  ev::{KeyboardEvent, SubmitEvent},
+  html,
+  prelude::*,
+};
+use markdown::render_markdown;
 use shared::{
   ApprovalDecision, ChatAccepted, ChatEvent, ChatRequest, HistoryContentItem, ToolStatus,
 };
 use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{EventSource, MessageEvent};
+use web_sys::{Event as DomEvent, EventSource, HtmlTextAreaElement, MessageEvent};
 
 fn main() {
   // Routes Rust `panic!`s to the browser console with a real stack trace instead of the
@@ -30,12 +39,34 @@ fn main() {
   leptos::mount::mount_to_body(App);
 }
 
+/// A tool call/result body long enough that it starts collapsed by default (see
+/// [`TimelineItem::ToolCall`]/[`TimelineItem::ToolResult`]'s `expanded`) — short ones
+/// (a `calculator` call, say) are more useful shown immediately than behind a tap, but a
+/// multi-kilobyte `web_search` result is not, especially on a phone screen.
+const AUTO_EXPAND_CHAR_LIMIT: usize = 220;
+
 /// Who said one [`TimelineItem::Message`] — the only two authors `agent::agent::Event`
 /// ever records (see `agent::agent::runtime`'s `"user"`/`"assistant"` literals).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Role {
   User,
   Assistant,
+}
+
+/// `GET /api/stream`'s connection state, reflected in the header's status dot — purely
+/// cosmetic (nothing here gates sending a message; a `POST /api/chat` that goes out
+/// while this reads anything but `Open` still reaches the server just fine, since it is
+/// an independent HTTP request), but a live "is this tab actually hearing about other
+/// front-ends' turns right now" indicator is worth having given how much of this page's
+/// whole point depends on that connection staying up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum ConnectionState {
+  #[default]
+  Connecting,
+  Open,
+  /// [`EventSource`] is retrying on its own (it always does, see [`listen_stream`]'s
+  /// docs) — this is not a terminal state, just what it looks like in between attempts.
+  Retrying,
 }
 
 /// One entry in the chat transcript as rendered, in the order it should appear.
@@ -56,6 +87,9 @@ enum TimelineItem {
     tool_id: String,
     name: String,
     arguments: String,
+    /// Whether the argument body is shown or collapsed behind a toggle — see
+    /// [`AUTO_EXPAND_CHAR_LIMIT`] for the default this starts at.
+    expanded: RwSignal<bool>,
   },
   ToolResult {
     id: u64,
@@ -63,6 +97,7 @@ enum TimelineItem {
     name: String,
     status: ToolStatus,
     content: String,
+    expanded: RwSignal<bool>,
   },
   Approval {
     id: u64,
@@ -127,20 +162,36 @@ struct ChatState {
   /// half-finished sentence has no [`TimelineItem::key`] of its own yet, and does not
   /// need one; it is always exactly the most recent thing on screen.
   streaming_text: RwSignal<String>,
+  /// Whether *some* turn — this tab's own, another tab's, or the terminal's — is
+  /// currently running, purely to drive the "thinking" indicator shown before the first
+  /// token of a reply arrives (see [`render_thinking_indicator`]). Sound because only
+  /// one turn runs at a time across the whole process (see `turn_lock`'s docs in
+  /// `src/bin/cli/main.rs`): a `UserMessage` always means *the* turn just started, a
+  /// `Done`/`Error` always means *the* turn just ended, with no other turn interleaved
+  /// in between to confuse this flag about.
+  turn_active: RwSignal<bool>,
   /// This tab's outstanding submission, if any — see [`PendingTurn`]. Also what the
   /// composer's disabled state reads (via [`Self::is_sending`]): "sending" means *this
   /// tab* has a turn in flight, not that the process is busy with someone's.
   pending: RwSignal<PendingTurn>,
   next_id: RwSignal<u64>,
+  /// The language a one-off, free-form notice (a request failure, the
+  /// [`Key::BudgetExhausted`] warning, ...) should be formatted in at the moment it is
+  /// pushed into [`Self::timeline`] — see `i18n`'s module docs for why that text is
+  /// frozen at push time rather than kept reactive to a later language switch the way
+  /// this page's own chrome (badges, buttons, placeholders) is.
+  lang: RwSignal<Lang>,
 }
 
 impl ChatState {
-  fn new() -> Self {
+  fn new(lang: RwSignal<Lang>) -> Self {
     Self {
       timeline: RwSignal::new(Vec::new()),
       streaming_text: RwSignal::new(String::new()),
+      turn_active: RwSignal::new(false),
       pending: RwSignal::new(PendingTurn::Idle),
       next_id: RwSignal::new(0),
+      lang,
     }
   }
 
@@ -217,8 +268,32 @@ impl ChatState {
 
 #[component]
 fn App() -> impl IntoView {
-  let state = ChatState::new();
+  // Created here — the top of the component tree — and shared with every rendering
+  // function below via `provide_context`/`i18n::current_lang` rather than as a
+  // parameter threaded through each one's signature; see `i18n`'s module docs for the
+  // reasoning and for why every translated string must be read from inside a
+  // `move || ...` closure rather than as a plain value.
+  let lang = RwSignal::new(Lang::detect());
+  provide_context(lang);
+
+  let state = ChatState::new(lang);
   let input_value = RwSignal::new(String::new());
+  let connection = RwSignal::new(ConnectionState::default());
+  let textarea_ref = NodeRef::<html::Textarea>::new();
+  let timeline_ref = NodeRef::<html::Div>::new();
+
+  // Keeps `<html lang>` in sync with the active language — screen readers and the
+  // browser's own "translate this page?" heuristics both read that attribute, and
+  // there is no reason for either to still see whatever `index.html` shipped with as
+  // its static default once this has actually detected/switched to something else.
+  Effect::new(move |_| {
+    if let Some(document_element) = web_sys::window()
+      .and_then(|w| w.document())
+      .and_then(|d| d.document_element())
+    {
+      let _ = document_element.set_attribute("lang", lang.get().code());
+    }
+  });
 
   // One-shot load, not a reactive `Resource`: the initial transcript never needs to be
   // re-fetched from inside this page (every later change arrives live via `/api/stream`
@@ -229,14 +304,35 @@ fn App() -> impl IntoView {
   // the old per-`POST /api/chat` stream this replaced): see the module docs for why a
   // single persistent connection is what makes cross-origin (terminal <-> browser, tab
   // <-> tab) live sync possible at all.
-  listen_stream(state);
+  listen_stream(state, connection);
+
+  // Keeps the timeline scrolled to its newest content as it grows — a chat page whose
+  // view silently stays pinned to a message from five turns ago the moment a new one
+  // arrives is not a usable one. Reads both signals through `.with(|_| ())` rather than
+  // `.get()` purely to avoid cloning the whole transcript (or the in-flight text) just
+  // to throw the clone away — the value itself is never needed here, only "did either
+  // of these change".
+  Effect::new(move |_| {
+    state.timeline.with(|_| ());
+    state.streaming_text.with(|_| ());
+    if let Some(el) = timeline_ref.get() {
+      el.set_scroll_top(el.scroll_height());
+    }
+  });
+
+  let reset_composer = move || {
+    input_value.set(String::new());
+    if let Some(el) = textarea_ref.get_untracked() {
+      set_textarea_height(&el, "auto");
+    }
+  };
 
   let send = move || {
     let input = input_value.get_untracked();
     if input.trim().is_empty() || state.is_sending_untracked() {
       return;
     }
-    input_value.set(String::new());
+    reset_composer();
     state.pending.set(PendingTurn::Submitting {
       finished: Vec::new(),
     });
@@ -250,7 +346,7 @@ fn App() -> impl IntoView {
         Err(err) => {
           state.push(TimelineItem::Error {
             id: state.next_id(),
-            message: format!("请求失败：{err}"),
+            message: i18n::request_failed(state.lang.get_untracked(), &err),
           });
           state.pending.set(PendingTurn::Idle);
         }
@@ -263,83 +359,245 @@ fn App() -> impl IntoView {
     send();
   };
 
+  // Enter sends, Shift+Enter inserts a newline — the usual chat-app convention — except
+  // while an IME composition is in progress (`is_composing`): the Enter that confirms a
+  // candidate in, say, an active Pinyin/Kana input session must never also submit the
+  // message, or every such message would go out one keystroke before the user meant it
+  // to.
+  let on_keydown = move |ev: KeyboardEvent| {
+    if ev.key() == "Enter" && !ev.shift_key() && !ev.is_composing() {
+      ev.prevent_default();
+      send();
+    }
+  };
+
+  // Auto-grows the textarea with its content, up to the `max-height` set in CSS (beyond
+  // that, the textarea itself scrolls). See [`set_textarea_height`]'s docs for why
+  // `scroll_height` is measured after collapsing the height first.
+  let on_input = move |ev| {
+    input_value.set(event_target_value(&ev));
+    if let Some(el) = textarea_ref.get_untracked() {
+      set_textarea_height(&el, "auto");
+      let scroll_height = el.scroll_height();
+      set_textarea_height(&el, &format!("{scroll_height}px"));
+    }
+  };
+
+  let timeline_is_empty = move || {
+    state.timeline.with(|items| items.is_empty()) && state.streaming_text.with(String::is_empty)
+  };
+  let show_thinking =
+    move || state.turn_active.get() && state.streaming_text.with(String::is_empty);
+
   view! {
-    <main class="app">
+    <div class="app-shell">
       <style>{CSS}</style>
-      <header>
-        <h1>"agent"</h1>
-        <p class="subtitle">"本地 web UI · 与终端共享同一份会话"</p>
+      <div class="ambient-glow" aria-hidden="true"></div>
+      <header class="app-header">
+        <div class="brand">
+          <span class="brand-mark">
+            {move || t(lang.get(), Key::RoleAgent)}
+            <span class="cursor" aria-hidden="true"></span>
+          </span>
+          <span class="brand-tag">{move || t(lang.get(), Key::BrandTag)}</span>
+        </div>
+        <div class="header-right">
+          <LangSwitch lang=lang />
+          <div class="connection" data-state=move || connection_data_attr(connection.get())>
+            <span class="connection-dot"></span>
+            <span class="connection-label">
+              {move || connection_label(connection.get(), lang.get())}
+            </span>
+          </div>
+        </div>
       </header>
-      <div class="timeline">
+
+      <div class="timeline" node_ref=timeline_ref>
+        <Show when=timeline_is_empty>
+          <div class="empty-state">
+            <p class="empty-state-glyph">"[ ]"</p>
+            <p>{move || t(lang.get(), Key::EmptyTitle)}</p>
+            <p class="empty-state-hint">{move || t(lang.get(), Key::EmptyHint)}</p>
+          </div>
+        </Show>
         <For each=move || state.timeline.get() key=TimelineItem::key children=render_item />
+        <Show when=show_thinking>{render_thinking_indicator}</Show>
         {move || {
           let text = state.streaming_text.get();
           (!text.is_empty()).then(|| render_streaming_bubble(text))
         }}
       </div>
+
       <form class="composer" on:submit=on_submit>
-        <input
-          type="text"
-          placeholder="输入消息…"
-          prop:value=move || input_value.get()
-          prop:disabled=move || state.is_sending()
-          on:input=move |ev| input_value.set(event_target_value(&ev))
-        />
-        <button type="submit" disabled=move || state.is_sending()>
-          {move || if state.is_sending() { "运行中…" } else { "发送" }}
-        </button>
+        <div class="composer-inner">
+          <textarea
+            class="composer-input"
+            node_ref=textarea_ref
+            rows="1"
+            placeholder=move || t(lang.get(), Key::ComposerPlaceholder)
+            prop:value=move || input_value.get()
+            prop:disabled=move || state.is_sending()
+            on:input=on_input
+            on:keydown=on_keydown
+          ></textarea>
+          <button
+            type="submit"
+            class="send-btn"
+            disabled=move || state.is_sending() || input_value.with(|v| v.trim().is_empty())
+            aria-label=move || t(lang.get(), Key::SendAria)
+          >
+            {move || {
+              if state.is_sending() {
+                view! { <span class="spinner" aria-hidden="true"></span> }.into_any()
+              } else {
+                view! { <SendIcon /> }.into_any()
+              }
+            }}
+          </button>
+        </div>
+        <p class="composer-hint">{move || t(lang.get(), Key::ComposerHint)}</p>
       </form>
-    </main>
+    </div>
   }
 }
 
+/// The header's language picker: one small button per [`i18n::ALL_LANGS`], the active
+/// one highlighted. Each button's own label is [`Lang::short_label`] (kept to two or
+/// three characters so all three fit next to the connection indicator on a narrow
+/// phone screen) with [`Lang::native_name`] as its `title`/`aria-label` for the full
+/// name — see those methods' docs for why neither is translated into whichever language
+/// is currently active.
+#[component]
+fn LangSwitch(lang: RwSignal<Lang>) -> impl IntoView {
+  view! {
+    <div class="lang-switch" role="group" aria-label="Language / 语言 / Idioma">
+      {i18n::ALL_LANGS
+        .map(|candidate| {
+          view! {
+            <button
+              type="button"
+              class=move || {
+                if lang.get() == candidate {
+                  "lang-btn active"
+                } else {
+                  "lang-btn"
+                }
+              }
+              title=candidate.native_name()
+              aria-label=candidate.native_name()
+              aria-pressed=move || lang.get() == candidate
+              on:click=move |_| {
+                lang.set(candidate);
+                candidate.store();
+              }
+            >
+              {candidate.short_label()}
+            </button>
+          }
+        })
+        .collect_view()}
+    </div>
+  }
+}
+
+/// Sets the composer textarea's inline `height` style to `value` (either `"auto"`, to
+/// collapse it back down before re-measuring, or a `"<n>px"` string). Goes through an
+/// explicit `&web_sys::HtmlTextAreaElement` binding rather than calling `.style()`
+/// straight off the `NodeRef`'s `HtmlElement<html::Textarea>` wrapper: that wrapper also
+/// has its own `.style()` (Leptos's reactive style-attribute helper, for `style:` view
+/// attributes), which shadows the raw DOM `CSSStyleDeclaration` getter this needs —
+/// disambiguating with a type annotation is what picks the latter.
+fn set_textarea_height(el: &HtmlTextAreaElement, value: &str) {
+  // `HtmlElement::style` (path-qualified, not `el.style()`): dot-call method
+  // resolution finds `tachys`'s `ElementExt::style` (Leptos's reactive style-attribute
+  // helper, blanket-implemented broadly enough to match `HtmlTextAreaElement` before
+  // autoderef ever reaches `web_sys::HtmlElement`'s own inherent `style`) first and
+  // shadows the one this needs. Naming the type explicitly bypasses that: inherent
+  // methods always win over trait methods for a type-qualified call.
+  let _ = web_sys::HtmlElement::style(el).set_property("height", value);
+}
+
+#[component]
+fn SendIcon() -> impl IntoView {
+  view! {
+    <svg
+      class="send-icon"
+      viewBox="0 0 24 24"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+    >
+      <path
+        d="M4 12L20 4L14 20L11 13L4 12Z"
+        stroke="currentColor"
+        stroke-width="1.6"
+        stroke-linejoin="round"
+        stroke-linecap="round"
+      ></path>
+    </svg>
+  }
+}
+
+fn connection_data_attr(state: ConnectionState) -> &'static str {
+  match state {
+    ConnectionState::Connecting => "connecting",
+    ConnectionState::Open => "open",
+    ConnectionState::Retrying => "retrying",
+  }
+}
+
+fn connection_label(state: ConnectionState, lang: Lang) -> &'static str {
+  let key = match state {
+    ConnectionState::Connecting => Key::ConnConnecting,
+    ConnectionState::Open => Key::ConnOpen,
+    ConnectionState::Retrying => Key::ConnRetrying,
+  };
+  t(lang, key)
+}
+
 fn render_item(item: TimelineItem) -> impl IntoView {
+  let lang = i18n::current_lang();
   match item {
     TimelineItem::Message { role, text, .. } => {
-      let class = if role == Role::User {
-        "bubble user"
+      let (row_class, bubble_class, role_key) = if role == Role::User {
+        ("message-row from-user", "bubble user", Key::RoleYou)
       } else {
-        "bubble assistant"
+        (
+          "message-row from-assistant",
+          "bubble assistant",
+          Key::RoleAgent,
+        )
       };
-      view! { <div class=class>{text}</div> }.into_any()
+      view! {
+        <div class=row_class>
+          <span class="role-label">{move || t(lang.get(), role_key)}</span>
+          <div class=bubble_class>{render_markdown(&text)}</div>
+        </div>
+      }
+      .into_any()
     }
     TimelineItem::ToolCall {
       tool_id,
       name,
       arguments,
+      expanded,
       ..
-    } => view! {
-      <div class="tool-call">
-        <span class="tool-badge">"调用"</span>
-        <code title=tool_id>{name}</code>
-        <pre class="tool-args">{arguments}</pre>
-      </div>
-    }
-    .into_any(),
+    } => render_tool_card(tool_id, name, arguments, ToolCardKind::Call, expanded).into_any(),
     TimelineItem::ToolResult {
       tool_id,
       name,
       status,
       content,
+      expanded,
       ..
-    } => {
-      let status_class = match status {
-        ToolStatus::Success => "tool-status ok",
-        ToolStatus::Error => "tool-status err",
-      };
-      let status_text = match status {
-        ToolStatus::Success => "成功",
-        ToolStatus::Error => "失败",
-      };
-      view! {
-        <div class="tool-result">
-          <span class=status_class>{status_text}</span>
-          <code title=tool_id>{name}</code>
-          <pre class="tool-args">{content}</pre>
-        </div>
-      }
-      .into_any()
-    }
+    } => render_tool_card(
+      tool_id,
+      name,
+      content,
+      ToolCardKind::Result(status),
+      expanded,
+    )
+    .into_any(),
     TimelineItem::Approval {
       tool_id,
       tool,
@@ -347,7 +605,70 @@ fn render_item(item: TimelineItem) -> impl IntoView {
       resolved,
       ..
     } => render_approval(tool_id, tool, arguments, resolved).into_any(),
-    TimelineItem::Error { message, .. } => view! { <div class="error">{message}</div> }.into_any(),
+    TimelineItem::Error { message, .. } => view! {
+      <div class="notice error">
+        <span class="notice-icon">"!"</span>
+        <span>{message}</span>
+      </div>
+    }
+    .into_any(),
+  }
+}
+
+/// What [`render_tool_card`] is rendering — a call about to run, or a finished result
+/// (carrying its outcome). Sharing one renderer between the two keeps the "collapsible
+/// body behind a header row" layout identical for both instead of two near-duplicate
+/// implementations drifting apart over time.
+enum ToolCardKind {
+  Call,
+  Result(ToolStatus),
+}
+
+fn render_tool_card(
+  tool_id: String,
+  name: String,
+  body: String,
+  kind: ToolCardKind,
+  expanded: RwSignal<bool>,
+) -> impl IntoView {
+  let lang = i18n::current_lang();
+  let (card_class, badge_class, badge_key) = match kind {
+    ToolCardKind::Call => ("tool-card call", "tool-badge call", Key::ToolCallBadge),
+    ToolCardKind::Result(ToolStatus::Success) => {
+      ("tool-card result ok", "tool-badge ok", Key::ToolDoneBadge)
+    }
+    ToolCardKind::Result(ToolStatus::Error) => (
+      "tool-card result err",
+      "tool-badge err",
+      Key::ToolFailedBadge,
+    ),
+  };
+  let has_body = !body.trim().is_empty();
+  let toggle = move |_| expanded.update(|value| *value = !*value);
+
+  view! {
+    <div class=card_class>
+      <button
+        type="button"
+        class="tool-card-header"
+        title=tool_id
+        disabled=!has_body
+        on:click=toggle
+      >
+        <span class=badge_class>{move || t(lang.get(), badge_key)}</span>
+        <code class="tool-name">{name}</code>
+        <Show when=move || has_body>
+          <span class="tool-toggle">
+            {move || {
+              t(lang.get(), if expanded.get() { Key::ToolCollapse } else { Key::ToolExpand })
+            }}
+          </span>
+        </Show>
+      </button>
+      <Show when=move || has_body && expanded.get()>
+        <pre class="tool-body">{body.clone()}</pre>
+      </Show>
+    </div>
   }
 }
 
@@ -357,13 +678,14 @@ fn render_approval(
   arguments: String,
   resolved: RwSignal<Option<bool>>,
 ) -> impl IntoView {
+  let lang = i18n::current_lang();
   // A decision is only *this browser's* until the server confirms having handed it to
   // the tool call waiting on it: the agent stays blocked in
-  // `DualApprovalCallback::prompt_web` until then, so rendering "已批准" off the click
-  // alone would claim something that has not happened — and, if the request failed,
-  // never will, leaving the turn hanging with the buttons already gone. Hence: disable
-  // the buttons while the request is in flight, and only write `resolved` once it has
-  // succeeded, putting the buttons back (with the reason) if it has not.
+  // `DualApprovalCallback::prompt_web` until then, so rendering "approved" off the
+  // click alone would claim something that has not happened — and, if the request
+  // failed, never will, leaving the turn hanging with the buttons already gone. Hence:
+  // disable the buttons while the request is in flight, and only write `resolved` once
+  // it has succeeded, putting the buttons back (with the reason) if it has not.
   let submitting = RwSignal::new(false);
   let failure = RwSignal::new(None::<String>);
 
@@ -377,7 +699,10 @@ fn render_approval(
     spawn_local(async move {
       match submit_approval(&tool_id, approved).await {
         Ok(()) => resolved.set(Some(approved)),
-        Err(err) => failure.set(Some(format!("提交决策失败，请重试：{err}"))),
+        Err(err) => failure.set(Some(i18n::approval_submit_failed(
+          lang.get_untracked(),
+          &err,
+        ))),
       }
       submitting.set(false);
     });
@@ -387,11 +712,15 @@ fn render_approval(
 
   view! {
     <div class="approval">
-      <p>
-        "即将执行高危操作 "
-        <code>{tool}</code>
-      </p>
-      <pre class="tool-args">{arguments}</pre>
+      <div class="approval-head">
+        <span class="approval-icon">"!"</span>
+        <p>
+          {move || t(lang.get(), Key::ApprovalPrompt)}
+          " "
+          <code>{tool}</code>
+        </p>
+      </div>
+      <pre class="tool-body approval-args">{arguments}</pre>
       {move || match resolved.get() {
         None => {
           // Cloned inside this closure's body, not just captured by the outer `move ||`
@@ -404,33 +733,73 @@ fn render_approval(
           view! {
             <div class="approval-buttons">
               <button
+                type="button"
                 class="approve"
                 disabled=move || submitting.get()
                 on:click=move |_| decide_yes(true)
               >
-                "批准"
+                {move || t(lang.get(), Key::ApprovalApprove)}
               </button>
               <button
+                type="button"
                 class="deny"
                 disabled=move || submitting.get()
                 on:click=move |_| decide_no(false)
               >
-                "拒绝"
+                {move || t(lang.get(), Key::ApprovalDeny)}
               </button>
             </div>
-            {move || failure.get().map(|message| view! { <p class="error">{message}</p> })}
+            {move || {
+              failure.get().map(|message| view! { <p class="notice error compact">{message}</p> })
+            }}
           }
             .into_any()
         }
-        Some(true) => view! { <p class="approval-decided">"已批准"</p> }.into_any(),
-        Some(false) => view! { <p class="approval-decided">"已拒绝"</p> }.into_any(),
+        Some(true) => view! {
+          <p class="approval-decided approve">{move || t(lang.get(), Key::ApprovalApproved)}</p>
+        }
+          .into_any(),
+        Some(false) => view! {
+          <p class="approval-decided deny">{move || t(lang.get(), Key::ApprovalDenied)}</p>
+        }
+          .into_any(),
       }}
     </div>
   }
 }
 
 fn render_streaming_bubble(text: String) -> impl IntoView {
-  view! { <div class="bubble assistant streaming">{text}</div> }
+  let lang = i18n::current_lang();
+  // Re-parsed as markdown on every token (this whole function re-runs whenever
+  // `streaming_text` changes) rather than incrementally patched: a partial code fence
+  // or unterminated `**` mid-stream renders a little oddly for a moment, but
+  // `pulldown_cmark` never panics on unterminated constructs, and the flicker resolves
+  // itself the instant the closing token arrives — an incremental parser would be a lot
+  // more code to render the exact same steady state slightly more smoothly along the
+  // way.
+  view! {
+    <div class="message-row from-assistant">
+      <span class="role-label">{move || t(lang.get(), Key::RoleAgent)}</span>
+      <div class="bubble assistant streaming">
+        {render_markdown(&text)}
+        <span class="type-cursor" aria-hidden="true"></span>
+      </div>
+    </div>
+  }
+}
+
+fn render_thinking_indicator() -> impl IntoView {
+  let lang = i18n::current_lang();
+  view! {
+    <div class="message-row from-assistant">
+      <span class="role-label">{move || t(lang.get(), Key::RoleAgent)}</span>
+      <div class="bubble assistant thinking" aria-label=move || t(lang.get(), Key::ThinkingAria)>
+        <span class="thinking-dot"></span>
+        <span class="thinking-dot"></span>
+        <span class="thinking-dot"></span>
+      </div>
+    </div>
+  }
 }
 
 /// `GET /api/history` once, on mount — see [`App`]'s call site.
@@ -466,24 +835,33 @@ async fn load_history(state: ChatState) {
           id: tool_id,
           name,
           arguments,
-        } => TimelineItem::ToolCall {
-          id,
-          tool_id,
-          name,
-          arguments: arguments.to_string(),
-        },
+        } => {
+          let arguments = arguments.to_string();
+          let expanded = RwSignal::new(arguments.len() <= AUTO_EXPAND_CHAR_LIMIT);
+          TimelineItem::ToolCall {
+            id,
+            tool_id,
+            name,
+            arguments,
+            expanded,
+          }
+        }
         HistoryContentItem::ToolResult {
           id: tool_id,
           name,
           status,
           content,
-        } => TimelineItem::ToolResult {
-          id,
-          tool_id,
-          name,
-          status,
-          content,
-        },
+        } => {
+          let expanded = RwSignal::new(content.len() <= AUTO_EXPAND_CHAR_LIMIT);
+          TimelineItem::ToolResult {
+            id,
+            tool_id,
+            name,
+            status,
+            content,
+            expanded,
+          }
+        }
       };
       state.push(timeline_item);
     }
@@ -498,13 +876,19 @@ async fn load_history(state: ChatState) {
 /// already resolved elsewhere, or its turn is gone — which is precisely what the caller
 /// must not render as a decision taken.
 async fn submit_approval(tool_id: &str, approved: bool) -> Result<(), String> {
+  // `Lang::En` here is fine even though this fails independently of it: `error_status`'s
+  // message only reaches the user through [`i18n::approval_submit_failed`], which
+  // re-wraps it in the *caller's* current language — this inner status text is a
+  // sub-detail embedded inside that outer message, not directly user-facing English
+  // text left untranslated, so it does not need `render_approval`'s own current
+  // language threaded all the way down here just to immediately get wrapped again.
   let response = Request::post(&format!("/api/approve/{tool_id}"))
     .json(&ApprovalDecision { approved })
     .map_err(|err| err.to_string())?
     .send()
     .await
     .map_err(|err| err.to_string())?;
-  match error_status(&response) {
+  match error_status(&response, Lang::En) {
     Some(status) => Err(status),
     None => Ok(()),
   }
@@ -516,13 +900,17 @@ async fn submit_approval(tool_id: &str, approved: bool) -> Result<(), String> {
 /// on the same stream as every other front-end's turns, which is exactly why the id is
 /// needed (see [`PendingTurn`]).
 async fn submit_chat(input: String) -> Result<String, String> {
+  // See [`submit_approval`]'s docs for why `Lang::En` here does not skip translating
+  // anything user-facing — the caller ([`App`]'s `send`) re-wraps this in
+  // [`i18n::request_failed`] using its own current language before it ever reaches the
+  // timeline.
   let response = Request::post("/api/chat")
     .json(&ChatRequest { input })
     .map_err(|err| err.to_string())?
     .send()
     .await
     .map_err(|err| err.to_string())?;
-  if let Some(status) = error_status(&response) {
+  if let Some(status) = error_status(&response, Lang::En) {
     return Err(status);
   }
   let accepted: ChatAccepted = response.json().await.map_err(|err| err.to_string())?;
@@ -533,14 +921,9 @@ async fn submit_chat(input: String) -> Result<String, String> {
 /// resolves a `4xx`/`5xx` as an `Ok(Response)` like any other completed exchange, so a
 /// caller that only propagates its `Err`s would treat "the server refused this" as
 /// "this worked".
-fn error_status(response: &gloo_net::http::Response) -> Option<String> {
-  (!response.ok()).then(|| {
-    format!(
-      "服务端返回 {} {}",
-      response.status(),
-      response.status_text()
-    )
-  })
+fn error_status(response: &gloo_net::http::Response, lang: Lang) -> Option<String> {
+  (!response.ok())
+    .then(|| i18n::server_error_status(lang, response.status(), &response.status_text()))
 }
 
 /// Opens `GET /api/stream` via the browser's native [`EventSource`] (auto-reconnecting
@@ -548,19 +931,21 @@ fn error_status(response: &gloo_net::http::Response) -> Option<String> {
 /// every [`ChatEvent`] it delivers to `state` for as long as this tab is open. This is
 /// the entire mechanism behind "a message typed in the terminal shows up here without
 /// this tab sending anything": nothing about this function is specific to messages this
-/// tab itself submitted — it just listens.
+/// tab itself submitted — it just listens. `connection` is updated from `onopen`/
+/// `onerror` purely for the header's status dot (see [`ConnectionState`]'s docs) — it
+/// does not otherwise affect anything here.
 ///
 /// The server tags every frame with the SSE event name `chat` (see `to_sse_event` in
 /// `src/bin/cli/web.rs`), so this listens on `"chat"` specifically —
 /// [`EventSource`]'s default, untagged-frame `message` event would never fire for these.
 ///
-/// `source`/`on_message` are deliberately leaked (via [`Box::leak`]/[`Closure::forget`]):
-/// both need to outlive this function — `source` for the whole tab session, the closure
-/// for as long as `source` might still invoke it — but neither has a Rust-side owner
-/// left to hold onto them once this function returns. This is the same trade-off
-/// `Closure::forget` exists to make explicit; a page this small never unmounts anyway,
-/// so there is no cleanup this would otherwise be skipping.
-fn listen_stream(state: ChatState) {
+/// `source`/the closures below are deliberately leaked (via [`Box::leak`]/
+/// [`Closure::forget`]): all three need to outlive this function — `source` for the
+/// whole tab session, the closures for as long as `source` might still invoke them —
+/// but none has a Rust-side owner left to hold onto them once this function returns.
+/// This is the same trade-off `Closure::forget` exists to make explicit; a page this
+/// small never unmounts anyway, so there is no cleanup this would otherwise be skipping.
+fn listen_stream(state: ChatState, connection: RwSignal<ConnectionState>) {
   let source = match EventSource::new("/api/stream") {
     Ok(source) => source,
     Err(err) => {
@@ -577,13 +962,26 @@ fn listen_stream(state: ChatState) {
       apply_chat_event(chat_event, state);
     }
   });
-  if let Err(err) =
-    source.add_event_listener_with_callback("chat", on_message.as_ref().unchecked_ref())
-  {
-    leptos::logging::error!("failed to attach /api/stream listener: {err:?}");
-    return;
+  let on_open = Closure::<dyn FnMut(DomEvent)>::new(move |_: DomEvent| {
+    connection.set(ConnectionState::Open);
+  });
+  let on_error = Closure::<dyn FnMut(DomEvent)>::new(move |_: DomEvent| {
+    connection.set(ConnectionState::Retrying);
+  });
+
+  let listeners = [
+    ("chat", on_message.as_ref().unchecked_ref()),
+    ("open", on_open.as_ref().unchecked_ref()),
+    ("error", on_error.as_ref().unchecked_ref()),
+  ];
+  for (event_name, callback) in listeners {
+    if let Err(err) = source.add_event_listener_with_callback(event_name, callback) {
+      leptos::logging::error!("failed to attach /api/stream `{event_name}` listener: {err:?}");
+    }
   }
   on_message.forget();
+  on_open.forget();
+  on_error.forget();
   Box::leak(Box::new(source));
 }
 
@@ -594,6 +992,7 @@ fn apply_chat_event(event: ChatEvent, state: ChatState) {
       // re-printing a `Terminal`-origin message because `reedline` already echoed it),
       // a browser tab never saw this input any other way — every `UserMessage`, from
       // any origin, is new information to this tab and rendered the same way.
+      state.turn_active.set(true);
       state.push(TimelineItem::Message {
         id: state.next_id(),
         role: Role::User,
@@ -607,22 +1006,27 @@ fn apply_chat_event(event: ChatEvent, state: ChatState) {
     }
     ChatEvent::ToolCallsStarted { calls } => {
       for call in calls {
+        let arguments = call.arguments.to_string();
+        let expanded = RwSignal::new(arguments.len() <= AUTO_EXPAND_CHAR_LIMIT);
         state.push(TimelineItem::ToolCall {
           id: state.next_id(),
           tool_id: call.id,
           name: call.name,
-          arguments: call.arguments.to_string(),
+          arguments,
+          expanded,
         });
       }
     }
     ChatEvent::ToolCallsFinished { results } => {
       for result in results {
+        let expanded = RwSignal::new(result.content.len() <= AUTO_EXPAND_CHAR_LIMIT);
         state.push(TimelineItem::ToolResult {
           id: state.next_id(),
           tool_id: result.id,
           name: result.name,
           status: result.status,
           content: result.content,
+          expanded,
         });
       }
     }
@@ -658,10 +1062,11 @@ fn apply_chat_event(event: ChatEvent, state: ChatState) {
         });
       }
       state.streaming_text.set(String::new());
+      state.turn_active.set(false);
       if budget_exhausted {
         state.push(TimelineItem::Error {
           id: state.next_id(),
-          message: "工具调用轮次预算已用尽，回答可能基于部分结果。".to_owned(),
+          message: t(state.lang.get_untracked(), Key::BudgetExhausted).to_owned(),
         });
       }
       // The composer, on the other hand, is this tab's alone: turns queue up behind each
@@ -670,6 +1075,7 @@ fn apply_chat_event(event: ChatEvent, state: ChatState) {
       state.turn_finished(&turn);
     }
     ChatEvent::Error { turn, message } => {
+      state.turn_active.set(false);
       state.push(TimelineItem::Error {
         id: state.next_id(),
         message,
@@ -681,32 +1087,4 @@ fn apply_chat_event(event: ChatEvent, state: ChatState) {
   }
 }
 
-const CSS: &str = r#"
-  :root { color-scheme: light dark; }
-  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-  .app { max-width: 720px; margin: 0 auto; padding: 1rem; display: flex; flex-direction: column; height: 100vh; box-sizing: border-box; }
-  header h1 { margin: 0; font-size: 1.25rem; }
-  header .subtitle { margin: 0.15rem 0 1rem; font-size: 0.8rem; opacity: 0.6; }
-  .timeline { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 0.5rem; padding-bottom: 1rem; }
-  .bubble { padding: 0.5rem 0.75rem; border-radius: 0.75rem; max-width: 80%; white-space: pre-wrap; word-break: break-word; }
-  .bubble.user { align-self: flex-end; background: #2563eb; color: white; }
-  .bubble.assistant { align-self: flex-start; background: rgba(127, 127, 127, 0.15); }
-  .bubble.streaming { opacity: 0.75; }
-  .tool-call, .tool-result { align-self: flex-start; font-size: 0.85rem; border-left: 3px solid #94a3b8; padding-left: 0.5rem; opacity: 0.85; }
-  .tool-badge { font-weight: bold; margin-right: 0.35rem; }
-  .tool-status { font-weight: bold; margin-right: 0.35rem; }
-  .tool-status.ok { color: #16a34a; }
-  .tool-status.err { color: #dc2626; }
-  .tool-args { margin: 0.2rem 0 0; font-size: 0.8rem; white-space: pre-wrap; word-break: break-word; opacity: 0.8; }
-  .approval { align-self: stretch; border: 1px solid #f59e0b; border-radius: 0.5rem; padding: 0.5rem 0.75rem; background: rgba(245, 158, 11, 0.08); }
-  .approval-buttons { display: flex; gap: 0.5rem; margin-top: 0.4rem; }
-  .approval-buttons .approve { background: #16a34a; color: white; }
-  .approval-buttons .deny { background: #dc2626; color: white; }
-  .approval-decided { font-weight: bold; margin: 0.4rem 0 0; }
-  .error { align-self: stretch; color: #dc2626; font-size: 0.85rem; }
-  .composer { display: flex; gap: 0.5rem; padding-top: 0.5rem; border-top: 1px solid rgba(127, 127, 127, 0.25); }
-  .composer input { flex: 1; padding: 0.5rem 0.75rem; border-radius: 0.5rem; border: 1px solid rgba(127, 127, 127, 0.35); }
-  .composer button { padding: 0.5rem 1rem; border-radius: 0.5rem; border: none; background: #2563eb; color: white; cursor: pointer; }
-  .composer button:disabled { opacity: 0.5; cursor: default; }
-  button { cursor: pointer; }
-"#;
+const CSS: &str = include_str!("style.css");
