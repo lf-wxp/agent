@@ -79,7 +79,15 @@ cargo run --bin cli -- --mode web --web-port 4000  # 只起 Web UI，不进入�
 
 会话历史按 `--session` 的名字落盘到 [`agent::session::FileSessionStore`](src/agent/session.rs)（默认目录 `.agent/sessions`，可用 `AGENT_CLI_SESSION_DIR` 覆盖），**进程退出后再次运行同一个 `--session` 仍能续接对话，且永不过期**（用 `FileSessionStore::new_persistent` 构造）——多久以前的对话都能接着聊，只有 `--fresh` / `/reset` / `--rm` 会清空。
 
-**`--workspace <dir>`** 把这次运行钉在一个具体目录（默认：启动 `cli` 时所在的目录，因此不传这个参数时行为与以前完全一致），并通过真正的 `std::env::set_current_dir` 切换过去——此后进程里任何相对路径（模型传给文件工具的参数、`mcp.json` 的默认查找路径、`.agent/sessions` 的默认位置）都以它为基准解析。这也意味着不同 `--workspace` 默认拥有各自独立的会话与 MCP 配置（除非用绝对路径的 `AGENT_CLI_SESSION_DIR` / `MCP_CONFIG_PATH` 覆盖）。在此之上，[`WorkspaceGuardCallback`](src/callback/path_guard.rs) 把这个目录变成内置文件类工具（`delete_file`/`read_file`/`list_files`/`unzip_file`）的**硬边界**：模型传入的路径参数一旦解析后落在工作区之外（绝对路径、`../` 逃逸，甚至指向工作区外的符号链接），会在真正执行前直接被拒绝——甚至不会触发确认弹窗。这解决的正是"CLI 运行时没有限定到具体目录，危险操作可能波及工作区之外"的风险。默认开启（沙箱状态显示在启动横幅里），`--no-sandbox` 可关闭这层限制（工作目录本身仍会被钉住，只是不再拦截越权路径）；MCP 工具的参数不在保护范围内（其 schema 运行时才发现，无法预先校验），启用 MCP Server 前请确保信任它。
+**`--workspace <dir>`** 把这次运行钉在一个具体目录（默认：启动 `cli` 时所在的目录，因此不传这个参数时行为与以前完全一致），并通过真正的 `std::env::set_current_dir` 切换过去——此后进程里任何相对路径（模型传给文件工具的参数、`mcp.json` 的默认查找路径、`.agent/sessions` 的默认位置）都以它为基准解析。这也意味着不同 `--workspace` 默认拥有各自独立的会话与 MCP 配置（除非用绝对路径的 `AGENT_CLI_SESSION_DIR` / `MCP_CONFIG_PATH` 覆盖）。在此之上，[`WorkspaceGuardCallback`](src/callback/path_guard.rs) 把这个目录变成内置文件类工具（`delete_file`/`read_file`/`list_files`/`unzip_file`）的**硬边界**：模型传入的路径参数一旦解析后落在工作区之外（绝对路径、`../` 逃逸，甚至指向工作区外的符号链接），会在真正执行前直接被拒绝——甚至不会触发确认弹窗。这解决的正是"CLI 运行时没有限定到具体目录，危险操作可能波及工作区之外"的风险。默认开启（沙箱状态显示在启动横幅里），`--no-sandbox` 可关闭这层限制（工作目录本身仍会被钉住，只是不再拦截越权路径）。
+
+**MCP 工具的隔离机制**：由于 MCP 工具的参数 schema 只有连接后才知道，`WorkspaceGuardCallback` 无法像内置工具那样按字段名精确校验，因此单独提供了三层互补的防护（同样受 `--no-sandbox` 控制，除第一层外）：
+
+1. **stdio 服务器进程环境变量隔离**（不受 `--no-sandbox` 影响，始终生效）：以 `command` 拉起的 MCP 服务器子进程默认**不再继承本进程的完整环境变量**（`Command::env_clear()`），只保留 `PATH`/`HOME` 等操作系统启动进程所需的最小集合，`mcp.json` 里 `env` 声明的变量会在此基础上叠加——避免一个通过 `npx` 安装的第三方 MCP 服务器随手就能读到本进程持有的 `OPENAI_API_KEY`、云厂商密钥等敏感环境变量。
+2. **声明式工具白名单**（`allowedTools`）：每个 server 条目可加一个 `allowedTools: string[]`，按服务器自己上报的原始工具名（加前缀之前）过滤——即使信任某个服务器整体，也可以只放行其中部分工具（例如只要 `read_file`，不要 `write_file`），在工具被发现、注册给模型之前就已经过滤掉，模型压根看不到未放行的工具。配置中写了但服务器实际没有上报的工具名只会打一条警告日志，不会影响其余工具。
+3. **[`McpGuardCallback`](src/callback/mcp_guard.rs)（运行时兜底）**：调用任何 MCP 工具（名字形如 `<label>__<tool>`）前，递归扫描整个参数 JSON 里的每一个字符串值（不管嵌套在哪个字段名下），一旦某个值是绝对路径或 `~` 相对路径，且解析后落在 `~/.ssh`、`~/.aws`、`~/.docker` 等一批公认的凭据/云配置目录之下，直接拒绝执行——不依赖字段名，因此哪怕字段叫 `foo`/`bar` 这种完全未知的名字也能生效；代价是只覆盖这份固定的敏感目录清单，不做通用的工作区边界判断（避免把搜索关键词里恰好带斜杠的普通文本也误判成路径）。
+
+MCP Server 本身仍然需要被信任（其 `command`/`args`/`env` 会作为子进程原样执行），上述三层是"哪怕信任的服务器暴露了意料之外的工具/参数，也尽量兜住"的纵深防御，不是完整的进程级沙箱（不隔离网络、不限制服务器自身能读写的文件系统）。
 
 工具集：默认内置工具（`calculator`、`web_search`、文件系统工具等）之外，若 `mcp.json`（`MCP_CONFIG_PATH`，默认路径 `mcp.json`）存在，会自动连接其中每个已启用的 MCP Server 并把发现的工具一并注册（见 [`ToolRegistry::with_mcp`](src/tools/registry.rs)）；退出聊天时会优雅关闭这些连接。`--tools` 会切换到显式的内置工具子集，此时不加载 MCP（MCP 工具的名字要连接后才知道，无法提前按名选择）。
 

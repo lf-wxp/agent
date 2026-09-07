@@ -27,8 +27,19 @@
 //! hard boundary for the built-in filesystem tools specifically: a call whose path
 //! argument resolves outside `--workspace` (an absolute path elsewhere, a `../` escape,
 //! …) is denied before it runs — before an approval prompt for it would even ask a
-//! human to weigh in. `--no-sandbox` turns that enforcement off; the working directory
-//! itself is still pinned either way.
+//! human to weigh in. The same flag also registers
+//! [`agent::callback::mcp_guard::McpGuardCallback`], which covers MCP tools specifically
+//! (unreachable for the built-in guard above, since an MCP tool's argument schema is
+//! only known at runtime — see that callback's docs): it denies any MCP tool call whose
+//! arguments name a well-known credential path (`~/.ssh`, `~/.aws`, ...), regardless of
+//! which field carries it. Plus, every stdio MCP server this invocation spawns gets a
+//! minimal environment rather than inheriting this process's own (see
+//! `agent::tools::mcp::config`'s `INHERITED_ENV_VARS`), so a server cannot read this
+//! process's own credentials (API keys, ...) just by being spawned — that part is not
+//! gated by `--no-sandbox` at all, since there is no legitimate reason an MCP server
+//! would need this agent's own secrets. `--no-sandbox` turns off the two call-time
+//! guards above; the working directory is still pinned, and stdio servers still get a
+//! minimal environment, either way.
 //!
 //! Destructive tools (`delete_file` by default) prompt for a `y`/`n` before running, via
 //! [`agent::callback::dual_approval::DualApprovalCallback`] — see `--dangerous-tools` /
@@ -117,6 +128,7 @@ use agent::{
   agent::Event,
   callback::{
     dual_approval::{ApprovalChannel, DualApprovalCallback, with_approval_channel},
+    mcp_guard::McpGuardCallback,
     path_guard::WorkspaceGuardCallback,
     search_compressor::SearchCompressorCallback,
   },
@@ -282,13 +294,18 @@ async fn main() -> anyhow::Result<()> {
   );
   // Registered before the approval callback below: [`Agent::with_before_tool_callback`]
   // runs hooks in registration order and stops at the first denial, so an out-of-
-  // workspace call is rejected here without ever reaching a `y`/`n` prompt for it.
-  // `--no-sandbox` skips this registration; the working directory is still pinned to
-  // `--workspace` either way (see the module docs).
+  // workspace call, or an MCP call reaching for a credential path, is rejected here
+  // without ever reaching a `y`/`n` prompt for it. `--no-sandbox` skips both
+  // registrations — same flag for both, since they are the same "sandbox" concept from
+  // an operator's point of view, just covering two different tool populations (built-in
+  // vs. MCP; see [`WorkspaceGuardCallback`]'s "Known limitations" for why one callback
+  // could not cover both). The working directory is still pinned to `--workspace`
+  // either way.
   let agent = if args.contains_key("no-sandbox") {
     agent
   } else {
-    agent.with_before_tool_callback(Arc::new(WorkspaceGuardCallback::new(&workspace)?))
+    let agent = agent.with_before_tool_callback(Arc::new(WorkspaceGuardCallback::new(&workspace)?));
+    agent.with_before_tool_callback(Arc::new(McpGuardCallback::new()))
   };
   let agent = if dangerous_tools.is_empty() {
     agent

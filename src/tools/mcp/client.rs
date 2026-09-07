@@ -272,7 +272,11 @@ fn build_headers(
 /// Characters outside `[A-Za-z0-9_-]` are replaced, and the result is truncated, because
 /// that is all the chat completions API accepts in a function name. A truncation that
 /// happens to collide with another tool is caught by the registry's duplicate check.
-fn local_name(label: &str, remote_name: &str) -> String {
+///
+/// `pub(crate)` (not private) so [`crate::tools::mcp::config`]'s `allowedTools` filter
+/// can compute the same local name a configured remote tool name will end up with,
+/// without duplicating the sanitization rules here.
+pub(crate) fn local_name(label: &str, remote_name: &str) -> String {
   let sanitized = format!("{label}{LABEL_SEPARATOR}{remote_name}")
     .chars()
     .map(|c| {
@@ -294,6 +298,20 @@ fn local_name(label: &str, remote_name: &str) -> String {
   }
 
   sanitized
+}
+
+/// Whether `name` looks like a local MCP tool name, i.e. `label__remote_name` (see
+/// [`local_name`]).
+///
+/// For callbacks (e.g. [`crate::callback::mcp_guard::McpGuardCallback`]) that want to
+/// single out MCP tools generically — as opposed to the built-in tools, whose fixed
+/// names and argument schemas a callback like [`crate::callback::path_guard::
+/// WorkspaceGuardCallback`] already knows by name — without hand-maintaining a second
+/// list of every server's tools. A false positive (a non-MCP tool whose own name happens
+/// to contain [`LABEL_SEPARATOR`]) is possible in principle but not in practice: no
+/// built-in tool name does.
+pub(crate) fn is_mcp_tool_name(name: &str) -> bool {
+  name.contains(LABEL_SEPARATOR)
 }
 
 /// Parse the model's arguments into the object MCP expects.
@@ -355,6 +373,13 @@ mod tests {
   #[test]
   fn namespaces_remote_names() {
     assert_eq!(local_name("demo", "current_time"), "demo__current_time");
+  }
+
+  #[test]
+  fn recognizes_mcp_tool_names_by_the_label_separator() {
+    assert!(is_mcp_tool_name("demo__current_time"));
+    assert!(!is_mcp_tool_name("delete_file"));
+    assert!(!is_mcp_tool_name("calculator"));
   }
 
   /// Build a header map from pairs.

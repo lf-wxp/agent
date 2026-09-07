@@ -29,8 +29,12 @@ use crate::{
 ///
 /// - **Built-in tools only**: an MCP server's tools are discovered at runtime with no
 ///   fixed argument schema this callback could rely on, so a filesystem-touching MCP
-///   tool is not covered — only enable MCP servers you already trust with full
-///   filesystem access (see [`crate::tools::ToolRegistry::with_mcp`]).
+///   tool is not covered by *this* boundary — only enable MCP servers you already trust
+///   with full filesystem access (see [`crate::tools::ToolRegistry::with_mcp`]).
+///   [`crate::callback::mcp_guard::McpGuardCallback`] covers MCP tools specifically, but
+///   with a narrower, schema-agnostic check (known credential paths, not an arbitrary
+///   workspace root) — the two are meant to be registered together, not as
+///   alternatives.
 /// - **A symlink inside a not-yet-existing suffix is not resolved**: [`resolve_best_effort`]
 ///   canonicalizes as much of a path as actually exists on disk — including resolving
 ///   any symlink along *that* prefix — but a symlink that is itself part of the
@@ -139,7 +143,10 @@ impl BeforeToolCallback for WorkspaceGuardCallback {
 /// Resolve `.`/`..` components without touching the filesystem: for a path that does
 /// not exist yet, [`std::fs::canonicalize`] cannot be used at all, but a component-wise
 /// resolution is still enough to catch a plain `..`-escape.
-fn lexical_normalize(path: &Path) -> PathBuf {
+///
+/// `pub(crate)` so [`crate::callback::mcp_guard`] can reuse the exact same escape logic
+/// for its own, differently-scoped check instead of re-implementing it.
+pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
   let mut out = PathBuf::new();
   for component in path.components() {
     match component {
@@ -162,7 +169,11 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 /// resolving any symlink along it — and reattaches the remaining, not-yet-existing
 /// suffix components unresolved (see the type docs' "Known limitations" for what that
 /// last step cannot see).
-fn resolve_best_effort(path: &Path) -> PathBuf {
+///
+/// `pub(crate)` for the same reason as [`lexical_normalize`]: [`crate::callback::
+/// mcp_guard`] resolves candidate paths the same best-effort way, just against a
+/// different set of denied roots.
+pub(crate) fn resolve_best_effort(path: &Path) -> PathBuf {
   let normalized = lexical_normalize(path);
   let components: Vec<Component> = normalized.components().collect();
 

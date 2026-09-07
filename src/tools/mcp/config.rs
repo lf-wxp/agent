@@ -36,13 +36,50 @@
 //! `MCP_CONFIG_PATH` the same way you would a shell command — anything that can control
 //! their contents can run arbitrary processes on this host.
 
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{
+  collections::{BTreeMap, HashSet},
+  path::Path,
+  sync::Arc,
+};
 
 use anyhow::Context;
 use serde::Deserialize;
 use tokio::process::Command;
 
-use crate::tools::{mcp::client::McpConnection, tool::Tool};
+use crate::tools::{
+  mcp::client::{self, McpConnection},
+  tool::Tool,
+};
+
+/// Environment variables a spawned stdio server inherits from this process by default,
+/// on top of whatever its own `env` in `mcp.json` declares — see [`stdio_env`].
+///
+/// Deliberately not "the whole environment": a stdio entry's `command` is, per the
+/// module docs' "Trust boundary" section, already treated like a shell command the
+/// operator chose to run — but the *environment that command sees* is a separate trust
+/// boundary a well-behaved config should not have to think about. Without this
+/// allowlist, [`tokio::process::Command`] inherits every variable this agent process
+/// itself has (API keys, cloud credentials, ...), regardless of whether the server ever
+/// needed them, which turns "one npx-installed MCP server" into "one npx-installed MCP
+/// server that can read every secret this agent has". Only what the OS needs to even
+/// locate and start the program survives; anything the server itself needs must be
+/// listed explicitly in `env`.
+#[cfg(unix)]
+const INHERITED_ENV_VARS: &[&str] = &["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"];
+#[cfg(windows)]
+const INHERITED_ENV_VARS: &[&str] = &[
+  "PATH",
+  "SystemRoot",
+  "SystemDrive",
+  "TEMP",
+  "TMP",
+  "USERPROFILE",
+  "APPDATA",
+  "LOCALAPPDATA",
+  "ProgramData",
+  "ComSpec",
+  "windir",
+];
 
 /// A parsed `mcp.json`.
 #[derive(Debug, Clone, Deserialize)]
@@ -86,6 +123,19 @@ pub struct ServerConfig {
   pub disabled: bool,
   #[serde(default)]
   pub enabled: Option<bool>,
+
+  /// Restrict this server to exactly these tools, named as the server itself advertises
+  /// them (i.e. before [`client::local_name`] adds the `label__` prefix) — see
+  /// [`apply_allow_list`]. `None` (the default, and the only option before this field
+  /// existed) exposes every tool the server advertises, unchanged.
+  ///
+  /// Exists because a server is discovered, not authored, by this agent: an operator who
+  /// otherwise trusts a server (enough to run its `command`, per the module docs) may
+  /// still want to hold back one specific tool it happens to expose — e.g. a
+  /// `filesystem` server's `write_file` alongside a `read_file` they do want — without
+  /// forking or patching the server itself.
+  #[serde(default)]
+  pub allowed_tools: Option<Vec<String>>,
 }
 
 /// Transports named in the wild. Values are matched case-insensitively.
@@ -190,7 +240,47 @@ async fn connect_one(
   };
 
   let tools = connection.tools().await?;
+  let tools = apply_allow_list(label, server, tools);
   Ok((connection, tools))
+}
+
+/// Keep only the tools named in `server.allowed_tools`, matched by computing the same
+/// [`client::local_name`] each one would already have been adapted with; `None` (the
+/// field's default) is a no-op, returning `tools` unchanged.
+///
+/// A configured name that matches nothing `tools` actually contains is logged, not an
+/// error: a typo, or a server that changed its tool set since the config was written,
+/// should not take the rest of the allowlist — or the server's other, still-valid
+/// tools — down with it.
+fn apply_allow_list(
+  label: &str,
+  server: &ServerConfig,
+  tools: Vec<Arc<dyn Tool>>,
+) -> Vec<Arc<dyn Tool>> {
+  let Some(allowed) = &server.allowed_tools else {
+    return tools;
+  };
+
+  let allowed_names: HashSet<String> = allowed
+    .iter()
+    .map(|name| client::local_name(label, name))
+    .collect();
+
+  for configured in allowed {
+    let local = client::local_name(label, configured);
+    if !tools.iter().any(|tool| tool.name() == local) {
+      tracing::warn!(
+        label,
+        tool = configured,
+        "MCP server `{label}`'s `allowedTools` names a tool it did not advertise"
+      );
+    }
+  }
+
+  tools
+    .into_iter()
+    .filter(|tool| allowed_names.contains(tool.name()))
+    .collect()
 }
 
 async fn spawn_stdio(label: &str, server: &ServerConfig) -> anyhow::Result<McpConnection> {
@@ -203,14 +293,38 @@ async fn spawn_stdio(label: &str, server: &ServerConfig) -> anyhow::Result<McpCo
   for arg in &server.args {
     command.arg(expand(arg)?);
   }
-  for (key, value) in &server.env {
-    command.env(key, expand(value)?);
+
+  // See `INHERITED_ENV_VARS`'s docs: the child does not get this process's full
+  // environment by default, only the fixed, minimal allowlist plus whatever the config
+  // itself declares.
+  command.env_clear();
+  for (key, value) in stdio_env(server)? {
+    command.env(key, value);
   }
+
   if let Some(cwd) = &server.cwd {
     command.current_dir(expand(cwd)?);
   }
 
   McpConnection::spawn(label, command).await
+}
+
+/// The environment a spawned stdio server ends up with: [`INHERITED_ENV_VARS`] as found
+/// in this process's own environment, overridden/extended by `server.env`. Split out of
+/// [`spawn_stdio`] as a pure function — returning the composed map instead of mutating a
+/// [`Command`] directly — so a test can check exactly what ends up in it without
+/// actually spawning a process.
+fn stdio_env(server: &ServerConfig) -> anyhow::Result<BTreeMap<String, String>> {
+  let mut env = BTreeMap::new();
+  for var in INHERITED_ENV_VARS {
+    if let Ok(value) = std::env::var(var) {
+      env.insert((*var).to_owned(), value);
+    }
+  }
+  for (key, value) in &server.env {
+    env.insert(key.clone(), expand(value)?);
+  }
+  Ok(env)
 }
 
 async fn connect_http(label: &str, server: &ServerConfig) -> anyhow::Result<McpConnection> {
@@ -391,5 +505,139 @@ mod tests {
   fn rejects_undefined_and_unterminated_variables() {
     assert!(expand("${AGENT_TEST_DEFINITELY_UNSET}").is_err());
     assert!(expand("${oops").is_err());
+  }
+
+  /// Bare-minimum [`Tool`] for [`apply_allow_list`]'s tests: only `name` is ever
+  /// inspected there, so nothing else needs to do anything real.
+  struct StubTool(String);
+
+  #[async_trait::async_trait]
+  impl Tool for StubTool {
+    fn name(&self) -> &str {
+      &self.0
+    }
+
+    fn description(&self) -> &str {
+      "stub"
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+      serde_json::json!({})
+    }
+
+    async fn execute(&self, _args_json: &str) -> anyhow::Result<String> {
+      unreachable!("apply_allow_list never calls a tool")
+    }
+  }
+
+  fn stub_tools(names: &[&str]) -> Vec<Arc<dyn Tool>> {
+    names
+      .iter()
+      .map(|name| Arc::new(StubTool((*name).to_owned())) as Arc<dyn Tool>)
+      .collect()
+  }
+
+  #[test]
+  fn allow_list_absent_keeps_every_tool() {
+    let server = ServerConfig::default();
+    let tools = stub_tools(&["demo__read_file", "demo__write_file"]);
+    assert_eq!(apply_allow_list("demo", &server, tools).len(), 2);
+  }
+
+  #[test]
+  fn allow_list_keeps_only_the_named_remote_tools() {
+    let server = ServerConfig {
+      allowed_tools: Some(vec!["read_file".to_owned()]),
+      ..Default::default()
+    };
+    let tools = stub_tools(&["demo__read_file", "demo__write_file"]);
+
+    let filtered = apply_allow_list("demo", &server, tools);
+    let names: Vec<&str> = filtered.iter().map(|tool| tool.name()).collect();
+    assert_eq!(names, ["demo__read_file"]);
+  }
+
+  #[test]
+  fn allow_list_of_empty_vec_keeps_nothing() {
+    let server = ServerConfig {
+      allowed_tools: Some(Vec::new()),
+      ..Default::default()
+    };
+    let tools = stub_tools(&["demo__read_file"]);
+    assert!(apply_allow_list("demo", &server, tools).is_empty());
+  }
+
+  #[test]
+  fn allow_list_naming_an_unadvertised_tool_does_not_panic_or_drop_the_rest() {
+    let server = ServerConfig {
+      allowed_tools: Some(vec!["read_file".to_owned(), "typo_tool".to_owned()]),
+      ..Default::default()
+    };
+    let tools = stub_tools(&["demo__read_file"]);
+
+    let filtered = apply_allow_list("demo", &server, tools);
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].name(), "demo__read_file");
+  }
+
+  #[test]
+  fn stdio_env_does_not_leak_unrelated_variables() {
+    // SAFETY: single-threaded test, and the name is unique to this test.
+    unsafe { std::env::set_var("AGENT_TEST_MCP_SECRET", "s3cret") };
+
+    let server = ServerConfig::default();
+    let env = stdio_env(&server).unwrap();
+
+    assert!(
+      !env.contains_key("AGENT_TEST_MCP_SECRET"),
+      "an env var outside INHERITED_ENV_VARS must not be passed to the child process"
+    );
+  }
+
+  #[test]
+  fn stdio_env_carries_only_the_inherited_allowlist_by_default() {
+    let server = ServerConfig::default();
+    let env = stdio_env(&server).unwrap();
+
+    for key in env.keys() {
+      assert!(
+        INHERITED_ENV_VARS.contains(&key.as_str()),
+        "`{key}` is not in INHERITED_ENV_VARS and `server.env` is empty here"
+      );
+    }
+  }
+
+  #[test]
+  fn stdio_env_lets_configured_vars_override_the_inherited_ones() {
+    // No need to touch the real `PATH` here: whatever it already is, `server.env`
+    // setting the same key must still win, since `stdio_env` applies it after the
+    // inherited-allowlist loop.
+    let server = ServerConfig {
+      env: BTreeMap::from([("PATH".to_owned(), "/configured/path".to_owned())]),
+      ..Default::default()
+    };
+    let env = stdio_env(&server).unwrap();
+
+    assert_eq!(
+      env.get("PATH").map(String::as_str),
+      Some("/configured/path")
+    );
+  }
+
+  #[test]
+  fn stdio_env_expands_configured_values() {
+    // SAFETY: single-threaded test, and the name is unique to this test.
+    unsafe { std::env::set_var("AGENT_TEST_MCP_EXPAND_SOURCE", "expanded") };
+
+    let server = ServerConfig {
+      env: BTreeMap::from([(
+        "TARGET".to_owned(),
+        "${AGENT_TEST_MCP_EXPAND_SOURCE}".to_owned(),
+      )]),
+      ..Default::default()
+    };
+    let env = stdio_env(&server).unwrap();
+
+    assert_eq!(env.get("TARGET").map(String::as_str), Some("expanded"));
   }
 }

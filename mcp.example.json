@@ -10,6 +10,7 @@
       "env": {
         "LOG_LEVEL": "info"
       },
+      "allowedTools": ["echo", "add"],
       "disabled": true
     },
     "remote": {
