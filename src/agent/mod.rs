@@ -1,12 +1,13 @@
 pub mod callback;
 pub mod context;
 pub mod event;
-mod history;
+pub mod llm_request;
 pub mod runtime;
 pub mod session;
 
-pub use callback::{AfterToolCallback, BeforeToolCallback, ToolCallView};
-pub use context::{ExecutionContext, TokenUsage};
+pub use callback::{AfterToolCallback, BeforeLlmCallback, BeforeToolCallback, ToolCallView};
+pub use context::{ContinuityCache, Conversation, ExecutionContext, TokenUsage};
 pub use event::{ContentItem, Event, ToolResultStatus};
+pub use llm_request::LlmRequest;
 pub use runtime::{Agent, AgentResult, AgentStreamEvent, StructuredAgentResult};
 pub use session::{FileSessionStore, SessionStore};

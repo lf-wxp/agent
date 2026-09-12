@@ -19,9 +19,9 @@
 //! itself stays a stateless function of "prior events + new input": it does not own a
 //! session/storage concept, that lives one layer up (see [`crate::agent::session`] for one
 //! way a caller can persist history across turns). It does, however, cap how much of
-//! that history it will actually send per call (see [`Self::with_max_history_tokens`] and
-//! [`crate::agent::history::trim_to_budget`]), since an unbounded session could otherwise
-//! grow past the model's context window.
+//! that history it will actually send per call: [`Agent::new`] registers a
+//! [`crate::callback::context_optimizer::ContextOptimizer`] by default, since an
+//! unbounded session could otherwise grow past the model's context window.
 //!
 //! Structured output ([`Agent::run_structured`] / [`Agent::run_structured_raw`]) is
 //! implemented in the [`structured`] submodule: it is a large enough sub-problem (model
@@ -47,12 +47,16 @@ use futures::{Stream, StreamExt, future::join_all};
 use serde_json::Value;
 
 use crate::{
-  agent::callback::{AfterToolCallback, BeforeToolCallback, ToolCallView},
+  agent::{
+    callback::{AfterToolCallback, BeforeLlmCallback, BeforeToolCallback, ToolCallView},
+    llm_request::LlmRequest,
+  },
+  callback::context_optimizer::ContextOptimizer,
   config,
   llm::{
     client::{DEFAULT_MAX_TOKENS, first_choice, request_builder},
     provider::Provider,
-    retry::with_retry,
+    retry::{is_transient, with_retry},
     tool_calls::ToolCallAccumulator,
     tool_loop::disable_tools,
   },
@@ -61,7 +65,7 @@ use crate::{
 };
 
 use super::{
-  context::ExecutionContext,
+  context::{Conversation, ExecutionContext},
   event::{ContentItem, Event, ToolResultStatus},
 };
 
@@ -131,13 +135,17 @@ pub struct Agent {
   instructions: Option<String>,
   toolbox: Arc<ToolRegistry>,
   max_steps: u32,
-  max_history_tokens: usize,
   /// Hooks run before each tool call, in registration order; see
   /// [`Self::with_before_tool_callback`].
   before_tool_callbacks: Vec<Arc<dyn BeforeToolCallback>>,
   /// Hooks run after each tool call, in registration order; see
   /// [`Self::with_after_tool_callback`].
   after_tool_callbacks: Vec<Arc<dyn AfterToolCallback>>,
+  /// Hooks run before each LLM request, in registration order; see
+  /// [`Self::with_before_llm_callback`]. [`Self::new`] seeds this with a
+  /// [`ContextOptimizer`] — the history token budget belongs to that callback, not
+  /// to `Agent`.
+  before_llm_callbacks: Vec<Arc<dyn BeforeLlmCallback>>,
 }
 
 impl Agent {
@@ -150,6 +158,11 @@ impl Agent {
   /// [`Provider::shared`] for the single-tenant default, or a tenant-specific
   /// [`Provider::new`] to isolate this agent's traffic (rate limit, API key, base URL)
   /// from other tenants running in the same process.
+  ///
+  /// A [`ContextOptimizer`] carrying [`config::max_history_tokens`] is registered as
+  /// the first before-LLM hook, so an unbounded session cannot grow past the model's
+  /// context window by default. Use [`Self::clear_before_llm_callbacks`] to change or
+  /// drop it.
   pub fn new(
     provider: Provider,
     model: impl Into<String>,
@@ -162,15 +175,18 @@ impl Agent {
       instructions: instructions.map(Into::into),
       toolbox,
       max_steps: config::max_tool_rounds() as u32,
-      max_history_tokens: config::max_history_tokens(),
       before_tool_callbacks: Vec::new(),
       after_tool_callbacks: Vec::new(),
+      before_llm_callbacks: vec![Arc::new(
+        ContextOptimizer::new(config::max_history_tokens()),
+      )],
     }
   }
 
   /// Rounds of tool execution allowed before further rounds fall back to a
   /// tools-disabled request, instead of looping forever on a model that never stops
   /// calling tools. See [`Self::run`] / [`Self::run_structured`].
+  #[must_use]
   pub fn with_max_steps(mut self, max_steps: u32) -> Self {
     self.max_steps = max_steps;
     self
@@ -188,6 +204,7 @@ impl Agent {
   /// Can be called more than once to register several independent hooks (e.g. an audit
   /// log that never denies anything, plus a permission check that might) — each call adds
   /// one, it does not replace the others.
+  #[must_use]
   pub fn with_before_tool_callback(mut self, callback: Arc<dyn BeforeToolCallback>) -> Self {
     self.before_tool_callbacks.push(callback);
     self
@@ -207,18 +224,59 @@ impl Agent {
   /// Calls short-circuited by [`Self::with_before_tool_callback`] never reach any of
   /// these, since their result did not come from a tool; a hook that has to see every
   /// recorded result has to be registered on both ends.
+  #[must_use]
   pub fn with_after_tool_callback(mut self, callback: Arc<dyn AfterToolCallback>) -> Self {
     self.after_tool_callbacks.push(callback);
     self
   }
 
-  /// Soft token budget for the `history` passed to [`Self::run_continuing`] — see
-  /// [`crate::agent::history::trim_to_budget`] for exactly how it is enforced (whole
-  /// turns dropped oldest-first, the most recent turn always kept). Defaults to
-  /// [`config::max_history_tokens`]; override when a particular agent talks to a model
-  /// with an unusually small or large context window.
-  pub fn with_max_history_tokens(mut self, max_history_tokens: usize) -> Self {
-    self.max_history_tokens = max_history_tokens;
+  /// Register a hook invoked before each LLM request, once the conversation has been
+  /// flattened into an [`LlmRequest`] but before it becomes API messages
+  /// ([`Self::prepare_llm_request`]). Use it to trim, compress, or enrich what goes out
+  /// this round — injecting a dynamic system instruction, summarizing old turns,
+  /// splicing in retrieved context — without touching [`ExecutionContext::events`],
+  /// which stays the authoritative transcript.
+  ///
+  /// Callbacks run in registration order, each seeing the previous one's edits, appended
+  /// after the ones already registered — including the default [`ContextOptimizer`]
+  /// from [`Self::new`]. A hook that *adds* content therefore runs after that trim and is
+  /// not covered by its budget; a hook that needs the last word on size has to enforce
+  /// its own.
+  ///
+  /// Can be called more than once to register several independent hooks — each call adds
+  /// one, it does not replace the others. To replace the default trim, clear the chain
+  /// first with [`Self::clear_before_llm_callbacks`].
+  #[must_use]
+  pub fn with_before_llm_callback(mut self, callback: Arc<dyn BeforeLlmCallback>) -> Self {
+    self.before_llm_callbacks.push(callback);
+    self
+  }
+
+  /// Drop every before-LLM hook registered so far, **including** the default
+  /// [`ContextOptimizer`] installed by [`Self::new`].
+  ///
+  /// This is how the history token budget is changed: it is a property of the callback,
+  /// not of the agent, so adjusting it means installing a differently-configured one.
+  ///
+  /// ```no_run
+  /// # use std::sync::Arc;
+  /// use agent::agent::Agent;
+  /// use agent::callback::context_optimizer::ContextOptimizer;
+  /// # use agent::llm::provider::Provider;
+  /// # use agent::tools::ToolRegistry;
+  /// #
+  /// # let toolbox = Arc::new(ToolRegistry::empty());
+  /// let agent = Agent::new(Provider::shared().clone(), "gpt-4o", Option::<String>::None, toolbox)
+  ///   .clear_before_llm_callbacks()
+  ///   .with_before_llm_callback(Arc::new(ContextOptimizer::new(32_000)));
+  /// ```
+  ///
+  /// Clearing without registering anything else disables trimming entirely: every round
+  /// then sends the full transcript, which is only safe when the caller bounds it some
+  /// other way.
+  #[must_use]
+  pub fn clear_before_llm_callbacks(mut self) -> Self {
+    self.before_llm_callbacks.clear();
     self
   }
 
@@ -255,30 +313,36 @@ impl Agent {
   }
 
   /// Run to a plain-text final answer, continuing a conversation whose prior turns are
-  /// `history`.
+  /// `conversation`.
   ///
-  /// `history` is normally a previous call's `AgentResult::context.events` — keep it on
-  /// the caller's side (in memory, a database, an HTTP session store, ...) between calls
-  /// and hand it back here for the next turn, so the model sees the full exchange so
-  /// far. This is what makes multi-turn conversations possible without `Agent` itself
-  /// owning any session/storage concept: it stays a pure function of "prior events + new
-  /// input" (see [`crate::agent::session`] for one way to manage that storage across
-  /// calls).
+  /// Accepts a bare `Vec<Event>` — normally a previous call's
+  /// `AgentResult::context.events` — or a [`Conversation`] carrying the caller's own
+  /// identifier for the exchange. Keep that history on the caller's side (in memory, a
+  /// database, an HTTP session store, ...) between calls and hand it back here for the
+  /// next turn, so the model sees everything so far. This is what makes multi-turn
+  /// conversations possible without `Agent` itself owning any session/storage concept: it
+  /// stays a pure function of "prior events + new input" (see [`crate::agent::session`]
+  /// for one way to manage that storage across calls).
+  ///
+  /// Passing a [`Conversation`] rather than a plain `Vec` additionally lets hooks
+  /// accumulate work across turns — see [`Conversation::id`] and
+  /// [`ExecutionContext::continuity_key`].
   ///
   /// The round budget ([`Self::with_max_steps`]) resets every call — `current_step`
   /// starts back at zero — so a long conversation is never penalized for rounds already
   /// spent on earlier turns; only this turn's own tool calls count against it.
   pub async fn run_continuing(
     &self,
-    history: Vec<Event>,
+    conversation: impl Into<Conversation>,
     user_input: &str,
   ) -> anyhow::Result<AgentResult> {
-    let mut context = self.seed_context(history, user_input);
+    let mut context = self.seed_context(conversation.into(), user_input);
 
     loop {
       let (tools_allowed, budget_exhausted) = self.round_budget(&context);
 
-      let messages = self.build_messages(&context)?;
+      let llm_request = self.prepare_llm_request(&context).await;
+      let messages = self.build_messages(llm_request)?;
       let mut builder = request_builder(
         &self.model,
         messages,
@@ -353,16 +417,20 @@ impl Agent {
   /// get the context to persist (e.g. into [`crate::agent::session::SessionStore`]).
   pub fn run_continuing_stream<'a>(
     &'a self,
-    history: Vec<Event>,
+    conversation: impl Into<Conversation>,
     user_input: &'a str,
   ) -> impl Stream<Item = anyhow::Result<AgentStreamEvent>> + 'a {
+    // Converted before the generator so the returned stream owns a plain `Conversation`
+    // and borrows nothing from the caller's argument.
+    let conversation = conversation.into();
     stream! {
-      let mut context = self.seed_context(history, user_input);
+      let mut context = self.seed_context(conversation, user_input);
 
       loop {
         let (tools_allowed, budget_exhausted) = self.round_budget(&context);
 
-        let messages = self.build_messages(&context)?;
+        let llm_request = self.prepare_llm_request(&context).await;
+        let messages = self.build_messages(llm_request)?;
         let mut builder = request_builder(
           &self.model,
           messages,
@@ -460,6 +528,11 @@ impl Agent {
   /// (e.g. a different retry policy) applies to all of them at once. `builder` is taken by
   /// reference and rebuilt (`builder.build()`) on every attempt, since a retried request
   /// must be constructed fresh each time rather than reusing a value already consumed.
+  ///
+  /// [`is_transient`] decides what is worth another attempt. A rejected key, an unknown
+  /// model or a request the provider considers malformed fails *identically* every time,
+  /// so retrying one only spends the attempt budget and delays the real error reaching
+  /// the caller by the whole backoff curve.
   async fn complete(
     &self,
     builder: &CreateChatCompletionRequestArgs,
@@ -475,7 +548,7 @@ impl Agent {
           .await?;
         anyhow::Ok(response)
       },
-      |_| true,
+      is_transient,
     )
     .await
   }
@@ -497,19 +570,24 @@ impl Agent {
           .await?;
         anyhow::Ok(stream)
       },
-      |_| true,
+      is_transient,
     )
     .await
   }
 
   /// Build the starting [`ExecutionContext`] for a call: a fresh execution id and step
-  /// counter (see [`Self::run_continuing`] on why the round budget resets per call), with
-  /// `history` trimmed to [`Self::with_max_history_tokens`] (see
-  /// [`crate::agent::history::trim_to_budget`]) and spliced in as prior turns before the
-  /// new user input is recorded.
-  fn seed_context(&self, history: Vec<Event>, user_input: &str) -> ExecutionContext {
+  /// counter (see [`Self::run_continuing`] on why the round budget resets per call), the
+  /// conversation's own id carried over so hooks can correlate turns (see
+  /// [`ExecutionContext::continuity_key`]), and its prior events stored as-is so the full
+  /// transcript is preserved for persistence (see
+  /// [`crate::agent::session::SessionStore`]). Token-budget trimming happens later, on
+  /// the per-round [`LlmRequest`] copy inside [`Self::prepare_llm_request`], so
+  /// [`ExecutionContext::events`] is never destructively truncated.
+  fn seed_context(&self, conversation: Conversation, user_input: &str) -> ExecutionContext {
     let mut context = ExecutionContext::new();
-    context.events = super::history::trim_to_budget(history, self.max_history_tokens);
+    context.conversation_id = conversation.id;
+    context.conversation_scope = conversation.scope;
+    context.events = conversation.events;
     self.record_user_input(&mut context, user_input);
     context
   }
@@ -548,6 +626,61 @@ impl Agent {
     }
   }
 
+  /// Build this round's [`LlmRequest`] — system prompt plus flattened transcript — and
+  /// run every hook over it, in registration order, starting with the
+  /// [`ContextOptimizer`] that [`Self::new`] installs by default.
+  ///
+  /// The system prompt is part of the request rather than prepended afterwards, so a hook
+  /// that measures or rewrites the prompt sees all of it; see [`LlmRequest`].
+  ///
+  /// `context` is borrowed immutably: the whole point of this path is that the request is
+  /// a throwaway copy and [`ExecutionContext::events`] survives intact for persistence.
+  async fn prepare_llm_request(&self, context: &ExecutionContext) -> LlmRequest {
+    let mut request = LlmRequest::new(self.instructions.clone(), &context.events);
+
+    for callback in &self.before_llm_callbacks {
+      callback.call(context, &mut request).await;
+    }
+
+    request
+  }
+
+  /// [`Self::prepare_llm_request`] for a caller that will append `trailer` as a trailing
+  /// system message of its own (see [`structured`]'s `json_object` route, where the schema
+  /// hint has to be the last thing the model reads).
+  ///
+  /// Such a message is part of what goes on the wire, so a hook measuring the request has
+  /// to see it — otherwise every token budget in the chain undercounts by exactly the
+  /// trailer's length, on the one route where that text is most likely to be a large
+  /// generated schema. It is therefore pushed as an instruction *before* the hooks run and
+  /// removed again afterwards, leaving the caller free to place it wherever it belongs.
+  ///
+  /// A hook that rewrote or dropped the trailer is respected rather than fought: removal
+  /// matches on the exact text, so if it is no longer there nothing happens — it was still
+  /// accounted for, which is the point.
+  async fn prepare_llm_request_with_trailer(
+    &self,
+    context: &ExecutionContext,
+    trailer: &str,
+  ) -> LlmRequest {
+    let mut request = LlmRequest::new(self.instructions.clone(), &context.events);
+    request.push_instruction(trailer);
+
+    for callback in &self.before_llm_callbacks {
+      callback.call(context, &mut request).await;
+    }
+
+    if let Some(at) = request
+      .instructions
+      .iter()
+      .rposition(|instruction| instruction == trailer)
+    {
+      request.instructions.remove(at);
+    }
+
+    request
+  }
+
   /// Record one round's tool calls into the transcript and return the same items, so a
   /// caller that also wants to forward them live (see
   /// [`AgentStreamEvent::ToolCallsStarted`]) does not have to recompute or reparse
@@ -579,8 +712,9 @@ impl Agent {
 
   /// Execute every call in one model turn.
   ///
-  /// Calls run concurrently rather than one after another: [`Tool::execute`] no longer
-  /// takes the caller's [`ExecutionContext`] at all (see [`Tool::execute`]'s docs for why),
+  /// Calls run concurrently rather than one after another: [`crate::tools::Tool::execute`]
+  /// no longer takes the caller's [`ExecutionContext`] at all (see that method's docs for
+  /// why),
   /// so independent tool calls requested in the same turn (e.g. two `web_search` calls) do
   /// not have to pay for each other's network latency in sequence, and there is no shared
   /// state to serialize access to.
@@ -713,77 +847,88 @@ impl Agent {
     result_items
   }
 
-  /// Replay the transcript recorded in `context` into the message shape the API expects.
+  /// Render a prepared [`LlmRequest`] into the message shape the API expects.
+  ///
+  /// Everything comes from `request`, including the system prompt: by this point hooks
+  /// have had their say, and re-reading [`Self::instructions`] here would silently undo
+  /// any edit they made to it.
+  ///
+  /// Takes the request **by value** and moves each payload into the message that will
+  /// carry it. Borrowing would mean cloning every string a second time — the request is
+  /// already a per-round copy of the transcript (see [`Self::prepare_llm_request`]), so
+  /// on a long run with bulky tool output that second copy is pure waste, and it is
+  /// paid on every round.
   fn build_messages(
     &self,
-    context: &ExecutionContext,
+    request: LlmRequest,
   ) -> anyhow::Result<Vec<ChatCompletionRequestMessage>> {
-    let mut messages = Vec::new();
+    let LlmRequest {
+      instructions,
+      contents,
+    } = request;
+    let mut messages = Vec::with_capacity(instructions.len() + contents.len());
 
-    if let Some(system) = &self.instructions {
+    for instruction in instructions {
       messages.push(
         ChatCompletionRequestSystemMessageArgs::default()
-          .content(system.as_str())
+          .content(instruction)
           .build()?
           .into(),
       );
     }
 
-    for event in &context.events {
-      for item in &event.content {
-        match item {
-          ContentItem::Message { role, content } => {
-            let message: ChatCompletionRequestMessage = if role == "user" {
-              ChatCompletionRequestUserMessageArgs::default()
-                .content(content.clone())
-                .build()?
-                .into()
-            } else {
-              ChatCompletionRequestAssistantMessageArgs::default()
-                .content(content.clone())
-                .build()?
-                .into()
-            };
-            messages.push(message);
-          }
-          ContentItem::ToolCall {
-            tool_call_id,
-            name,
-            arguments,
-          } => {
-            let tool_call =
-              ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
-                id: tool_call_id.clone(),
-                function: FunctionCall {
-                  name: name.clone(),
-                  arguments: arguments.to_string(),
-                },
-              });
+    for item in contents {
+      match item {
+        ContentItem::Message { role, content } => {
+          let message: ChatCompletionRequestMessage = if role == "user" {
+            ChatCompletionRequestUserMessageArgs::default()
+              .content(content)
+              .build()?
+              .into()
+          } else {
+            ChatCompletionRequestAssistantMessageArgs::default()
+              .content(content)
+              .build()?
+              .into()
+          };
+          messages.push(message);
+        }
+        ContentItem::ToolCall {
+          tool_call_id,
+          name,
+          arguments,
+        } => {
+          let tool_call = ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+            id: tool_call_id,
+            function: FunctionCall {
+              name,
+              arguments: arguments.to_string(),
+            },
+          });
 
-            if let Some(ChatCompletionRequestMessage::Assistant(last)) = messages.last_mut() {
-              last.tool_calls.get_or_insert_with(Vec::new).push(tool_call);
-            } else {
-              messages.push(
-                ChatCompletionRequestAssistantMessageArgs::default()
-                  .tool_calls(vec![tool_call])
-                  .build()?
-                  .into(),
-              );
-            }
-          }
-          ContentItem::ToolResult {
-            tool_call_id,
-            content,
-            ..
-          } => {
+          if let Some(ChatCompletionRequestMessage::Assistant(last)) = messages.last_mut() {
+            last.tool_calls.get_or_insert_with(Vec::new).push(tool_call);
+          } else {
             messages.push(
-              ChatCompletionRequestToolMessageArgs::default()
-                .tool_call_id(tool_call_id.clone())
-                .content(content.clone())
+              ChatCompletionRequestAssistantMessageArgs::default()
+                .tool_calls(vec![tool_call])
                 .build()?
                 .into(),
             );
           }
+        }
+        ContentItem::ToolResult {
+          tool_call_id,
+          content,
+          ..
+        } => {
+          messages.push(
+            ChatCompletionRequestToolMessageArgs::default()
+              .tool_call_id(tool_call_id)
+              .content(content)
+              .build()?
+              .into(),
+          );
         }
       }
     }

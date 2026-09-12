@@ -14,6 +14,12 @@ use crate::tools::macros::simple_tool;
 /// Tool name, used both in the definition and in dispatch.
 pub const NAME: &str = "list_files";
 
+/// The directory listed when the model omits `path`.
+///
+/// Public so [`crate::callback::context_optimizer::compaction`] can name the directory
+/// that was actually listed instead of reporting an omitted argument as unknown.
+pub const DEFAULT_PATH: &str = ".";
+
 /// Arguments as produced by the model.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListFilesArgs {
@@ -24,7 +30,7 @@ pub struct ListFilesArgs {
 }
 
 fn default_path() -> String {
-  ".".to_string()
+  DEFAULT_PATH.to_string()
 }
 
 simple_tool!(

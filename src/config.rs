@@ -4,7 +4,7 @@
 //! [`crate::telemetry::init`] (which loads `.env` internally); otherwise values
 //! set in `.env` will not take effect.
 
-use std::{path::PathBuf, str::FromStr, sync::LazyLock};
+use std::{path::PathBuf, str::FromStr, sync::LazyLock, time::Duration};
 
 use tracing::Level;
 
@@ -48,8 +48,11 @@ const ENV_CLI_WEB_PORT: &str = "AGENT_CLI_WEB_PORT";
 const ENV_CLI_WEB_DIST_DIR: &str = "AGENT_CLI_WEB_DIST_DIR";
 
 /// Environment variable: soft token budget for conversation history passed to
-/// [`crate::agent::Agent::run_continuing`]; see [`crate::agent::history::trim_to_budget`].
+/// [`crate::agent::Agent::run_continuing`]; see [`crate::callback::context_optimizer::ContextOptimizer`].
 const ENV_MAX_HISTORY_TOKENS: &str = "LLM_MAX_HISTORY_TOKENS";
+
+/// Environment variable: seconds a dangerous-tool approval waits for a human.
+const ENV_APPROVAL_TIMEOUT_SECS: &str = "AGENT_APPROVAL_TIMEOUT_SECS";
 
 /// Environment variable: Tavily API key, used by the `web_search` tool.
 const ENV_TAVILY_API_KEY: &str = "TAVILY_API_KEY";
@@ -102,6 +105,11 @@ const DEFAULT_CLI_WEB_PORT: u16 = 4173;
 /// definitions, and the model's own output, and keeps per-turn cost bounded for models
 /// billed by input tokens.
 const DEFAULT_MAX_HISTORY_TOKENS: usize = 6_000;
+
+/// Default wait for a human approval decision: long enough to step away from the keyboard
+/// and come back, short enough that an abandoned prompt does not wedge the session for the
+/// rest of the day.
+const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 300;
 
 /// Default Tavily search depth: `basic` costs 1 credit and balances latency against relevance.
 const DEFAULT_TAVILY_SEARCH_DEPTH: &str = "basic";
@@ -198,6 +206,21 @@ pub fn cli_web_port() -> u16 {
   parsed_var_nonzero(ENV_CLI_WEB_PORT, DEFAULT_CLI_WEB_PORT)
 }
 
+/// How long a dangerous-tool approval waits for a human before giving up and denying
+/// (see [`crate::callback::dual_approval::DualApprovalCallback`]). Override with
+/// `AGENT_APPROVAL_TIMEOUT_SECS`; invalid values (non-numeric or 0) fall back to the
+/// default.
+///
+/// A bound is required rather than merely nice: a turn holds the session's turn lock for
+/// its whole duration, so an approval nobody ever answers would otherwise wedge every
+/// front-end sharing that session — permanently, with no way out but killing the process.
+pub fn approval_timeout() -> Duration {
+  Duration::from_secs(parsed_var_nonzero(
+    ENV_APPROVAL_TIMEOUT_SECS,
+    DEFAULT_APPROVAL_TIMEOUT_SECS,
+  ))
+}
+
 /// Directory the `cli` binary's web server serves static front-end assets from.
 /// Override with `AGENT_CLI_WEB_DIST_DIR`; defaults to `crates/web-ui/dist` resolved
 /// against *this crate's* source directory (via `CARGO_MANIFEST_DIR`, fixed at compile
@@ -213,8 +236,16 @@ pub fn cli_web_dist_dir() -> PathBuf {
 }
 
 /// Soft token budget for conversation history handed to [`crate::agent::Agent::run_continuing`]
-/// (see [`crate::agent::history::trim_to_budget`]). Override with `LLM_MAX_HISTORY_TOKENS`;
+/// (see [`crate::callback::context_optimizer::ContextOptimizer`]). Override with `LLM_MAX_HISTORY_TOKENS`;
 /// invalid values (non-numeric or 0) fall back to the default.
+///
+/// This is the budget for the *request*, and the model's context window has to hold the
+/// request **plus** the answer it generates. Nothing here checks that: raising this past
+/// `window - `[`crate::llm::client::DEFAULT_MAX_TOKENS`] (or past the tighter ceiling the
+/// structured routes of [`crate::agent::Agent`] apply) leaves a request that fits on its
+/// own and still overflows once the model starts writing. Tool definitions come out of the
+/// same window and are not counted either, so a large toolbox wants more headroom still.
+/// The default is chosen to leave room for all of it on a 32k window.
 pub fn max_history_tokens() -> usize {
   parsed_var_nonzero(ENV_MAX_HISTORY_TOKENS, DEFAULT_MAX_HISTORY_TOKENS)
 }

@@ -22,8 +22,9 @@
 //! caller would reach through `schemars::JsonSchema`.
 
 use async_openai::types::chat::{
-  ChatCompletionMessageToolCalls, ChatCompletionToolChoiceOption, ChatCompletionTools,
-  FinishReason, ResponseFormat, ToolChoiceOptions,
+  ChatCompletionMessageToolCalls, ChatCompletionRequestSystemMessageArgs,
+  ChatCompletionToolChoiceOption, ChatCompletionTools, FinishReason, ResponseFormat,
+  ToolChoiceOptions,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -85,9 +86,9 @@ impl Agent {
 
   /// Run to a structured final answer given a JSON Schema `Value` at runtime, instead of a
   /// compile-time Rust type — the counterpart to [`Self::run_structured`] for callers that do
-  /// not have (or want) a Rust type for the answer, e.g. the HTTP API (see
-  /// [`crate::api::dto::StructuredSchemaRequest`]), where the schema arrives as part of the
-  /// request body.
+  /// not have (or want) a Rust type for the answer, e.g. an HTTP API whose clients send the
+  /// schema as part of the request body, where the shape is only known once the request
+  /// arrives.
   ///
   /// `name` is OpenAI's naming constraint on `function.name` / `response_format.json_schema.name`
   /// (1-64 characters, `[a-zA-Z0-9_-]`), checked with [`validate_schema_name`] up front — a
@@ -176,7 +177,8 @@ impl Agent {
         final_answer_only
       };
 
-      let messages = self.build_messages(&context)?;
+      let request = self.prepare_llm_request(&context).await;
+      let messages = self.build_messages(request)?;
       let mut builder = request_builder(&self.model, messages, DEFAULT_MAX_TOKENS, definitions);
       builder.tool_choice(ChatCompletionToolChoiceOption::Mode(
         ToolChoiceOptions::Required,
@@ -324,8 +326,11 @@ impl Agent {
       // unconstrained it would reply in prose and fail to parse. On tool-calling rounds
       // `content` is empty anyway, so the constraint is harmless there.
       let messages = match &schema_hint {
-        Some(hint) => self.messages_with_schema_hint(&context, hint)?,
-        None => self.build_messages(&context)?,
+        Some(hint) => self.messages_with_schema_hint(&context, hint).await?,
+        None => {
+          let request = self.prepare_llm_request(&context).await;
+          self.build_messages(request)?
+        }
       };
       // Reasoning models keep `max_tokens` covering chain-of-thought + answer, so the
       // structured budget applies here too (see `structured::JSON_OBJECT_MAX_TOKENS`).
@@ -401,14 +406,21 @@ impl Agent {
 
   /// Like [`Self::build_messages`] but appends a one-off system message carrying the schema
   /// hint, used by the `json_object` response-format route.
-  fn messages_with_schema_hint(
+  ///
+  /// Goes through [`Self::prepare_llm_request_with_trailer`] so the before-LLM hook chain
+  /// (token budget trimming, and anything else registered) applies here exactly as it does
+  /// on the plain route — *and* so the hint is counted against that budget, which is what
+  /// the trailer dance exists for. The hint is emitted after the conversation rather than
+  /// among the leading system messages: under `json_object` the schema is only
+  /// prompt-guided, and models follow it far more reliably when it is the last thing they
+  /// read.
+  async fn messages_with_schema_hint(
     &self,
     context: &ExecutionContext,
     hint: &str,
   ) -> anyhow::Result<Vec<async_openai::types::chat::ChatCompletionRequestMessage>> {
-    use async_openai::types::chat::ChatCompletionRequestSystemMessageArgs;
-
-    let mut messages = self.build_messages(context)?;
+    let request = self.prepare_llm_request_with_trailer(context, hint).await;
+    let mut messages = self.build_messages(request)?;
     messages.push(
       ChatCompletionRequestSystemMessageArgs::default()
         .content(hint)

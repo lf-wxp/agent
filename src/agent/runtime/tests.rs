@@ -1,11 +1,17 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{
+  Mutex,
+  atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use serde_json::json;
 
 use super::*;
-use crate::tools::{
-  Tool,
-  calculator::{self, Calculator},
+use crate::{
+  agent::llm_request::LlmRequest,
+  tools::{
+    Tool,
+    calculator::{self, Calculator},
+  },
 };
 
 fn agent_with(toolbox: ToolRegistry) -> Agent {
@@ -37,15 +43,188 @@ fn with_max_steps_overrides_the_default() {
 }
 
 #[test]
-fn new_defaults_max_history_tokens_to_the_shared_config() {
+fn new_registers_the_default_budget_trim() {
   let agent = agent_with(ToolRegistry::empty());
-  assert_eq!(agent.max_history_tokens, config::max_history_tokens());
+  assert_eq!(
+    agent.before_llm_callbacks.len(),
+    1,
+    "a ContextOptimizer should be registered by default"
+  );
 }
 
-#[test]
-fn with_max_history_tokens_overrides_the_default() {
-  let agent = agent_with(ToolRegistry::empty()).with_max_history_tokens(42);
-  assert_eq!(agent.max_history_tokens, 42);
+/// A long conversation under a tiny budget: the request must shrink, the head must
+/// survive, and `context.events` must be untouched either way.
+#[tokio::test]
+async fn a_tight_budget_trims_the_request_but_not_the_transcript() {
+  let agent = agent_with(ToolRegistry::empty())
+    .clear_before_llm_callbacks()
+    .with_before_llm_callback(Arc::new(ContextOptimizer::new(200)));
+  let mut context = ExecutionContext::new();
+  let id = context.execution_id.clone();
+
+  context.add_event(Event::new(
+    id.clone(),
+    "user",
+    vec![ContentItem::Message {
+      role: "user".to_owned(),
+      content: "the original task".to_owned(),
+    }],
+  ));
+  for i in 0..20 {
+    context.add_event(Event::new(
+      id.clone(),
+      "agent",
+      vec![ContentItem::Message {
+        role: "assistant".to_owned(),
+        content: format!("step {i} {}", "word ".repeat(200)),
+      }],
+    ));
+  }
+
+  let request = agent.prepare_llm_request(&context).await;
+
+  assert!(
+    request.contents.len() < context.events.len(),
+    "the request copy should have been trimmed"
+  );
+  let ContentItem::Message { content, .. } = &request.contents[0] else {
+    panic!("expected the pinned head to still be a message");
+  };
+  assert_eq!(content, "the original task", "the head is pinned");
+  assert_eq!(
+    context.events.len(),
+    21,
+    "context.events must stay intact (non-destructive)"
+  );
+}
+
+#[tokio::test]
+async fn clearing_the_chain_drops_the_default_trim() {
+  let agent = agent_with(ToolRegistry::empty()).clear_before_llm_callbacks();
+  let mut context = ExecutionContext::new();
+
+  context.add_event(Event::new(
+    context.execution_id.clone(),
+    "user",
+    vec![ContentItem::Message {
+      role: "user".to_owned(),
+      content: "word".repeat(50_000),
+    }],
+  ));
+
+  let request = agent.prepare_llm_request(&context).await;
+
+  assert_eq!(
+    request.contents.len(),
+    1,
+    "with no hooks left the transcript is sent as-is"
+  );
+}
+
+#[tokio::test]
+async fn hooks_run_in_registration_order_after_the_default_trim() {
+  struct AddInstruction;
+
+  #[async_trait::async_trait]
+  impl BeforeLlmCallback for AddInstruction {
+    async fn call(&self, _context: &ExecutionContext, request: &mut LlmRequest) {
+      request.push_instruction(format!("saw {} item(s)", request.contents.len()));
+    }
+  }
+
+  let agent = agent_with(ToolRegistry::empty())
+    .clear_before_llm_callbacks()
+    .with_before_llm_callback(Arc::new(ContextOptimizer::new(200)))
+    .with_before_llm_callback(Arc::new(AddInstruction));
+  let mut context = ExecutionContext::new();
+  let id = context.execution_id.clone();
+
+  context.add_event(Event::new(
+    id.clone(),
+    "user",
+    vec![ContentItem::Message {
+      role: "user".to_owned(),
+      content: "the original task".to_owned(),
+    }],
+  ));
+  for i in 0..20 {
+    context.add_event(Event::new(
+      id.clone(),
+      "agent",
+      vec![ContentItem::Message {
+        role: "assistant".to_owned(),
+        content: format!("step {i} {}", "word ".repeat(200)),
+      }],
+    ));
+  }
+
+  let request = agent.prepare_llm_request(&context).await;
+
+  let seen = request
+    .instructions
+    .first()
+    .expect("the second hook should have pushed an instruction");
+  assert_ne!(
+    seen, "saw 21 item(s)",
+    "the hook must observe the already-trimmed contents, not the full transcript"
+  );
+  assert_eq!(seen, &format!("saw {} item(s)", request.contents.len()));
+}
+
+/// A trailing system message (the `json_object` schema hint) is part of what goes on the
+/// wire, so the hook chain has to be able to measure it — otherwise every token budget
+/// undercounts by exactly its length, on the route where that text is most likely to be a
+/// large generated schema.
+#[tokio::test]
+async fn a_trailer_is_visible_to_the_hook_chain() {
+  struct RecordInstructions(Arc<Mutex<Vec<String>>>);
+
+  #[async_trait::async_trait]
+  impl BeforeLlmCallback for RecordInstructions {
+    async fn call(&self, _context: &ExecutionContext, request: &mut LlmRequest) {
+      *self.0.lock().expect("not poisoned") = request.instructions.clone();
+    }
+  }
+
+  let seen = Arc::new(Mutex::new(Vec::new()));
+  let agent = agent_with(ToolRegistry::empty())
+    .clear_before_llm_callbacks()
+    .with_before_llm_callback(Arc::new(RecordInstructions(Arc::clone(&seen))));
+
+  let request = agent
+    .prepare_llm_request_with_trailer(&ExecutionContext::new(), "reply with JSON")
+    .await;
+
+  assert!(
+    seen
+      .lock()
+      .expect("not poisoned")
+      .iter()
+      .any(|instruction| instruction == "reply with JSON"),
+    "the hook must see the trailer, or it cannot charge it to the budget"
+  );
+  assert!(
+    !request.instructions.iter().any(|i| i == "reply with JSON"),
+    "the caller places the trailer itself, so it must not also be left up front"
+  );
+}
+
+/// Only the trailer is taken back out — an agent's own system prompt (and anything a hook
+/// added) has to survive it.
+#[tokio::test]
+async fn removing_the_trailer_leaves_the_other_instructions_alone() {
+  let agent = Agent::new(
+    Provider::shared().clone(),
+    "gpt-test",
+    Some("be nice"),
+    Arc::new(ToolRegistry::empty()),
+  );
+
+  let request = agent
+    .prepare_llm_request_with_trailer(&ExecutionContext::new(), "reply with JSON")
+    .await;
+
+  assert_eq!(request.instructions, vec!["be nice".to_owned()]);
 }
 
 #[test]
@@ -87,7 +266,8 @@ fn build_messages_replays_system_user_tool_call_and_result() {
     }],
   ));
 
-  let messages = agent.build_messages(&context).unwrap();
+  let request = LlmRequest::new(Some("be nice".to_owned()), &context.events);
+  let messages = agent.build_messages(request).unwrap();
 
   assert_eq!(messages.len(), 4, "system + user + assistant + tool");
   assert!(matches!(
@@ -125,7 +305,8 @@ fn build_messages_merges_consecutive_tool_calls_into_one_assistant_message() {
     ],
   ));
 
-  let messages = agent.build_messages(&context).unwrap();
+  let request = LlmRequest::new(None, &context.events);
+  let messages = agent.build_messages(request).unwrap();
   assert_eq!(messages.len(), 1);
   let ChatCompletionRequestMessage::Assistant(assistant) = &messages[0] else {
     panic!("expected an assistant message");
@@ -452,7 +633,7 @@ fn seed_context_appends_the_new_turn_after_prior_history() {
     }],
   )];
 
-  let context = agent.seed_context(prior, "follow up");
+  let context = agent.seed_context(prior.into(), "follow up");
 
   assert_eq!(context.events.len(), 2, "prior turn plus the new user turn");
   assert_eq!(context.events[0].author, "user");
@@ -467,7 +648,7 @@ fn seed_context_appends_the_new_turn_after_prior_history() {
 #[test]
 fn seed_context_with_empty_history_only_has_the_new_turn() {
   let agent = agent_with(ToolRegistry::empty());
-  let context = agent.seed_context(Vec::new(), "hi");
+  let context = agent.seed_context(Vec::new().into(), "hi");
   assert_eq!(context.events.len(), 1);
 }
 

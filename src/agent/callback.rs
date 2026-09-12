@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use crate::agent::{ExecutionContext, ToolResultStatus};
+use crate::agent::{ExecutionContext, ToolResultStatus, llm_request::LlmRequest};
 
 /// The call a [`BeforeToolCallback`] is being asked to rule on.
 #[derive(Debug, Clone, Copy)]
@@ -57,4 +57,22 @@ pub trait AfterToolCallback: Send + Sync {
     status: ToolResultStatus,
     content: &str,
   ) -> Option<(ToolResultStatus, String)>;
+}
+
+/// Runs on every round, after [`LlmRequest`] is built from [`ExecutionContext::events`]
+/// and before it is converted into API messages.
+///
+/// Implementations may read `context` (for auditing or budget decisions) and freely mutate
+/// `request` — trimming [`LlmRequest::contents`], appending instructions, compressing tool
+/// results, injecting retrieved snippets. All of it stays local to this round's request.
+/// `context` is borrowed immutably on purpose: the transcript is the authoritative record
+/// and no hook on this path may rewrite it.
+///
+/// Hooks run in registration order, each seeing the previous one's edits, so an ordering
+/// choice matters: the default
+/// [`crate::callback::context_optimizer::ContextOptimizer`] sits first in the chain
+/// and therefore does not account for content a later hook adds.
+#[async_trait::async_trait]
+pub trait BeforeLlmCallback: Send + Sync {
+  async fn call(&self, context: &ExecutionContext, request: &mut LlmRequest);
 }
