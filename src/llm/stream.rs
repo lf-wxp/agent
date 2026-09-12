@@ -6,7 +6,7 @@ use crate::{
   llm::{
     client::{DEFAULT_MAX_TOKENS, build_messages, ensure_valid_params, request_builder},
     provider::Provider,
-    retry::with_retry,
+    retry::{is_transient, with_retry},
     tool_calls::ToolCallAccumulator,
     tool_loop::{append_tool_results, disable_tools},
   },
@@ -150,8 +150,9 @@ pub async fn chat_stream_with_retry(
       }
       Ok(output)
     },
-    // No deterministic-failure marker at this level yet; retry every failure.
-    |_| true,
+    // A stream that failed deterministically (rejected key, unknown model, malformed
+    // request) reopens to the identical failure, so only transient ones are retried.
+    is_transient,
   )
   .await
 }

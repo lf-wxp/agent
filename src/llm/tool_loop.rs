@@ -19,7 +19,7 @@ use crate::{
   llm::{
     client::{first_choice, request_builder},
     provider::Provider,
-    retry::with_retry,
+    retry::{is_transient, with_retry},
   },
   tools::ToolRegistry,
   util::truncate_chars,
@@ -102,15 +102,17 @@ pub async fn run(
       );
     }
 
-    // Transient failures (rate limits, network blips) are retried with backoff; there is
-    // nothing deterministic to skip at this level, so every failure is eligible.
+    // Transient failures (rate limits, network blips) are retried with backoff.
+    // `is_transient` filters out the deterministic ones — a rejected key or a malformed
+    // request fails identically on every attempt, so retrying only spends the budget and
+    // delays the real error.
     let response = with_retry(
       || async {
         let _permit = provider.acquire().await?;
         let response = provider.client().chat().create(builder.build()?).await?;
         anyhow::Ok(response)
       },
-      |_| true,
+      is_transient,
     )
     .await?;
     // The full response can be long; only log metadata to inspect usage and trace id.

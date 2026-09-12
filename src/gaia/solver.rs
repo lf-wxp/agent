@@ -4,7 +4,7 @@ use crate::{
   gaia::models::{GaiaOutput, Solution},
   llm::{
     provider::Provider,
-    retry::with_retry,
+    retry::{is_transient, with_retry},
     structured::{TruncatedOutput, chat_complete_structured_raw},
     tool_loop::BudgetExhausted,
   },
@@ -22,9 +22,11 @@ pub async fn solve_problem_with_retry(
     || solve_problem(provider, model, system, prompt, registry),
     // Skip deterministic failures, where a retry only burns resources for the same outcome:
     // a max_tokens truncation repeats token spend, and a budget-exhausted attempt replays
-    // the entire tool round budget.
+    // the entire tool round budget. `is_transient` adds the provider-level half of the
+    // same rule (a rejected key, an unknown model, a malformed request).
     |err: &anyhow::Error| {
-      err.downcast_ref::<TruncatedOutput>().is_none()
+      is_transient(err)
+        && err.downcast_ref::<TruncatedOutput>().is_none()
         && err.downcast_ref::<BudgetExhausted>().is_none()
     },
   )
