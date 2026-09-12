@@ -1,0 +1,18 @@
+# Workspace-wide Cargo settings.
+
+[build]
+# Document private items by default.
+#
+# The doc comments in this workspace deliberately explain *how* things work, not just
+# what they expose: a public method's docs routinely point at the private helper that
+# implements the step being described (`Agent::execute_tool_calls`, `disable_tools`,
+# `SENSITIVE_HOME_SUBPATHS`, ...). Those references are the main reason the docs are
+# worth reading, and they are correct — they name real items.
+#
+# Without this flag rustdoc refuses to link them (`private_intra_doc_links`), renders
+# them as dead plain text, and emits a warning per occurrence. Its own diagnostic
+# recommends exactly this flag as the fix. Since this crate is not published — the docs
+# exist for people working *on* it, not consuming it from crates.io — documenting the
+# internals is what makes `cargo doc --open` useful here, and it turns those references
+# back into working links.
+rustdocflags = ["--document-private-items"]

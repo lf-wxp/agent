@@ -1,0 +1,221 @@
+# Build/QA entry points for this repository, driven by `cargo make` (cargo-make).
+#
+# Why a task runner at all: this repo is not one `cargo build` away from being checked.
+# It is a native package (tokio/axum, `src/`, `examples/`, `tests/`) that *also* roots a
+# workspace whose other members compile to `wasm32-unknown-unknown` through `trunk`
+# (`crates/shared`, `crates/web-ui`). Nothing in plain Cargo covers both halves in one
+# command: `cargo clippy --all-targets` at the root sees only the native package, the
+# wasm members need an explicit `--target` (and that target installed), and the Web UI
+# bundle needs `trunk` rather than Cargo at all. The result used to be a README section
+# listing the commands and a reader expected to remember which ones apply to which half.
+# The tasks below encode that instead, so `cargo make ci` is the whole gate.
+#
+# Install once: `cargo install cargo-make`. Then `cargo make --list-all-steps` lists
+# everything defined here.
+
+[config]
+min_version = "0.37.0"
+# The workspace members are the wasm half, and they are handled deliberately (see
+# `clippy-wasm`/`web`), not by running every task once per member: `cargo make test`
+# fanned out across the workspace would try to run the native test suite inside
+# `crates/web-ui`, which has no test suite and does not build for the host target.
+default_to_workspace = false
+# cargo-make ships a large set of predefined tasks (coverage, release automation,
+# CI provisioning, ...) that this repo does not use and whose names (`build`, `check`,
+# `test`) would silently take precedence over the intent below. Opting out keeps this
+# file the single source of truth for what a task name means here.
+skip_core_tasks = true
+skip_git_env_info = true
+skip_rust_env_info = true
+
+[env]
+# The Leptos UI's compilation target. Named once because it appears both as a
+# `--target` argument and in the `rustup target add` guard.
+WASM_TARGET = "wasm32-unknown-unknown"
+# `crates/web-ui` is the wasm crate proper; `crates/shared` is compiled into it (and
+# into the native binary), so it is linted for both targets rather than only the host.
+WASM_PACKAGES = "-p web-ui -p shared"
+WEB_UI_DIR = "crates/web-ui"
+
+# ---------------------------------------------------------------------------
+# Default
+# ---------------------------------------------------------------------------
+
+# A bare `cargo make` runs the same gate CI does — the point being that "it passed
+# locally" and "it passed in CI" cannot diverge through someone running a shorter
+# command by habit.
+[tasks.default]
+alias = "ci"
+
+# ---------------------------------------------------------------------------
+# Formatting
+# ---------------------------------------------------------------------------
+
+[tasks.fmt]
+description = "Format every crate in the workspace (2-space indent, see rustfmt.toml)"
+category = "Development"
+command = "cargo"
+args = ["fmt", "--all"]
+
+[tasks.fmt-check]
+description = "Fail if anything is unformatted, without rewriting files"
+category = "CI"
+command = "cargo"
+args = ["fmt", "--all", "--", "--check"]
+
+# ---------------------------------------------------------------------------
+# Native half: `src/`, `examples/`, `tests/`
+# ---------------------------------------------------------------------------
+
+[tasks.check]
+description = "Type-check the native package including examples, tests and benches"
+category = "Development"
+command = "cargo"
+# `--all-targets` matters more than usual here: the 19 files under `examples/` are part
+# of the documented API surface (the README points at them), so they have to keep
+# compiling, and they are not built by a plain `cargo check`.
+args = ["check", "--all-targets"]
+
+[tasks.clippy]
+description = "Lint the native package; any warning is an error"
+category = "CI"
+command = "cargo"
+args = ["clippy", "--all-targets", "--", "-D", "warnings"]
+
+[tasks.test]
+description = "Run unit tests, integration tests and doctests"
+category = "CI"
+command = "cargo"
+args = ["test"]
+
+[tasks.doc]
+description = "Build the API docs (private items included, see .cargo/config.toml)"
+category = "Development"
+command = "cargo"
+args = ["doc", "--no-deps"]
+
+# ---------------------------------------------------------------------------
+# Wasm half: crates/shared + crates/web-ui
+# ---------------------------------------------------------------------------
+
+# Every wasm task depends on this rather than assuming the target is present: a fresh
+# clone has only the host target, and the failure without it (`can't find crate for
+# core`) does not say "run rustup". Adding an already-installed target is a no-op, so
+# this is cheap to repeat.
+[tasks.wasm-target]
+description = "Ensure the wasm32-unknown-unknown target is installed"
+category = "Setup"
+script_runner = "@shell"
+script = '''
+if ! rustup target list --installed | grep -qx "${WASM_TARGET}"; then
+  echo "Installing Rust target ${WASM_TARGET}..."
+  rustup target add "${WASM_TARGET}"
+fi
+'''
+
+[tasks.check-wasm]
+description = "Type-check the Leptos UI and the shared wire types for wasm"
+category = "Development"
+dependencies = ["wasm-target"]
+command = "cargo"
+args = ["check", "@@split(WASM_PACKAGES, )", "--target", "${WASM_TARGET}", "--all-targets"]
+
+[tasks.clippy-wasm]
+description = "Lint the wasm crates; any warning is an error"
+category = "CI"
+dependencies = ["wasm-target"]
+command = "cargo"
+args = [
+  "clippy",
+  "@@split(WASM_PACKAGES, )",
+  "--target",
+  "${WASM_TARGET}",
+  "--all-targets",
+  "--",
+  "-D",
+  "warnings",
+]
+
+# ---------------------------------------------------------------------------
+# Web UI bundle (trunk)
+# ---------------------------------------------------------------------------
+
+# `trunk` is what turns `crates/web-ui` into the `dist/` directory the CLI serves in
+# `--mode web`/`both`; `install_crate` installs it on first use instead of failing with
+# "command not found" (skipped when a `trunk` — homebrew's, say — is already on PATH).
+[tasks.web]
+description = "Build the Web UI bundle into crates/web-ui/dist (debug)"
+category = "Development"
+dependencies = ["wasm-target"]
+cwd = "${WEB_UI_DIR}"
+install_crate = { crate_name = "trunk", binary = "trunk", test_arg = "--version" }
+command = "trunk"
+args = ["build"]
+
+[tasks.web-release]
+description = "Build the size-optimized Web UI bundle (opt-level=z, see Cargo.toml)"
+category = "Build"
+dependencies = ["wasm-target"]
+cwd = "${WEB_UI_DIR}"
+install_crate = { crate_name = "trunk", binary = "trunk", test_arg = "--version" }
+command = "trunk"
+args = ["build", "--release"]
+
+# Front-end development loop: `trunk`'s own server with hot reload, proxying `/api/*` to
+# a separately running `cargo make cli -- --mode web`.
+[tasks.web-serve]
+description = "Serve the Web UI with hot reload (expects `cli --mode web` alongside)"
+category = "Development"
+dependencies = ["wasm-target"]
+cwd = "${WEB_UI_DIR}"
+install_crate = { crate_name = "trunk", binary = "trunk", test_arg = "--version" }
+command = "trunk"
+args = ["serve"]
+
+# ---------------------------------------------------------------------------
+# Build & run
+# ---------------------------------------------------------------------------
+
+# The release artifact is both halves: the native binary alone cannot serve the Web UI,
+# because `AGENT_CLI_WEB_DIST_DIR` points at `trunk`'s output rather than at anything
+# embedded in the executable.
+[tasks.build]
+description = "Release build: native binaries + Web UI bundle"
+category = "Build"
+dependencies = ["web-release"]
+command = "cargo"
+args = ["build", "--release"]
+
+[tasks.cli]
+description = "Run the interactive CLI (`cargo make cli -- --mode both`)"
+category = "Development"
+command = "cargo"
+args = ["run", "--bin", "cli", "--", "${@}"]
+
+[tasks.clean]
+description = "Remove Cargo's target/ and the Web UI's dist/"
+category = "Build"
+script_runner = "@shell"
+script = '''
+cargo clean
+rm -rf "${WEB_UI_DIR}/dist"
+'''
+
+# ---------------------------------------------------------------------------
+# Aggregates
+# ---------------------------------------------------------------------------
+
+# Ordered cheapest-first so the fastest failure is the one reported: formatting before
+# linting, native before wasm (the wasm crates pull a second dependency tree and a
+# second target directory), tests last.
+[tasks.ci]
+description = "Everything a PR must pass: fmt, clippy (native + wasm), tests"
+category = "CI"
+dependencies = ["fmt-check", "clippy", "clippy-wasm", "test"]
+
+# Same coverage as `ci`, but formats instead of complaining about formatting — the
+# version to run mid-change rather than before pushing.
+[tasks.dev]
+description = "Local loop: format, then lint (native + wasm) and test"
+category = "Development"
+dependencies = ["fmt", "clippy", "clippy-wasm", "test"]
