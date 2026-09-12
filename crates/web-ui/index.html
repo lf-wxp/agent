@@ -9,6 +9,26 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <title>agent · web</title>
+    <!-- `data-trunk rel="icon"`: trunk copies the file into `dist/` (hashed) and rewrites
+         this tag's `href` to match, so the icon is part of the build rather than a path
+         that has to stay correct by hand.
+
+         SVG only, and no `apple-touch-icon`: both of those would mean committing a binary
+         raster nothing in this repo can regenerate. Every browser new enough to run a
+         wasm SPA renders an SVG favicon, and this page is only ever reached at
+         `127.0.0.1` from a developer's own machine — not a general-purpose site that has
+         to cover legacy tab strips and home-screen shortcuts.
+
+         It also stops the browser's implicit `GET /favicon.ico`, which the CLI's static
+         file service answers with `index.html` (its `ServeDir` fallback — see
+         `src/bin/cli/web.rs`): harmless, since the browser discards a non-image, but a
+         confusing entry in the network log all the same.
+
+         No `type="image/svg+xml"` here: trunk emits the `<link>` itself and keeps only
+         `rel`/`href`, so the attribute would silently not survive the build. The MIME
+         type comes from the response header instead — `ServeDir` derives it from the
+         `.svg` extension. -->
+    <link data-trunk rel="icon" href="favicon.svg" />
     <link data-trunk rel="rust" href="Cargo.toml" />
   </head>
   <body></body>

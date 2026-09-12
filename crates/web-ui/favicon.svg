@@ -1,0 +1,36 @@
+<!-- Tab icon for the local Web UI: a terminal prompt chevron and a block cursor, in the
+     same amber/teal on near-black palette as the page itself (see `src/style.css`). The
+     header's brand mark is the word "agent" followed by a blinking amber block; this is
+     the same idea minus the word, which is illegible at 16px.
+
+     Drawn rather than exported: this is the whole icon, in a diff-able form. An `.ico`
+     or `.png` would be an opaque binary in the tree that nothing here can regenerate.
+
+     Note that XML comments cannot contain two consecutive hyphens, so the CSS custom
+     properties this palette comes from are named below without their leading dashes.
+
+     Geometry sits on a 32-unit grid with whole and half coordinates so the 16px
+     rendering (the only size a browser tab ever shows) lands on pixel boundaries
+     instead of blurring across them, while `geometricPrecision` keeps the chevron's
+     diagonal smooth at the larger sizes bookmark bars and PWA lists use. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32"
+     shape-rendering="geometricPrecision">
+  <title>agent</title>
+  <!-- The plate: the `bg-elevated` color rather than `bg` (#0a0b0d), plus a faint rim.
+       Pure near-black vanishes into a dark tab strip; this keeps the icon a legible
+       shape against light and dark browser chrome alike. -->
+  <rect width="32" height="32" rx="7" fill="#14161a" />
+  <rect x="0.5" y="0.5" width="31" height="31" rx="6.5" fill="none"
+        stroke="#ffffff" stroke-opacity="0.16" />
+  <!-- Prompt chevron, in the teal that marks the agent/tool side of the conversation. -->
+  <path d="M8 10.5 L13.5 16 L8 21.5" fill="none" stroke="#2dd4bf" stroke-width="3"
+        stroke-linecap="round" stroke-linejoin="round" />
+  <!-- Block cursor, in the amber that marks the human side. Static, unlike the page's
+       blinking one: an animated tab icon reads as noise rather than as a flourish.
+
+       The 4.5-unit gap to the chevron's tip is sized for the 16px case: halve it and
+       the round cap bleeds into the block, leaving one amber-and-teal smudge instead
+       of two shapes. Both glyphs are pushed outward to buy that gap, which is why the
+       chevron starts at x=8 rather than sitting on an even margin. -->
+  <rect x="18" y="10" width="6" height="12" rx="1.5" fill="#f0b429" />
+</svg>
