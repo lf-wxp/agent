@@ -43,9 +43,14 @@
 //!
 //! Destructive tools (`delete_file` by default) prompt for a `y`/`n` before running, via
 //! [`agent::callback::dual_approval::DualApprovalCallback`] — see `--dangerous-tools` /
-//! `--no-approval` below. The prompt goes to the console for a terminal-originated turn
-//! and to the browser for a web-originated one (see [`mod@web`] and the `--mode` flag
-//! below), decided per turn rather than baked into one binary-wide choice. A bulky
+//! `--no-approval` below. The prompt belongs to the *session*, not to whichever front-end
+//! started the turn: it is shown in the terminal and in every connected browser tab at
+//! once, and the first answer from any of them decides. Answer in the terminal by typing
+//! `y`/`n` — inline when this terminal is running the turn, or at the `You>` prompt when
+//! a browser-submitted turn raised it. Nothing waits forever: an unanswered prompt denies
+//! after [`agent::config::approval_timeout`] (`AGENT_APPROVAL_TIMEOUT_SECS`), so walking
+//! away from a prompt cannot wedge the session — which matters because a turn holds the
+//! session's turn lock until it finishes. A bulky
 //! `web_search` result is compressed to the passages that answer the query before it
 //! enters the transcript, via
 //! [`agent::callback::search_compressor::SearchCompressorCallback`] — see
@@ -98,8 +103,14 @@
 //! being typed (loops back to a fresh prompt) rather than killing the process; `Ctrl-D`
 //! on an empty line still leaves the chat, same as before.
 //!
-//! In-chat commands: `/reset` clears the current session's history; `exit` / `quit`
-//! (or Ctrl-D) leaves the chat.
+//! In-chat commands are defined once in [`shared::commands`] and shared by both
+//! front-ends: `/help` lists them, `/reset` clears the current session's history,
+//! `exit`/`quit` (or Ctrl-D) leaves the chat. A command is handled before a turn starts,
+//! so it never reaches the model; its output is broadcast like anything else, so a
+//! command run in one view is visible in the others. Typing `/` here opens a menu of
+//! them to pick from (`Tab` reopens it, `↑`/`↓` walk it, `Enter` picks) rather than
+//! requiring that they be remembered — see [`mod@completer`]; the browser's composer
+//! offers the same menu over the same table.
 //!
 //! `--list` and `--rm <session>` are one-shot session-management commands: each prints
 //! its result and exits immediately, without starting a chat or touching the configured
@@ -114,20 +125,25 @@
 //! reason: there is no second user to keep out on this machine (see
 //! `docs/web-ui-plan.md`'s "非目标" section).
 
+mod commands;
+mod completer;
 mod web;
 
 use std::{
-  collections::HashMap,
-  io::{self, Write},
+  collections::{HashMap, VecDeque},
+  io::{self, IsTerminal, Write},
   net::SocketAddr,
   sync::Arc,
 };
 
 use agent::{
   Agent, AgentResult, AgentStreamEvent,
-  agent::Event,
+  agent::{Conversation, Event},
   callback::{
-    dual_approval::{ApprovalChannel, DualApprovalCallback, with_approval_channel},
+    dual_approval::{
+      ApprovalChannel, ApprovalRegistry, DualApprovalCallback, PendingApproval,
+      with_approval_channel,
+    },
     mcp_guard::McpGuardCallback,
     path_guard::WorkspaceGuardCallback,
     search_compressor::SearchCompressorCallback,
@@ -144,10 +160,11 @@ use crossterm::cursor::SetCursorStyle;
 use futures::{Stream, StreamExt};
 use reedline::{
   CursorConfig, EditMode as ReedlineEditMode, Emacs, Prompt, PromptEditMode, PromptHistorySearch,
-  Reedline, Signal, Vi, default_vi_insert_keybindings, default_vi_normal_keybindings,
+  Reedline, Signal, Vi, default_emacs_keybindings, default_vi_insert_keybindings,
+  default_vi_normal_keybindings,
 };
-use shared::{ChatEvent, MessageOrigin};
-use tokio::sync::{Mutex as AsyncMutex, broadcast};
+use shared::{ChatEvent, MessageOrigin, commands as command_set};
+use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc};
 
 const SYSTEM_PROMPT: &str =
   "You are a helpful, general-purpose assistant running in a command-line chat session.";
@@ -203,9 +220,6 @@ const LOCAL_SCOPE: &str = "local";
 
 const DEFAULT_SESSION_ID: &str = "default";
 
-/// Commands (case-insensitive) that leave the chat.
-const EXIT_COMMANDS: [&str; 4] = ["exit", "quit", ":q", "/exit"];
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
   telemetry::init()?;
@@ -248,8 +262,32 @@ async fn main() -> anyhow::Result<()> {
   }
   // Same `Agent`/session state either way — `--mode` only decides which front-end(s)
   // are actually driving turns against it this run (see the module docs).
-  let run_terminal = mode != "web";
   let run_web = mode != "cli";
+  // A REPL also needs somewhere to read from. `reedline` drives the terminal directly
+  // (raw mode, cursor shapes) and cannot work against a pipe or a closed stdin: asked to
+  // anyway, its first `read_line` fails outright ("Device not configured"), which used to
+  // take the whole process — and, under `--mode both`, the web server with it — down
+  // before the port it had just announced could serve anything.
+  //
+  // So the terminal half is only run when there is a terminal to run it on:
+  //
+  // - `--mode both` degrades to exactly `--mode web`, since that half was asked for and
+  //   works perfectly well on its own. Announced rather than done quietly: a missing REPL
+  //   is worth knowing about, and it is usually a sign this was launched from somewhere
+  //   that cannot host one (a detached/background job, an IDE's run panel, a pipe).
+  // - `--mode cli` has nothing left to fall back to, so it is an error, naming the mode
+  //   that would have worked instead.
+  let stdin_is_tty = io::stdin().is_terminal();
+  if !stdin_is_tty && !run_web {
+    anyhow::bail!(
+      "--mode cli needs an interactive terminal, but stdin is not a TTY. Use `--mode web` \
+       for a browser-only session."
+    );
+  }
+  let run_terminal = mode != "web" && stdin_is_tty;
+  if run_web && !run_terminal && mode == "both" {
+    println!("Note: stdin is not a TTY, so there is no terminal prompt — serving the web UI only.");
+  }
 
   let session_id = args
     .get("session")
@@ -335,6 +373,12 @@ async fn main() -> anyhow::Result<()> {
   // originated and a web-originated turn race on the same session.
   let turn_lock = Arc::new(AsyncMutex::new(()));
 
+  // The session's in-flight approvals, shared with the web server exactly like
+  // `turn_lock` is: a terminal and a browser pointed at this session are two views of one
+  // conversation, so either must be able to answer a prompt the other raised. See
+  // `agent::callback::dual_approval`'s module docs.
+  let approvals = Arc::new(ApprovalRegistry::new());
+
   // Created unconditionally (even in `--mode cli`, where nothing ever subscribes to
   // it): every turn this loop runs broadcasts onto it below, and gating that behind
   // `if run_web` would mean duplicating the loop body instead of just letting a
@@ -360,11 +404,23 @@ async fn main() -> anyhow::Result<()> {
       Arc::clone(&store),
       Arc::clone(&turn_lock),
       session_id.clone(),
+      Arc::clone(&approvals),
       web_events_tx.clone(),
     ));
     let dist_dir = config::cli_web_dist_dir();
+    // Bound here, not inside the spawned task: the port being taken is the ordinary way
+    // this fails, and `--mode both` detaches that task, so binding in there meant the
+    // error went nowhere while the banner below had already announced the UI was up.
+    // Failing on this `?` also keeps `--mode both` from starting a terminal session that
+    // silently has no browser half.
+    let listener = web::bind(addr).await?;
+    // Only now that the port is actually claimed — a browser opened the moment this
+    // appears cannot arrive before the listener does.
     println!("Web UI: http://{addr} (session `{session_id}`)\n");
-    let handle = tokio::spawn(async move { web::serve(state, addr, &dist_dir).await });
+    if let Some(warning) = web::dist_warning(&dist_dir) {
+      println!("Warning: {warning}\n");
+    }
+    let handle = tokio::spawn(async move { web::serve(state, listener, &dist_dir).await });
 
     if !run_terminal {
       // `--mode web`: no REPL to keep the process alive, so this *is* the run — block
@@ -373,10 +429,23 @@ async fn main() -> anyhow::Result<()> {
       handle.await.context("web server task panicked")??;
       return Ok(());
     }
-    // `--mode both`: intentionally not awaited/stored anywhere further — dropping the
-    // `JoinHandle` detaches the task (it keeps running; only *awaiting* the handle would
-    // block here). It shares the exact same `Arc` clones as the REPL loop below, so it
-    // needs no further wiring to participate in the same session.
+    // `--mode both`: the REPL below is what keeps this process alive, so the server runs
+    // on as a task this thread never awaits. Its *outcome* is still watched, by a second
+    // task — an `axum::serve` that stops mid-run leaves every browser tab dead while the
+    // terminal carries on working, which is not something to find out by guessing. Only
+    // reachable if the server stops early; a healthy one never resolves.
+    tokio::spawn(async move {
+      let report = match handle.await {
+        Ok(Ok(())) => "web server stopped".to_owned(),
+        Ok(Err(err)) => format!("web server stopped: {err:#}"),
+        Err(err) => format!("web server panicked: {err}"),
+      };
+      tracing::error!("{report}");
+      // Also straight to the terminal, via `term_write` for the raw-mode reasons that
+      // function documents: `tracing` output is not necessarily visible here, and this
+      // is exactly the kind of thing someone sitting at the `You>` prompt needs told.
+      term_write(&format!("\n[web] {report}\n"));
+    });
   }
 
   // Reaching here means `run_terminal` is true (the `--mode web` branch above always
@@ -397,29 +466,35 @@ async fn main() -> anyhow::Result<()> {
   // vi's modal keybindings by default (see the module docs); `--no-vi-mode` falls back
   // to `reedline`'s other mode, Emacs-style. This only affects how a line is *typed*;
   // nothing about the chat loop, history, or the model changes either way.
+  //
+  // Either way the command menu's keys are bound on top (see `completer`): in vi mode
+  // only over the *insert* bindings, since `/` in normal mode is vi's own search.
   let vi_mode = !args.contains_key("no-vi-mode");
   let edit_mode: Box<dyn ReedlineEditMode> = if vi_mode {
-    Box::new(Vi::new(
-      default_vi_insert_keybindings(),
-      default_vi_normal_keybindings(),
-    ))
+    let mut insert = default_vi_insert_keybindings();
+    completer::bind_menu_keys(&mut insert);
+    Box::new(Vi::new(insert, default_vi_normal_keybindings()))
   } else {
-    Box::new(Emacs::default())
+    let mut emacs = default_emacs_keybindings();
+    completer::bind_menu_keys(&mut emacs);
+    Box::new(Emacs::new(emacs))
   };
   let mut editor = Reedline::create()
     .with_edit_mode(edit_mode)
+    .with_completer(Box::new(completer::CommandCompleter))
+    .with_menu(completer::command_menu())
     .with_cursor_config(configure_cursor());
 
   println!(
-    "agent CLI — session `{session_id}` (model: {}) — workspace `{}`{}. Type `/reset` to \
-     clear history, `exit`/`quit` to leave.\n",
+    "agent CLI — session `{session_id}` (model: {}) — workspace `{}`{}. {}.\n",
     config::model(),
     workspace.display(),
     if args.contains_key("no-sandbox") {
       ""
     } else {
       " (sandboxed)"
-    }
+    },
+    command_set::hint()
   );
 
   loop {
@@ -433,11 +508,31 @@ async fn main() -> anyhow::Result<()> {
     if input.is_empty() {
       continue;
     }
-    if EXIT_COMMANDS.contains(&input.to_ascii_lowercase().as_str()) {
-      break;
+    // Commands are handled here rather than becoming a turn: none reaches the model or
+    // waits on the turn lock. Their output goes out on the broadcast like everything
+    // else, so a browser sharing this session sees it too — and so this terminal renders
+    // it through the one renderer (`print_chat_events`) rather than printing directly.
+    match command_set::parse(input) {
+      Some(command_set::Command::Exit) => break,
+      Some(command) => {
+        commands::execute(
+          command,
+          input,
+          MessageOrigin::Terminal,
+          &store,
+          &session_id,
+          &web_events_tx,
+        )
+        .await;
+        continue;
+      }
+      None => {}
     }
-    if input.eq_ignore_ascii_case("/reset") {
-      clear_session(&store, &session_id).await;
+    // A prompt raised by another view of this session — a browser-submitted turn — can
+    // be answered from here, since this terminal is idle while that turn runs. Checked
+    // before anything below treats the line as a message: while something is pending, a
+    // bare `y` is far more likely to be an answer than a chat turn.
+    if resolve_pending_approval(&approvals, &web_events_tx, input) {
       continue;
     }
 
@@ -466,35 +561,44 @@ async fn main() -> anyhow::Result<()> {
     // an earlier version of this loop did) is what makes a web-originated turn's output
     // show up in *this* terminal too, not just a browser tab's.
     if streaming {
-      let stream = run_turn_stream(
+      drive_terminal_turn(
         &agent,
         &store,
         &turn_lock,
+        &approvals,
         &session_id,
         input,
-        ApprovalChannel::Terminal,
-      );
-      futures::pin_mut!(stream);
-
-      while let Some(event) = stream.next().await {
-        let event = event?;
-        for chat_event in web::to_chat_events(&event, &turn) {
-          let _ = web_events_tx.send(chat_event);
-        }
-      }
+        &turn,
+        &web_events_tx,
+      )
+      .await?;
     } else {
       // `--no-stream`: one `run_turn` call instead of the streaming counterpart, so
       // nothing is printed until the model — and every tool round it runs along the way —
-      // has fully finished.
+      // has fully finished. Approvals still have to reach every view of the session while
+      // that happens, so they are published from a task running alongside the call rather
+      // than inline.
+      let (approval_tx, approval_rx) = mpsc::unbounded_channel::<PendingApproval>();
+      let pump = tokio::spawn(publish_approvals(
+        approval_rx,
+        Arc::clone(&approvals),
+        web_events_tx.clone(),
+      ));
+
       let result = run_turn(
         &agent,
         &store,
         &turn_lock,
         &session_id,
         input,
-        ApprovalChannel::Terminal,
+        ApprovalChannel::Session(approval_tx),
       )
-      .await?;
+      .await;
+
+      // Dropping the turn's sender ends the pump, which then clears anything it raised.
+      let raised = pump.await.unwrap_or_default();
+      approvals.discard(&raised);
+      let result = result?;
       // No per-round `ToolCallsStarted`/`Finished` to broadcast here (this branch never
       // sees them at all — see `run_turn`'s docs), just the final text and completion,
       // so a browser watching along at least sees *something* for a non-streaming turn
@@ -527,6 +631,241 @@ async fn main() -> anyhow::Result<()> {
 
   println!("Bye!");
   Ok(())
+}
+
+/// Run one terminal-originated streaming turn, publishing any approval it raises to the
+/// whole session and offering to answer it right here.
+///
+/// Mirrors [`web::drive_turn`] deliberately: both front-ends raise approvals the same way
+/// (to the shared [`ApprovalRegistry`], broadcast to every view) and both clear whatever
+/// they raised when the turn ends. The one asymmetry is that this side can also *ask* —
+/// stdin is free while a terminal turn runs, since the REPL is busy consuming this
+/// stream — whereas a browser-submitted turn leaves the terminal at its `You>` prompt,
+/// where [`resolve_pending_approval`] takes over instead.
+///
+/// The console read is a *branch* of the loop below rather than something awaited inside
+/// one. Awaiting it inline would stop polling `stream` for as long as the human took to
+/// answer — so a decision made in another view would unblock the agent, yet none of the
+/// events that followed would be drained or printed: both front-ends would sit silent
+/// until someone finally pressed Enter here.
+#[allow(clippy::too_many_arguments)]
+async fn drive_terminal_turn(
+  agent: &Agent,
+  store: &FileSessionStore,
+  turn_lock: &AsyncMutex<()>,
+  approvals: &Arc<ApprovalRegistry>,
+  session_id: &str,
+  input: &str,
+  turn: &str,
+  events: &broadcast::Sender<ChatEvent>,
+) -> anyhow::Result<()> {
+  let (approval_tx, mut approval_rx) = mpsc::unbounded_channel::<PendingApproval>();
+  let stream = run_turn_stream(
+    agent,
+    store,
+    turn_lock,
+    session_id,
+    input,
+    ApprovalChannel::Session(approval_tx),
+  );
+  futures::pin_mut!(stream);
+
+  let mut raised = Vec::new();
+  let mut failure = None;
+  // Tool calls in one round run concurrently, so several prompts can be outstanding at
+  // once; they are asked one at a time so two console prompts cannot interleave.
+  let mut queued: VecDeque<PendingApproval> = VecDeque::new();
+  let mut asking: Option<(String, tokio::task::JoinHandle<Option<bool>>)> = None;
+
+  loop {
+    // Take over the console for the next prompt that is still unanswered. The prompt
+    // itself was already drawn by `print_chat_events` when the broadcast went out — this
+    // only claims stdin to read the reply, and only one at a time, so two concurrent
+    // prompts cannot interleave their input.
+    if asking.is_none() {
+      while let Some(next) = queued.pop_front() {
+        if !approvals.is_pending(&next.id) {
+          continue;
+        }
+        asking = Some((next.id, tokio::task::spawn_blocking(read_approval_line)));
+        break;
+      }
+    }
+
+    tokio::select! {
+      pending = approval_rx.recv() => {
+        let Some(pending) = pending else {
+          // Every sender for this turn is gone; nothing more will arrive here, but the
+          // stream below is what actually ends the loop.
+          continue;
+        };
+        raised.push(pending.id.clone());
+        let _ = events.send(ChatEvent::ApprovalRequired {
+          id: pending.id.clone(),
+          tool: pending.tool.clone(),
+          arguments: pending.raw_arguments.clone(),
+        });
+        approvals.register(pending.id.clone(), pending.decision);
+        queued.push_back(PendingApproval {
+          // `decision` now lives in the registry; the queue only needs what it takes to
+          // render the prompt, so a placeholder channel stands in for it.
+          decision: tokio::sync::oneshot::channel().0,
+          ..pending
+        });
+      }
+      answered = async {
+                   // `&mut JoinHandle` is itself a future, so the handle stays in place
+                   // and other branches keep their claim on it across polls.
+                   (&mut asking.as_mut().expect("guarded by the condition below").1).await
+                 }, if asking.is_some() => {
+        let (id, _) = asking.take().expect("guarded above");
+        // `None` means stdin could not be read; leave the prompt for another view or the
+        // timeout. A stale answer (another view got there first) resolves nothing.
+        if let Some(approved) = answered.unwrap_or(None)
+          && approvals.resolve(&id, approved) {
+            let _ = events.send(ChatEvent::ApprovalResolved { id, approved });
+          }
+      }
+      next = stream.next() => {
+        match next {
+          Some(Ok(event)) => {
+            for chat_event in web::to_chat_events(&event, turn) {
+              let _ = events.send(chat_event);
+            }
+          }
+          Some(Err(err)) => {
+            failure = Some(err);
+            break;
+          }
+          None => break,
+        }
+      }
+    }
+  }
+
+  approvals.discard(&raised);
+
+  // A console read can still be outstanding here: another view answered the prompt first,
+  // or it timed out and the turn carried on without it. Either way the answer no longer
+  // matters — but the read itself cannot be cancelled, because a blocking stdin read stays
+  // parked until a line actually arrives.
+  //
+  // So it has to be waited out rather than abandoned. Handing the terminal back to
+  // `reedline` while this reader is still on stdin means two readers competing for it:
+  // `reedline` puts the terminal in raw mode and asks it for the cursor position, this
+  // reader consumes the reply, and `reedline` fails with "The cursor position could not be
+  // read within a normal duration". Blocking here until the line lands keeps stdin
+  // single-reader at all times, which is what makes returning to the prompt safe.
+  if let Some((_, handle)) = asking.take() {
+    term_write("\n(该审批已由其他界面处理，按回车返回输入)\n");
+    let _ = handle.await;
+  }
+
+  match failure {
+    Some(err) => Err(err),
+    None => Ok(()),
+  }
+}
+
+/// One blocking `y`/`n` read from the console. `None` if stdin is closed or unreadable
+/// (a non-interactive process, say), which the caller treats as "no answer from here".
+///
+/// Unbounded on purpose: the waiting side in [`agent::callback::dual_approval`] already
+/// applies [`agent::config::approval_timeout`], so bounding it here too would just race
+/// two clocks.
+fn read_approval_line() -> Option<bool> {
+  let mut input = String::new();
+  match io::stdin().read_line(&mut input) {
+    Ok(0) => None, // stdin closed.
+    Ok(_) => Some(input.trim().eq_ignore_ascii_case("y")),
+    Err(err) => {
+      tracing::warn!("failed to read approval answer: {err}");
+      None
+    }
+  }
+}
+
+/// Forward approvals raised by a non-streaming turn to the session, returning the ids it
+/// raised so the caller can clear them once the turn ends.
+///
+/// The `--no-stream` counterpart of the `approval_rx` arm in [`drive_terminal_turn`]:
+/// `run_turn` does not yield anything until it is completely finished, so without a task
+/// alongside it nothing would publish an approval while it waits — the turn would block
+/// on a prompt no view had been told about, until it timed out. This side does not ask on
+/// the console: stdin belongs to the blocked `run_turn` call's own callback path here, so
+/// the answer comes from a browser or from [`resolve_pending_approval`] afterwards.
+async fn publish_approvals(
+  mut approvals_rx: mpsc::UnboundedReceiver<PendingApproval>,
+  approvals: Arc<ApprovalRegistry>,
+  events: broadcast::Sender<ChatEvent>,
+) -> Vec<String> {
+  let mut raised = Vec::new();
+  while let Some(pending) = approvals_rx.recv().await {
+    let PendingApproval {
+      id,
+      tool,
+      raw_arguments,
+      decision,
+    } = pending;
+    raised.push(id.clone());
+    approvals.register(id.clone(), decision);
+    let _ = events.send(ChatEvent::ApprovalRequired {
+      id,
+      tool,
+      arguments: raw_arguments,
+    });
+  }
+  raised
+}
+
+/// Answer an approval raised by *another* view of this session — a browser-submitted turn
+/// asking about `delete_file` while this terminal sits idle at `You>`.
+///
+/// The terminal cannot prompt inline in that situation: it is not running the turn, and
+/// stdin belongs to `reedline`. So the REPL reads `y`/`n` as a decision instead of a
+/// message whenever something is pending. `true` if `line` was consumed here rather than
+/// being sent to the model.
+///
+/// Anything else typed while a prompt is outstanding is also consumed — with a reminder
+/// of what is being asked. Letting it through would start a second turn that immediately
+/// blocks on the turn lock the pending one still holds, so the reply would go nowhere and
+/// the prompt would stay unanswered; saying so beats that silent stall.
+fn resolve_pending_approval(
+  approvals: &ApprovalRegistry,
+  events: &broadcast::Sender<ChatEvent>,
+  line: &str,
+) -> bool {
+  let Some(id) = approvals.any_pending() else {
+    return false;
+  };
+
+  let approved = match line.to_ascii_lowercase().as_str() {
+    "y" | "yes" | "/approve" => true,
+    "n" | "no" | "/deny" => false,
+    _ => {
+      term_write("\n[approval] 有待处理的审批，请先输入 y（批准）或 n（拒绝）\n");
+      return true;
+    }
+  };
+
+  if approvals.resolve(&id, approved) {
+    let _ = events.send(ChatEvent::ApprovalResolved { id, approved });
+  }
+  true
+}
+
+/// The approval prompt as this terminal shows it, for a prompt raised by *any* view of
+/// the session.
+///
+/// One renderer so the two cases cannot drift apart: a browser-raised prompt used to get
+/// a one-line "waiting on a decision in the browser" — no arguments to judge it by, and
+/// no hint that it was answerable from here — while a terminal-raised one got the full
+/// block. They are the same prompt and carry the same options, so they read the same.
+///
+/// Raw arguments rather than parsed ones: a payload that failed to parse would render as
+/// `null`, and approving a call you cannot see is worse than not being asked.
+fn approval_prompt(tool: &str, raw_arguments: &str) -> String {
+  format!("\n⚠️  即将执行高危操作\n工具: {tool}\n参数: {raw_arguments}\n是否执行？(y/n): ")
 }
 
 /// The single renderer for every [`ChatEvent`] this process broadcasts on
@@ -580,21 +919,23 @@ fn print_chat_event(event: ChatEvent) {
         term_write(&format!("[tool] {} -> {:?}\n", result.name, result.status));
       }
     }
-    ChatEvent::ApprovalRequired { tool, .. } => {
-      // Purely informational here: the actual decision for a web-originated call is
-      // made in the browser (see `web::approve_handler`), and a terminal-originated
-      // call's own `DualApprovalCallback::prompt_terminal` already prints its own
-      // blocking `y`/`n` prompt directly — this print only covers the case this task
-      // would otherwise stay silent about, a *web*-originated call waiting on the
-      // browser.
-      term_write(&format!(
-        "\n[approval] `{tool}` is waiting on a decision in the browser\n"
-      ));
+    ChatEvent::SystemNotice { text } => term_write(&format!("\n{text}\n")),
+    ChatEvent::ApprovalRequired {
+      tool, arguments, ..
+    } => {
+      // The single place an approval prompt is rendered on this terminal, whichever view
+      // raised it — see `approval_prompt`. The turn driver does not print one of its own;
+      // it only broadcasts, and this arm (a subscriber like any other) draws it.
+      term_write(&approval_prompt(&tool, &arguments));
     }
     ChatEvent::ApprovalResolved { approved, .. } => {
       term_write(&format!(
-        "[approval] {}\n",
-        if approved { "approved" } else { "denied" }
+        "\n[approval] {}\n",
+        if approved {
+          "✅ 已批准，继续执行..."
+        } else {
+          "❌ 已拒绝，跳过执行"
+        }
       ));
     }
     ChatEvent::Done { .. } => term_write("\n\n"),
@@ -668,9 +1009,11 @@ fn normalize_line_endings(text: &str) -> String {
 /// lock for the whole turn instead serializes that race into a queue: the second turn's
 /// `history` load waits until the first one's `save` has completed.
 ///
-/// `channel` is where any [`DualApprovalCallback`] prompt this turn triggers should go —
-/// [`ApprovalChannel::Terminal`] for the loop above, `ApprovalChannel::Web(..)` for
-/// [`web::chat_handler`]. It is re-attached (via [`with_approval_channel`]) around each
+/// `channel` is where any [`DualApprovalCallback`] prompt this turn triggers should go.
+/// Both front-ends pass [`ApprovalChannel::Session`]: a prompt belongs to the session
+/// rather than to whoever started the turn, so either view can answer it (see
+/// [`drive_terminal_turn`] and [`web::drive_turn`]). It is re-attached (via
+/// [`with_approval_channel`]) around each
 /// individual `inner.next()` poll rather than around the whole stream once: a
 /// [`tokio::task_local!`] only stays set for the duration of the future it wraps, and
 /// `inner` (an `async_stream` generator, not something that itself takes a channel
@@ -687,7 +1030,10 @@ fn run_turn_stream<'a>(
     let _guard = turn_lock.lock().await;
     let history = store.history(LOCAL_SCOPE, session_id).await;
 
-    let inner = agent.run_continuing_stream(history, input);
+    let inner = agent.run_continuing_stream(
+      Conversation::new(session_id, history).with_scope(LOCAL_SCOPE),
+      input,
+    );
     futures::pin_mut!(inner);
 
     while let Some(event) = with_approval_channel(channel.clone(), inner.next()).await {
@@ -713,7 +1059,14 @@ async fn run_turn(
   let _guard = turn_lock.lock().await;
   let history = store.history(LOCAL_SCOPE, session_id).await;
 
-  let result = with_approval_channel(channel, agent.run_continuing(history, input)).await?;
+  let result = with_approval_channel(
+    channel,
+    agent.run_continuing(
+      Conversation::new(session_id, history).with_scope(LOCAL_SCOPE),
+      input,
+    ),
+  )
+  .await?;
   record_turn(
     store,
     session_id,
@@ -809,11 +1162,17 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
 /// itself uses, so which mode is active is visible at a glance without reading the
 /// typed text. `emacs: None` leaves the cursor untouched in Emacs mode, which has no
 /// insert/normal distinction to indicate with a shape change.
+///
+/// Built from [`CursorConfig::default`] (all modes untouched) rather than an exhaustive
+/// literal: the struct also carries `hx_*` fields under `reedline`'s optional `helix`
+/// feature, so which fields a literal must name depends on whether anything in the
+/// dependency graph turned that feature on — and this CLI has no helix mode to style.
 fn configure_cursor() -> CursorConfig {
   CursorConfig {
     vi_insert: Some(SetCursorStyle::SteadyBar),
     vi_normal: Some(SetCursorStyle::SteadyBlock),
     emacs: None,
+    ..CursorConfig::default()
   }
 }
 
@@ -873,16 +1232,6 @@ mod tests {
   use super::*;
 
   #[test]
-  fn exit_commands_are_matched_case_insensitively() {
-    for input in ["exit", "EXIT", "Quit", ":q", "/exit"] {
-      assert!(
-        EXIT_COMMANDS.contains(&input.to_ascii_lowercase().as_str()),
-        "{input} should be recognized as an exit command"
-      );
-    }
-  }
-
-  #[test]
   fn format_elapsed_picks_the_coarsest_matching_unit() {
     use std::time::Duration;
 
@@ -891,6 +1240,73 @@ mod tests {
     assert_eq!(format_elapsed(Duration::from_secs(120)), "2m ago");
     assert_eq!(format_elapsed(Duration::from_secs(3 * 3_600)), "3h ago");
     assert_eq!(format_elapsed(Duration::from_secs(2 * 86_400)), "2d ago");
+  }
+
+  /// Whichever view raised it, the prompt has to carry the same three things: the tool,
+  /// the arguments to judge it by, and how to answer.
+  #[test]
+  fn the_approval_prompt_shows_the_tool_arguments_and_options() {
+    let prompt = approval_prompt("delete_file", r#"{"path":"notes.txt"}"#);
+
+    assert!(prompt.contains("delete_file"));
+    assert!(
+      prompt.contains(r#"{"path":"notes.txt"}"#),
+      "the arguments are what the decision is made on"
+    );
+    assert!(prompt.contains("y/n"), "the options must be spelled out");
+  }
+
+  fn registry_with_one_pending() -> (ApprovalRegistry, tokio::sync::oneshot::Receiver<bool>) {
+    let registry = ApprovalRegistry::new();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    registry.register("call-1".to_owned(), tx);
+    (registry, rx)
+  }
+
+  #[test]
+  fn a_pending_approval_captures_yes_and_no_at_the_prompt() {
+    for (line, expected) in [
+      ("y", true),
+      ("Y", true),
+      ("yes", true),
+      ("/approve", true),
+      ("n", false),
+      ("no", false),
+      ("/deny", false),
+    ] {
+      let (registry, rx) = registry_with_one_pending();
+      let (events, _keepalive) = broadcast::channel(4);
+
+      assert!(
+        resolve_pending_approval(&registry, &events, line),
+        "{line} should be taken as an answer"
+      );
+      assert_eq!(rx.blocking_recv().unwrap(), expected);
+      assert!(registry.is_empty(), "answering clears the prompt");
+    }
+  }
+
+  /// Anything else is held back rather than sent as a message: it would only start a turn
+  /// that blocks on the lock the pending one still holds.
+  #[test]
+  fn other_input_is_held_back_while_an_approval_is_pending() {
+    let (registry, _rx) = registry_with_one_pending();
+    let (events, _keepalive) = broadcast::channel(4);
+
+    assert!(resolve_pending_approval(&registry, &events, "what is 2+2?"));
+    assert!(
+      !registry.is_empty(),
+      "the prompt is still waiting for a real answer"
+    );
+  }
+
+  /// With nothing pending, `y` is an ordinary message and must reach the model.
+  #[test]
+  fn input_passes_through_when_no_approval_is_pending() {
+    let registry = ApprovalRegistry::new();
+    let (events, _keepalive) = broadcast::channel(4);
+
+    assert!(!resolve_pending_approval(&registry, &events, "y"));
   }
 
   #[test]

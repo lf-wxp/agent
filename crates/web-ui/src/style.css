@@ -797,6 +797,74 @@ button {
   -webkit-backdrop-filter: blur(10px);
 }
 
+/* The `/` command menu, sitting directly above the input it completes. Capped in height
+   so a long command list cannot push the composer off a short screen; it scrolls
+   instead. */
+.command-menu {
+  margin-bottom: 0.5rem;
+  padding: 0.3rem;
+  max-height: 15rem;
+  overflow-y: auto;
+  background: var(--bg-elevated-2);
+  border: 1px solid var(--amber-strong);
+  border-radius: 14px;
+  animation: fade-in-up 0.12s ease both;
+}
+
+.command-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  width: 100%;
+  padding: 0.4rem 0.55rem;
+  border: none;
+  border-radius: 10px;
+  background: none;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.85rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+/* One highlight for both the keyboard's selection and the pointer's hover, because
+   `mouseenter` moves the selection rather than painting a second, competing one. */
+.command-row.active {
+  background: var(--amber-dim);
+}
+
+.command-alias {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--amber);
+}
+
+.command-summary {
+  color: var(--text-dim);
+  font-size: 0.78rem;
+}
+
+.command-menu-hint {
+  margin: 0.2rem 0 0.1rem;
+  padding: 0 0.55rem;
+  font-size: 0.68rem;
+  color: var(--text-faint);
+}
+
+/* Narrow screens: the alias alone identifies the command, and stacking keeps a long
+   description from squeezing it to one character per line. */
+@media (max-width: 520px) {
+  .command-row {
+    flex-direction: column;
+    gap: 0.1rem;
+  }
+
+  .command-menu-hint {
+    display: none;
+  }
+}
+
 .composer-inner {
   display: flex;
   align-items: flex-end;

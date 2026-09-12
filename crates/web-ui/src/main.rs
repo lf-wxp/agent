@@ -19,7 +19,7 @@ mod markdown;
 use gloo_net::http::Request;
 use i18n::{Key, Lang, t};
 use leptos::{
-  ev::{KeyboardEvent, SubmitEvent},
+  ev::{KeyboardEvent, MouseEvent, SubmitEvent},
   html,
   prelude::*,
 };
@@ -110,6 +110,13 @@ enum TimelineItem {
     /// watching the same turn may have resolved it first.
     resolved: RwSignal<Option<bool>>,
   },
+  /// Output from the process itself — a `/help` listing, a confirmation that history was
+  /// cleared — rather than from the model. Rendered as an aside and never persisted, so
+  /// it stays visually distinct from anything the model said.
+  Notice {
+    id: u64,
+    text: String,
+  },
   Error {
     id: u64,
     message: String,
@@ -123,6 +130,7 @@ impl TimelineItem {
       | Self::ToolCall { id, .. }
       | Self::ToolResult { id, .. }
       | Self::Approval { id, .. }
+      | Self::Notice { id, .. }
       | Self::Error { id, .. } => *id,
     }
   }
@@ -150,7 +158,7 @@ enum PendingTurn {
 }
 
 /// Everything the chat page needs, grouped so it can be passed around (into
-/// [`stream_chat`], into event handlers) as one `Copy` value — every field is itself a
+/// [`listen_stream`], into event handlers) as one `Copy` value — every field is itself a
 /// signal, so cloning this struct never clones the underlying state, only the handles to
 /// it.
 #[derive(Clone, Copy)]
@@ -281,6 +289,13 @@ fn App() -> impl IntoView {
   let connection = RwSignal::new(ConnectionState::default());
   let textarea_ref = NodeRef::<html::Textarea>::new();
   let timeline_ref = NodeRef::<html::Div>::new();
+  // Which row of the `/` command menu is highlighted, and whether the menu was closed
+  // by hand. Both are reset by `on_input` (see its docs): the selection because the rows
+  // it indexed into may no longer exist after another keystroke, and the dismissal
+  // because `Esc` is meant to get the menu out of the way *now*, not to stop it from
+  // ever opening again for the rest of the message.
+  let menu_selected = RwSignal::new(0usize);
+  let menu_dismissed = RwSignal::new(false);
 
   // Keeps `<html lang>` in sync with the active language — screen readers and the
   // browser's own "translate this page?" heuristics both read that attribute, and
@@ -359,12 +374,115 @@ fn App() -> impl IntoView {
     send();
   };
 
+  // The rows the `/` menu would show for whatever is in the composer right now — empty
+  // whenever the composer is not in the middle of typing a command, which is what
+  // `menu_open` reads as "no menu". Both the trigger condition and the filtering come
+  // from `shared::commands` so this menu offers exactly what the terminal's does (see
+  // that module's docs); `true` is the `web` flag, dropping commands a tab cannot run.
+  let menu_rows = move || {
+    input_value.with(|input| {
+      shared::commands::command_token(input)
+        .map(|token| shared::commands::suggestions(token, true))
+        .unwrap_or_default()
+    })
+  };
+  // Also suppressed while a turn of this tab's own is in flight: the textarea is
+  // disabled then, so a menu over it would offer rows that cannot be typed into.
+  let menu_open = move || !menu_dismissed.get() && !state.is_sending() && !menu_rows().is_empty();
+
+  // Paired with its index for `<For>`, which needs one to compare against
+  // `menu_selected`. Built here rather than inline in the `view!` below because the
+  // turbofish a `collect` into `Vec` needs reads as a tag to that macro's parser.
+  let menu_options = move || {
+    let rows: Vec<(usize, shared::commands::CommandSuggestion)> =
+      menu_rows().into_iter().enumerate().collect();
+    rows
+  };
+
+  // Picking a row replaces the composer with that alias and stops there — deliberately
+  // *not* submitting it. That mirrors the terminal, where `reedline`'s `Enter` accepts
+  // the highlighted row and a second `Enter` sends the line; it also leaves a
+  // mis-selected command recoverable instead of already run.
+  let accept = move |alias: &str| {
+    input_value.set(alias.to_owned());
+    menu_dismissed.set(true);
+    menu_selected.set(0);
+    if let Some(el) = textarea_ref.get_untracked() {
+      // The composer may have grown over several lines before the command was typed;
+      // an alias is one short line, so let it shrink back rather than leaving the gap.
+      set_textarea_height(&el, "auto");
+      // The click path stole focus from the textarea; the keyboard path never lost it
+      // and is unaffected by putting it back.
+      let _ = el.focus();
+    }
+  };
+
+  let accept_selected = move || {
+    let rows = menu_rows();
+    // Clamped rather than indexed directly: `menu_selected` is only reset on input, so
+    // it can still name a row that the latest keystroke shortened the list past. Guarded
+    // against empty as well — the only caller checks `menu_open` first, but a bare
+    // `len() - 1` would underflow if that ever stopped being true.
+    if rows.is_empty() {
+      return;
+    }
+    let index = menu_selected.get_untracked().min(rows.len() - 1);
+    accept(rows[index].alias);
+  };
+
+  // Wraps around at both ends, the way every other command palette does: `↓` on the
+  // last row returns to the first rather than sticking.
+  let move_selection = move |delta: isize| {
+    let len = menu_rows().len();
+    if len == 0 {
+      return;
+    }
+    menu_selected.update(|selected| {
+      let len = len as isize;
+      *selected = (((*selected as isize + delta) % len + len) % len) as usize;
+    });
+  };
+
   // Enter sends, Shift+Enter inserts a newline — the usual chat-app convention — except
   // while an IME composition is in progress (`is_composing`): the Enter that confirms a
   // candidate in, say, an active Pinyin/Kana input session must never also submit the
   // message, or every such message would go out one keystroke before the user meant it
   // to.
+  //
+  // While the `/` menu is open it takes those keys first, since every one of them means
+  // something about the menu rather than about the message: `Enter` picks a row instead
+  // of sending a half-typed `/re`, and `↑`/`↓` walk the rows instead of moving the
+  // caret. `Esc` closes the menu and is *not* forwarded as anything else — there is no
+  // other use for it at this composer.
   let on_keydown = move |ev: KeyboardEvent| {
+    if menu_open() && !ev.is_composing() {
+      match ev.key().as_str() {
+        "ArrowDown" => {
+          ev.prevent_default();
+          move_selection(1);
+          return;
+        }
+        "ArrowUp" => {
+          ev.prevent_default();
+          move_selection(-1);
+          return;
+        }
+        // `Tab` completes here as it does at a shell prompt — and must be stopped from
+        // its default job of moving focus to the send button.
+        "Enter" | "Tab" if !ev.shift_key() => {
+          ev.prevent_default();
+          accept_selected();
+          return;
+        }
+        "Escape" => {
+          ev.prevent_default();
+          menu_dismissed.set(true);
+          return;
+        }
+        _ => {}
+      }
+    }
+
     if ev.key() == "Enter" && !ev.shift_key() && !ev.is_composing() {
       ev.prevent_default();
       send();
@@ -374,8 +492,14 @@ fn App() -> impl IntoView {
   // Auto-grows the textarea with its content, up to the `max-height` set in CSS (beyond
   // that, the textarea itself scrolls). See [`set_textarea_height`]'s docs for why
   // `scroll_height` is measured after collapsing the height first.
+  //
+  // Any edit also revives a dismissed menu and returns its highlight to the first row:
+  // the rows are derived from this text, so a selection made against the previous
+  // keystroke's list is meaningless against this one.
   let on_input = move |ev| {
     input_value.set(event_target_value(&ev));
+    menu_dismissed.set(false);
+    menu_selected.set(0);
     if let Some(el) = textarea_ref.get_untracked() {
       set_textarea_height(&el, "auto");
       let scroll_height = el.scroll_height();
@@ -429,6 +553,45 @@ fn App() -> impl IntoView {
       </div>
 
       <form class="composer" on:submit=on_submit>
+        <Show when=menu_open>
+          <div class="command-menu" role="listbox" aria-label=move || t(lang.get(), Key::CommandMenuAria)>
+            <For
+              each=menu_options
+              key=|(_, row)| row.alias
+              children=move |(index, row)| {
+                view! {
+                  <button
+                    type="button"
+                    class=move || {
+                      if menu_selected.get() == index {
+                        "command-row active"
+                      } else {
+                        "command-row"
+                      }
+                    }
+                    role="option"
+                    aria-selected=move || (menu_selected.get() == index).to_string()
+                    // Highlight follows the pointer so clicking and arrowing agree on
+                    // what "the selected row" is.
+                    on:mouseenter=move |_| menu_selected.set(index)
+                    // `mousedown`, not `click`: the textarea's `blur` would otherwise
+                    // land first and the row would be gone before the click resolved.
+                    on:mousedown=move |ev: MouseEvent| {
+                      ev.prevent_default();
+                      accept(row.alias);
+                    }
+                  >
+                    <span class="command-alias">{row.alias}</span>
+                    <span class="command-summary">
+                      {move || i18n::command_summary(lang.get(), row.command)}
+                    </span>
+                  </button>
+                }
+              }
+            />
+            <p class="command-menu-hint">{move || t(lang.get(), Key::CommandMenuHint)}</p>
+          </div>
+        </Show>
         <div class="composer-inner">
           <textarea
             class="composer-input"
@@ -605,6 +768,12 @@ fn render_item(item: TimelineItem) -> impl IntoView {
       resolved,
       ..
     } => render_approval(tool_id, tool, arguments, resolved).into_any(),
+    TimelineItem::Notice { text, .. } => view! {
+      // `pre-wrap`: `/help` is an aligned table, so its newlines and runs of spaces are
+      // what makes it readable.
+      <div class="notice" style="white-space: pre-wrap">{text}</div>
+    }
+    .into_any(),
     TimelineItem::Error { message, .. } => view! {
       <div class="notice error">
         <span class="notice-icon">"!"</span>
@@ -958,8 +1127,16 @@ fn listen_stream(state: ChatState, connection: RwSignal<ConnectionState>) {
     let Some(data) = event.data().as_string() else {
       return;
     };
-    if let Ok(chat_event) = serde_json::from_str::<ChatEvent>(&data) {
-      apply_chat_event(chat_event, state);
+    match serde_json::from_str::<ChatEvent>(&data) {
+      Ok(chat_event) => apply_chat_event(chat_event, state),
+      // Almost always a bundle older than the server that is talking to it: a variant
+      // added to `ChatEvent` since this wasm was built fails to deserialize here. The
+      // event is still unusable, but dropping it *silently* turns "the page is stale"
+      // into "the feature does nothing, with no clue why" — so say so.
+      Err(err) => leptos::logging::error!(
+        "ignored an unrecognized /api/stream event ({err}); the page may be older than \
+         the server — rebuild with `trunk build`. payload: {data}"
+      ),
     }
   });
   let on_open = Closure::<dyn FnMut(DomEvent)>::new(move |_: DomEvent| {
@@ -1003,6 +1180,20 @@ fn apply_chat_event(event: ChatEvent, state: ChatState) {
       state
         .streaming_text
         .update(|current| current.push_str(&text));
+    }
+    ChatEvent::SystemNotice { text } => {
+      // A command's echo (above) is an ordinary `UserMessage`, indistinguishable from one
+      // that starts a turn, so it has already switched the "thinking" indicator on — but
+      // a command never becomes a turn and so has no `Done` of its own coming to switch
+      // it back off. This notice *is* the reply, and one can only arrive while no turn is
+      // running (see `ChatEvent::SystemNotice`'s docs), which makes it the right place to
+      // take the indicator down — for a command run from any front-end, including a
+      // terminal this tab cannot see.
+      state.turn_active.set(false);
+      state.push(TimelineItem::Notice {
+        id: state.next_id(),
+        text,
+      });
     }
     ChatEvent::ToolCallsStarted { calls } => {
       for call in calls {

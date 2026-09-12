@@ -14,6 +14,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod commands;
+
 /// Request body for `POST /api/chat`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
@@ -92,6 +94,21 @@ pub enum ChatEvent {
   UserMessage { text: String, origin: MessageOrigin },
   /// A chunk of assistant text.
   Token { text: String },
+  /// Output that came from the process itself rather than the model — a `/help` listing,
+  /// a confirmation that history was cleared. Broadcast like anything else so every view
+  /// sees it, including views that did not issue the command.
+  ///
+  /// Distinct from [`Self::Token`] on purpose: this is not part of the conversation and
+  /// is never persisted to the transcript, so a renderer should style it as an aside
+  /// rather than as something the model said.
+  ///
+  /// Only ever produced by an in-chat command, and a command is resolved *before* a turn
+  /// starts (it never reaches the model and never takes the turn lock) — so a notice
+  /// never arrives mid-turn, and one arriving means no turn is running. A renderer
+  /// showing a "waiting for the model" affordance may rely on that to take it down:
+  /// the [`Self::UserMessage`] echoing a command looks exactly like one that starts a
+  /// turn, and for a command there is no [`Self::Done`] guaranteed to follow.
+  SystemNotice { text: String },
   /// The model requested these tool calls; they are about to run.
   ToolCallsStarted { calls: Vec<ToolCallSummary> },
   /// The immediately preceding `ToolCallsStarted` batch has finished.

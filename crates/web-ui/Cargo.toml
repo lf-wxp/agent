@@ -3,7 +3,8 @@ name = "web-ui"
 version = "0.1.0"
 edition = "2024"
 
-# Compiles to `wasm32-unknown-unknown` via `trunk` (see `index.html`/`Trunk.toml`), so
+# Compiles to `wasm32-unknown-unknown` via `trunk` (see `index.html`, and the `web*`
+# tasks in the workspace's `Makefile.toml`), so
 # this crate must stay free of any dependency that only works natively (tokio's
 # multi-threaded runtime, tools that touch the filesystem/spawn processes, ...). Shared
 # wire types come from `crates/shared`, imported by path so both sides of the
@@ -13,7 +14,7 @@ leptos = { version = "0.8", features = ["csr"] }
 console_error_panic_hook = "0.1"
 shared = { path = "../shared" }
 serde_json = "1"
-gloo-net = "0.6"
+gloo-net = "0.7"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 # Pure-Rust CommonMark parser (no OS/filesystem calls), used by `markdown.rs` to turn
@@ -39,6 +40,7 @@ features = [
   "Event",
   "EventSource",
   "EventTarget",
+  "HtmlElement",
   "HtmlTextAreaElement",
   "MessageEvent",
   "Navigator",

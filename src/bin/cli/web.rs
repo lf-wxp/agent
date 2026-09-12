@@ -11,28 +11,32 @@
 //!
 //! Bound to `127.0.0.1` only (see [`serve`]'s caller in `main.rs`), and there is no
 //! authentication of any kind on these routes: there is no second user on this machine
-//! to keep out, the same reasoning [`super::LOCAL_SCOPE`] already relies on. Do not put
-//! this behind a `0.0.0.0` bind or a public reverse proxy without adding some.
+//! to keep out, the same reasoning [`super::LOCAL_SCOPE`] already relies on. What that
+//! reasoning does *not* cover is a request that reaches this server from outside the
+//! machine's own trust boundary while still looking local — DNS rebinding — so every
+//! `/api/*` request additionally has to arrive under a loopback host name (see
+//! [`guard_loopback_host`]). Do not put this behind a `0.0.0.0` bind or a public reverse
+//! proxy without adding real authentication; the host check is a guard against one
+//! specific trick, not a substitute for one.
 
-use std::{
-  collections::HashMap,
-  convert::Infallible,
-  net::SocketAddr,
-  path::Path as FsPath,
-  sync::{Arc, Mutex as StdMutex},
-};
+use std::{convert::Infallible, net::SocketAddr, path::Path as FsPath, sync::Arc};
 
 use agent::{
   Agent, AgentStreamEvent,
   agent::{ContentItem, Event, ToolResultStatus},
-  callback::dual_approval::{ApprovalChannel, PendingWebApproval},
+  callback::dual_approval::{ApprovalChannel, ApprovalRegistry, PendingApproval},
   session::{FileSessionStore, SessionStore},
 };
+use anyhow::Context;
 use axum::{
   Json, Router,
-  extract::{Path, State},
+  extract::{Path, Request, State},
   http::{HeaderValue, Method, StatusCode, header},
-  response::sse::{Event as SseEvent, KeepAlive, Sse},
+  middleware::{self, Next},
+  response::{
+    IntoResponse, Response,
+    sse::{Event as SseEvent, KeepAlive, Sse},
+  },
   routing::{get, post},
 };
 use futures::{Stream, StreamExt};
@@ -40,7 +44,7 @@ use shared::{
   ApprovalDecision, ChatAccepted, ChatEvent, ChatRequest, HistoryContentItem, HistoryEntry,
   MessageOrigin, ToolCallSummary, ToolResultSummary, ToolStatus,
 };
-use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc};
 use tower_http::{
   cors::{AllowOrigin, CorsLayer},
   services::{ServeDir, ServeFile},
@@ -66,16 +70,15 @@ pub struct WebState {
   store: Arc<FileSessionStore>,
   turn_lock: Arc<AsyncMutex<()>>,
   session_id: String,
-  /// Tool calls waiting on a browser's approve/deny decision, keyed by tool call id.
-  /// [`drive_turn`] inserts an entry when a [`PendingWebApproval`] for a web-originated
-  /// turn comes in; [`approve_handler`] removes it once a decision arrives. A plain
-  /// [`std::sync::Mutex`] (not `tokio`'s) is enough here: every critical section
-  /// touching it is a single, non-blocking `HashMap` operation, never held across an
-  /// `.await`.
-  pending_approvals: StdMutex<HashMap<String, oneshot::Sender<bool>>>,
+  /// The session's in-flight approvals — the *same* registry the terminal loop in
+  /// `main.rs` holds, not a private copy. That sharing is the whole point: a prompt
+  /// raised by a terminal-typed turn is answerable here, and one raised by a
+  /// browser-submitted turn is answerable there. See
+  /// [`agent::callback::dual_approval`]'s module docs.
+  approvals: Arc<ApprovalRegistry>,
   /// Every [`ChatEvent`] this process produces, from *any* turn regardless of which
   /// front-end started it — this is the one channel that makes a terminal-typed message
-  /// (or one from a different browser tab) show up here. [`main.rs`]'s terminal loop
+  /// (or one from a different browser tab) show up here. `main.rs`'s terminal loop
   /// holds its own clone of the exact same sender (constructed once, before this
   /// `WebState` even exists — see `main.rs`) and calls [`to_chat_events`] itself for the
   /// same reason [`drive_turn`] does below: neither side special-cases the other's
@@ -90,6 +93,7 @@ impl WebState {
     store: Arc<FileSessionStore>,
     turn_lock: Arc<AsyncMutex<()>>,
     session_id: String,
+    approvals: Arc<ApprovalRegistry>,
     events: broadcast::Sender<ChatEvent>,
   ) -> Self {
     Self {
@@ -97,7 +101,7 @@ impl WebState {
       store,
       turn_lock,
       session_id,
-      pending_approvals: StdMutex::new(HashMap::new()),
+      approvals,
       events,
     }
   }
@@ -113,7 +117,55 @@ pub fn new_event_channel() -> broadcast::Sender<ChatEvent> {
   sender
 }
 
-/// Build the router and serve it on `addr` until it errors or the process exits.
+/// Claim `addr` up front, so that failing to (the port already being in use, most
+/// often) is reported to whoever asked for the server rather than discovered later.
+///
+/// Split from [`serve`] because `--mode both` runs the server as a detached task whose
+/// result nobody is left to inspect: binding *there* meant an "already in use" error
+/// vanishing into a dropped `JoinHandle` while the startup banner had already claimed
+/// the UI was up. Binding here keeps that failure on the caller's own `?`, and also
+/// means the banner is only printed once the port is genuinely claimed — a browser
+/// opened the instant it appears can no longer beat the listener to it.
+pub async fn bind(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpListener> {
+  tokio::net::TcpListener::bind(addr)
+    .await
+    .with_context(|| format!("failed to bind the web UI to {addr}"))
+}
+
+/// Why the front-end cannot be served from `dist_dir`, if it cannot.
+///
+/// [`serve`] treats a missing `dist_dir` as a usable degraded state (see its docs) and
+/// that is worth keeping — but it must not be a *silent* one. `dist_dir` is `trunk`
+/// output and is not in version control, so a fresh clone has none of it: without this,
+/// the first thing a new checkout does on `--mode web`/`both` is answer the page with a
+/// bare 404 and no indication anywhere that a front-end build was the missing step.
+///
+/// `None` means the assets are there and nothing needs saying.
+pub fn dist_warning(dist_dir: &FsPath) -> Option<String> {
+  let how_to_fix = "run `trunk build --release` in `crates/web-ui` (or point \
+                    AGENT_CLI_WEB_DIST_DIR at an existing build). The `/api/*` routes \
+                    work regardless, which is all `trunk serve` needs.";
+
+  if !dist_dir.is_dir() {
+    return Some(format!(
+      "no front-end build at `{}`, so the page itself will 404 — {how_to_fix}",
+      dist_dir.display()
+    ));
+  }
+  // Present but without an entry point: a half-finished or cleaned-out build directory.
+  // Checked separately because `ServeDir`'s fallback is that very file, so its absence
+  // 404s every route the front-end has, not just `/`.
+  if !dist_dir.join("index.html").is_file() {
+    return Some(format!(
+      "`{}` has no `index.html`, so the page itself will 404 — {how_to_fix}",
+      dist_dir.display()
+    ));
+  }
+  None
+}
+
+/// Build the router and serve it on `listener` (see [`bind`]) until it errors or the
+/// process exits.
 ///
 /// `dist_dir` is `crates/web-ui`'s `trunk build` output (see
 /// [`agent::config::cli_web_dist_dir`]) — a missing directory is not fatal here, it just
@@ -121,9 +173,10 @@ pub fn new_event_channel() -> broadcast::Sender<ChatEvent> {
 /// deliberately usable degraded state, not just a tolerated one: it is the same thing an
 /// engineer wants while developing the front-end separately via `trunk serve` (which
 /// proxies its own dev server's API calls to this one instead of serving them itself).
+/// [`dist_warning`] is what keeps that state from being a silent one.
 pub async fn serve(
   state: Arc<WebState>,
-  addr: SocketAddr,
+  listener: tokio::net::TcpListener,
   dist_dir: &FsPath,
 ) -> anyhow::Result<()> {
   let index_html = dist_dir.join("index.html");
@@ -134,12 +187,13 @@ pub async fn serve(
     .route("/api/history", get(history_handler))
     .route("/api/stream", get(stream_handler))
     .route("/api/approve/{id}", post(approve_handler))
+    // Only the API routes: a static asset is inert, and rejecting one would break the
+    // `trunk serve` workflow above for no gain.
+    .layer(middleware::from_fn(guard_loopback_host))
     .fallback_service(static_files)
     .layer(loopback_cors_layer())
     .with_state(state);
 
-  let listener = tokio::net::TcpListener::bind(addr).await?;
-  tracing::info!("web UI listening on http://{addr}");
   axum::serve(listener, app).await?;
   Ok(())
 }
@@ -174,13 +228,56 @@ fn is_loopback_origin(origin: &HeaderValue) -> bool {
   let Some(authority) = origin.strip_prefix("http://") else {
     return false;
   };
-  // Split the port off, keeping in mind that an IPv6 host is bracketed (`[::1]:8080`)
-  // and so cannot simply be cut at its first `:`.
-  let host = match authority.strip_prefix('[') {
+  is_loopback_host(host_of(authority))
+}
+
+/// The host part of an `authority`, with any port removed.
+///
+/// An IPv6 host is bracketed (`[::1]:8080`) and so cannot simply be cut at its first `:`.
+fn host_of(authority: &str) -> &str {
+  match authority.strip_prefix('[') {
     Some(rest) => rest.split(']').next().unwrap_or_default(),
     None => authority.split(':').next().unwrap_or_default(),
-  };
+  }
+}
+
+fn is_loopback_host(host: &str) -> bool {
   matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+/// Reject any `/api/*` request that reached this server under a name other than
+/// loopback's.
+///
+/// Closes the one hole the module's "there is no second user on this machine" reasoning
+/// does not cover: **DNS rebinding**. A page the user visits can point a hostname it
+/// controls at `127.0.0.1` and then have the browser issue same-origin requests to it.
+/// CORS does not help — the browser believes those requests *are* same-origin, so no
+/// preflight is made and [`loopback_cors_layer`] never gets a say. What gives the attack
+/// away is the `Host` header: the browser sends the name it resolved, which is the
+/// attacker's domain and never a loopback name.
+///
+/// A request with no host at all is allowed through. A rebound request always carries
+/// one — carrying the attacker's domain is the entire mechanism — so denying the absent
+/// case would reject odd-but-harmless clients without closing anything.
+async fn guard_loopback_host(request: Request, next: Next) -> Response {
+  let host = request
+    .headers()
+    .get(header::HOST)
+    .and_then(|value| value.to_str().ok())
+    .map(host_of)
+    // HTTP/2 carries the authority in the URI rather than a `Host` header.
+    .or_else(|| request.uri().host());
+
+  match host {
+    Some(host) if !is_loopback_host(host) => {
+      tracing::warn!(
+        %host,
+        "rejected an API request that did not arrive over loopback; see guard_loopback_host"
+      );
+      StatusCode::FORBIDDEN.into_response()
+    }
+    _ => next.run(request).await,
+  }
 }
 
 /// A fresh id for one turn, unique across every front-end this process drives (see
@@ -202,55 +299,103 @@ pub(crate) fn new_turn_id() -> String {
 /// empty line without starting a turn at all, and a turn started here would otherwise
 /// broadcast an empty `UserMessage` and persist an empty user entry to the shared
 /// transcript that every front-end then has to render.
-async fn chat_handler(
+///
+/// An in-chat command (see [`commands`]) is handled inline instead of becoming a turn —
+/// the same as the terminal does with it — so it neither reaches the model nor waits on
+/// the session's turn lock. The reply comes back as a [`ChatEvent::SystemNotice`] on the
+/// shared stream, so every view sees it, not just the tab that typed it.
+pub(crate) async fn chat_handler(
   State(state): State<Arc<WebState>>,
   Json(request): Json<ChatRequest>,
 ) -> Result<(StatusCode, Json<ChatAccepted>), StatusCode> {
   if request.input.trim().is_empty() {
     return Err(StatusCode::BAD_REQUEST);
   }
+
+  if let Some(command) = shared::commands::parse(&request.input) {
+    let turn = new_turn_id();
+    super::commands::execute(
+      command,
+      &request.input,
+      MessageOrigin::Web,
+      &state.store,
+      &state.session_id,
+      &state.events,
+    )
+    .await;
+    // Reported as an immediately-finished turn purely to release *this tab's* composer:
+    // it went into "sending" when it posted and only a `Done` carrying the id in this
+    // response frees it, so a command producing no turn at all would leave it disabled
+    // for good. Nothing else needs this — a view's "thinking" indicator comes down on
+    // the notice itself, which is what a command run from the terminal (no turn id, no
+    // `Done`) relies on.
+    let _ = state.events.send(ChatEvent::Done {
+      turn: turn.clone(),
+      budget_exhausted: false,
+    });
+    return Ok((StatusCode::ACCEPTED, Json(ChatAccepted { turn })));
+  }
+
   let turn = new_turn_id();
   tokio::spawn(drive_turn(state, turn.clone(), request.input));
   Ok((StatusCode::ACCEPTED, Json(ChatAccepted { turn })))
 }
 
 /// Runs one web-originated turn to completion, broadcasting every event it produces —
-/// including its own [`PendingWebApproval`] prompts and resolutions — to
+/// including its own [`ChatEvent::ApprovalRequired`] prompts and their
+/// [`ChatEvent::ApprovalResolved`] answers — to
 /// [`WebState::events`] rather than returning them anywhere. Spawned by [`chat_handler`]
 /// and outlives that request; nothing here depends on the HTTP response still being
 /// open. `turn` is the id that response already handed the submitting tab, so the
 /// [`ChatEvent::Done`]/[`ChatEvent::Error`] ending this turn is recognizable as *its*
 /// turn ending among every other turn sharing the same stream.
-async fn drive_turn(state: Arc<WebState>, turn: String, input: String) {
+///
+/// `pub(crate)` to match [`chat_handler`] above: the terminal loop's own
+/// `drive_terminal_turn` is documented as mirroring this function, and a module-private
+/// one is not nameable from there — so the reference that explains the symmetry would
+/// render as dead text.
+pub(crate) async fn drive_turn(state: Arc<WebState>, turn: String, input: String) {
   let _ = state.events.send(ChatEvent::UserMessage {
     text: input.clone(),
     origin: MessageOrigin::Web,
   });
 
-  let (approval_tx, mut approval_rx) = mpsc::unbounded_channel::<PendingWebApproval>();
+  let (approval_tx, mut approval_rx) = mpsc::unbounded_channel::<PendingApproval>();
   let stream = run_turn_stream(
     &state.agent,
     &state.store,
     &state.turn_lock,
     &state.session_id,
     &input,
-    ApprovalChannel::Web(approval_tx),
+    ApprovalChannel::Session(approval_tx),
   );
   futures::pin_mut!(stream);
 
+  // Ids this turn published, so anything still unanswered when it ends can be cleared
+  // rather than lingering in the shared registry for the life of the process.
+  let mut raised = Vec::new();
+
+  // Once the approval channel is closed no front-end can ever send another approval, so
+  // this branch is gated off and the loop is then driven by `stream` alone. Without the
+  // gate, a closed receiver would resolve immediately on every iteration and `continue`
+  // back into `select!`, spinning until `stream` also ended.
+  let mut approvals_open = true;
   loop {
     tokio::select! {
-      pending = approval_rx.recv() => {
-        let Some(pending) = pending else {
-          // The turn's last `ApprovalChannel::Web` clone was dropped: not itself a
-          // reason to stop this loop (`stream` below is the actual end-of-stream
-          // signal), just nothing left to ever receive here again. Read it once more
-          // every future iteration would just get another `None` immediately.
-          continue;
-        };
-        let PendingWebApproval { id, tool, raw_arguments, decision } = pending;
-        state.pending_approvals.lock().unwrap().insert(id.clone(), decision);
-        let _ = state.events.send(ChatEvent::ApprovalRequired { id, tool, arguments: raw_arguments });
+      pending = approval_rx.recv(), if approvals_open => {
+        match pending {
+          Some(PendingApproval { id, tool, raw_arguments, decision }) => {
+            raised.push(id.clone());
+            // Into the *session-wide* registry, so a terminal sharing this session can
+            // answer it too — not just the browser tab that submitted this turn.
+            state.approvals.register(id.clone(), decision);
+            let _ = state.events.send(ChatEvent::ApprovalRequired { id, tool, arguments: raw_arguments });
+          }
+          // The turn's last `ApprovalChannel::Session` clone was dropped: nothing will
+          // ever be received here again. `stream` below is still the end-of-stream
+          // signal, so stop polling this branch rather than stopping the loop.
+          None => approvals_open = false,
+        }
       }
       next = stream.next() => {
         match next {
@@ -271,37 +416,31 @@ async fn drive_turn(state: Arc<WebState>, turn: String, input: String) {
       }
     }
   }
+
+  // Whatever is left here was never answered (it timed out, or the turn ended around
+  // it); the waiting side has already given up and denied, so there is nothing to
+  // notify — only slots to reclaim.
+  state.approvals.discard(&raised);
 }
 
 /// `POST /api/approve/{id}`: resolve a pending [`ChatEvent::ApprovalRequired`] by tool
-/// call id. `404` if `id` is unknown — already resolved, never existed, or belonged to a
-/// turn that has since finished/errored (its sender was dropped, which
-/// [`DualApprovalCallback`](agent::callback::dual_approval::DualApprovalCallback) treats
-/// as a denial on the other end regardless of whether anyone ever calls this route for
-/// it). Broadcasts [`ChatEvent::ApprovalResolved`] on success so every tab watching this
-/// turn — not just the one that submitted the decision — updates its prompt.
+/// call id — whichever front-end raised it. `404` if `id` is unknown: already answered
+/// (possibly from the terminal, which shares this registry), timed out, or belonging to a
+/// turn that has since finished. Broadcasts [`ChatEvent::ApprovalResolved`] on success so
+/// every view — other tabs and the terminal alike — updates its prompt.
 async fn approve_handler(
   State(state): State<Arc<WebState>>,
   Path(id): Path<String>,
   Json(decision): Json<ApprovalDecision>,
 ) -> StatusCode {
-  let sender = state.pending_approvals.lock().unwrap().remove(&id);
-  match sender {
-    // `send` fails only if the receiving `DualApprovalCallback::prompt_web` call already
-    // gave up (e.g. its turn errored out concurrently) — nothing left to notify, and
-    // this decision arrived too late to matter either way.
-    Some(sender) => match sender.send(decision.approved) {
-      Ok(()) => {
-        let _ = state.events.send(ChatEvent::ApprovalResolved {
-          id,
-          approved: decision.approved,
-        });
-        StatusCode::NO_CONTENT
-      }
-      Err(_) => StatusCode::GONE,
-    },
-    None => StatusCode::NOT_FOUND,
+  if !state.approvals.resolve(&id, decision.approved) {
+    return StatusCode::NOT_FOUND;
   }
+  let _ = state.events.send(ChatEvent::ApprovalResolved {
+    id,
+    approved: decision.approved,
+  });
+  StatusCode::NO_CONTENT
 }
 
 /// `GET /api/history`: the current session's full transcript, for a freshly opened (or
@@ -322,7 +461,7 @@ async fn history_handler(State(state): State<Arc<WebState>>) -> Json<Vec<History
 /// ([`broadcast::error::RecvError::Lagged`]) rather than closing the connection —
 /// losing a few intermediate token chunks is preferable to dropping the whole page's
 /// live view over a momentary stall.
-async fn stream_handler(
+pub(crate) async fn stream_handler(
   State(state): State<Arc<WebState>>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
   let mut receiver = state.events.subscribe();
@@ -479,6 +618,52 @@ fn to_sse_event(event: ChatEvent) -> Result<SseEvent, Infallible> {
 mod tests {
   use super::*;
 
+  fn temp_dir(label: &str) -> std::path::PathBuf {
+    let path =
+      std::env::temp_dir().join(format!("agent-web-dist-{label}-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&path).expect("temp dir");
+    path
+  }
+
+  /// The fresh-clone case: `dist` is `trunk` output and gitignored, so this is what a new
+  /// checkout hits. It has to say so rather than leave the page 404ing unexplained.
+  #[test]
+  fn a_missing_dist_dir_is_reported() {
+    let missing = std::env::temp_dir().join(format!("agent-web-absent-{}", uuid::Uuid::new_v4()));
+    let warning = dist_warning(&missing).expect("a missing build should warn");
+    assert!(warning.contains("trunk build"), "{warning}");
+    assert!(
+      warning.contains(&missing.display().to_string()),
+      "the warning should name the path it looked in: {warning}"
+    );
+  }
+
+  /// A directory that exists but has no entry point 404s just as thoroughly, since
+  /// `ServeDir`'s fallback *is* that file — so it cannot be treated as a working build.
+  #[test]
+  fn a_dist_dir_without_an_index_is_reported() {
+    let dir = temp_dir("no-index");
+    std::fs::write(dir.join("app.wasm"), b"not the entry point").expect("write");
+    let warning = dist_warning(&dir).expect("a build with no index.html should warn");
+    assert!(warning.contains("index.html"), "{warning}");
+  }
+
+  #[test]
+  fn a_complete_dist_dir_warns_about_nothing() {
+    let dir = temp_dir("complete");
+    std::fs::write(dir.join("index.html"), b"<!doctype html>").expect("write");
+    assert!(dist_warning(&dir).is_none());
+  }
+
+  /// A file where the directory should be is still "no build here", not a panic.
+  #[test]
+  fn a_file_in_place_of_the_dist_dir_is_reported() {
+    let dir = temp_dir("as-file");
+    let path = dir.join("dist");
+    std::fs::write(&path, b"not a directory").expect("write");
+    assert!(dist_warning(&path).is_some());
+  }
+
   #[test]
   fn only_plain_http_loopback_origins_are_allowed() {
     for origin in [
@@ -503,6 +688,46 @@ mod tests {
       assert!(
         !is_loopback_origin(&HeaderValue::from_static(origin)),
         "{origin} is not this machine and should be rejected"
+      );
+    }
+  }
+
+  #[test]
+  fn a_port_is_not_part_of_the_host() {
+    assert_eq!(host_of("127.0.0.1:8080"), "127.0.0.1");
+    assert_eq!(host_of("localhost"), "localhost");
+    assert_eq!(host_of("[::1]:8080"), "::1");
+    assert_eq!(host_of("[::1]"), "::1");
+  }
+
+  /// The DNS rebinding guard: a hostname the attacker controls resolves to `127.0.0.1`,
+  /// so the request reaches this server — but the browser sends the name it looked up,
+  /// which is never a loopback one.
+  #[test]
+  fn only_a_loopback_host_is_accepted() {
+    for host in [
+      "localhost",
+      "localhost:8080",
+      "127.0.0.1:1420",
+      "[::1]:8080",
+    ] {
+      assert!(
+        is_loopback_host(host_of(host)),
+        "{host} is this machine and should be allowed"
+      );
+    }
+
+    for host in [
+      "evil.example.com",
+      "evil.example.com:8080",
+      // The prefix/suffix tricks that a `starts_with`/`contains` check would wave through.
+      "localhost.example.com",
+      "127.0.0.1.example.com",
+      "not-localhost",
+    ] {
+      assert!(
+        !is_loopback_host(host_of(host)),
+        "{host} is a rebinding attempt and should be rejected"
       );
     }
   }

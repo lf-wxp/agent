@@ -32,6 +32,7 @@
 //! "well, this one's ours, so translate it retroactively but nothing else."
 
 use leptos::prelude::*;
+use shared::commands::Command;
 
 /// Supported UI languages. `Copy` because a [`RwSignal<Lang>`] is read constantly from
 /// inside reactive closures scattered across every rendering function (see the module
@@ -166,6 +167,8 @@ pub enum Key {
   CopyLabel,
   CopiedLabel,
   BudgetExhausted,
+  CommandMenuAria,
+  CommandMenuHint,
 }
 
 pub fn t(lang: Lang, key: Key) -> &'static str {
@@ -200,9 +203,9 @@ pub fn t(lang: Lang, key: Key) -> &'static str {
     (ComposerPlaceholder, En) => "Type a message…",
     (ComposerPlaceholder, Es) => "Escribe un mensaje…",
 
-    (ComposerHint, Zh) => "Enter 发送 · Shift+Enter 换行",
-    (ComposerHint, En) => "Enter to send · Shift+Enter for a new line",
-    (ComposerHint, Es) => "Enter para enviar · Shift+Enter para salto de línea",
+    (ComposerHint, Zh) => "Enter 发送 · Shift+Enter 换行 · / 查看命令",
+    (ComposerHint, En) => "Enter to send · Shift+Enter for a new line · / for commands",
+    (ComposerHint, Es) => "Enter para enviar · Shift+Enter para salto de línea · / para comandos",
 
     (SendAria, Zh) => "发送",
     (SendAria, En) => "Send",
@@ -277,6 +280,44 @@ pub fn t(lang: Lang, key: Key) -> &'static str {
       "Se agotó el presupuesto de rondas de herramientas; la respuesta puede basarse en \
        resultados parciales."
     }
+
+    (CommandMenuAria, Zh) => "可用命令",
+    (CommandMenuAria, En) => "Available commands",
+    (CommandMenuAria, Es) => "Comandos disponibles",
+
+    (CommandMenuHint, Zh) => "↑↓ 选择 · Enter 确认 · Esc 关闭",
+    (CommandMenuHint, En) => "↑↓ to choose · Enter to confirm · Esc to dismiss",
+    (CommandMenuHint, Es) => "↑↓ para elegir · Enter para confirmar · Esc para cerrar",
+  }
+}
+
+/// What one row of the `/`-triggered command menu says the command does.
+///
+/// Kept here rather than read off [`shared::commands::CommandSpec::summary`], which is
+/// Chinese-only: that string is written for `//help`'s plain-text output and for the
+/// terminal, neither of which is translated, while this menu is part of *this* page's
+/// chrome and has to follow the language picker like every other [`Key`] does.
+///
+/// Matching on the [`Command`] enum rather than on the summary text keeps the guarantee
+/// the rest of this module is built on (see the module docs): adding a command to
+/// [`shared::commands::COMMANDS`] makes this `match` non-exhaustive, so a new command
+/// cannot reach the menu without its description being translated first.
+pub fn command_summary(lang: Lang, command: Command) -> &'static str {
+  match (command, lang) {
+    (Command::Help, Lang::Zh) => "显示可用命令",
+    (Command::Help, Lang::En) => "Show the available commands",
+    (Command::Help, Lang::Es) => "Mostrar los comandos disponibles",
+
+    (Command::Reset, Lang::Zh) => "清空当前会话的历史记录",
+    (Command::Reset, Lang::En) => "Clear this session's history",
+    (Command::Reset, Lang::Es) => "Borrar el historial de esta sesión",
+
+    // Never actually listed in this menu (`available_on_web` filters it out before it
+    // gets here), but translated anyway rather than left to a fallback arm: a catch-all
+    // is exactly what would let the *next* command through undescribed.
+    (Command::Exit, Lang::Zh) => "退出（仅命令行）",
+    (Command::Exit, Lang::En) => "Leave the chat (terminal only)",
+    (Command::Exit, Lang::Es) => "Salir del chat (solo terminal)",
   }
 }
 
@@ -367,11 +408,41 @@ mod tests {
       Key::CopyLabel,
       Key::CopiedLabel,
       Key::BudgetExhausted,
+      Key::CommandMenuAria,
+      Key::CommandMenuHint,
     ];
     for key in keys {
       for lang in ALL_LANGS {
         assert!(!t(lang, key).is_empty());
       }
+    }
+  }
+
+  /// Same guarantee as above, for the menu's own descriptions: every command the table
+  /// defines must be describable in every language, including the ones this page filters
+  /// out of the menu.
+  #[test]
+  fn every_command_has_a_summary_in_every_language() {
+    for spec in shared::commands::COMMANDS {
+      for lang in ALL_LANGS {
+        assert!(
+          !command_summary(lang, spec.command).is_empty(),
+          "{:?} has no summary in {}",
+          spec.command,
+          lang.code()
+        );
+      }
+    }
+  }
+
+  /// The menu is opened by typing `/`, so the hint pointing at it has to name that and
+  /// not the older `/help` route to the same list.
+  #[test]
+  fn the_composer_hint_points_at_the_slash_menu() {
+    for lang in ALL_LANGS {
+      let hint = t(lang, Key::ComposerHint);
+      assert!(hint.contains('/'), "{}", lang.code());
+      assert!(!hint.contains("/help"), "{}", lang.code());
     }
   }
 }
