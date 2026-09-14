@@ -309,6 +309,52 @@ impl ChatState {
     });
   }
 
+  /// Remove the live approval prompts for calls that ended up suspended.
+  ///
+  /// Two things go wrong without this, and the second is the worse one:
+  ///
+  /// 1. The prompt's buttons are dead. The turn ended, so its registry entry was
+  ///    discarded and `POST /api/approve/{id}` answers `404` — a control that looks
+  ///    live, does nothing, and reports a failure when pressed.
+  /// 2. The re-raised prompt would be swallowed. A resumed call keeps its original
+  ///    `tool_call_id`, and `push_approval` de-duplicates on exactly that — so after
+  ///    resuming, the fresh prompt would be discarded as a duplicate of the dead one,
+  ///    leaving the turn waiting on something the page never shows.
+  ///
+  /// Only the suspended calls: a sibling that was answered in the same round keeps its
+  /// card, resolved state and all, because that is a record of what happened.
+  fn drop_unanswered_approvals(&self, pending: &[shared::PendingApprovalView]) {
+    if pending.is_empty() {
+      return;
+    }
+    self.timeline.update(|items| {
+      items.retain(|item| match item {
+        TimelineItem::Approval { tool_id, .. } => !pending.iter().any(|call| call.id == *tool_id),
+        _ => true,
+      });
+    });
+  }
+
+  /// Make the suspended card actionable again.
+  ///
+  /// `acted` only exists to stop a double click while the request is in flight, and
+  /// `POST /api/chat` returning `202` is not the resume succeeding — a fingerprint
+  /// mismatch, or another view having got there first, both fail later and
+  /// asynchronously. So the flag is cleared whenever a turn ends: if the resume worked,
+  /// `SuspendedRunCleared` already removed the card and this is a no-op; if it did not,
+  /// the run is still stored and the card has to offer its buttons again. Without this
+  /// the page says "the turn is still saved, carry on once the original setup is back"
+  /// next to a card with nothing left to press.
+  fn reset_suspended_action(&self) {
+    self.timeline.with_untracked(|items| {
+      for item in items {
+        if let TimelineItem::Suspended { acted, .. } = item {
+          acted.set(false);
+        }
+      }
+    });
+  }
+
   /// Take down the suspended card, once the run behind it is no longer suspended.
   ///
   /// Called when a turn starts, which is the observable consequence of a successful
@@ -1472,11 +1518,6 @@ fn apply_chat_event(event: ChatEvent, state: ChatState) {
       // a browser tab never saw this input any other way — every `UserMessage`, from
       // any origin, is new information to this tab and rendered the same way.
       state.turn_active.set(true);
-      // A turn starting is the observable consequence of the suspended run being taken
-      // up — by this tab, another one, or the terminal. Taken down here rather than in
-      // the click handler so all three cases are covered by one rule, and so a card
-      // still showing after someone else resumed cannot be clicked a second time.
-      state.clear_suspended();
       state.push(TimelineItem::Message {
         id: state.next_id(),
         role: Role::User,
@@ -1582,11 +1623,16 @@ fn apply_chat_event(event: ChatEvent, state: ChatState) {
       }
       state.streaming_text.set(String::new());
       state.turn_active.set(false);
+      state.drop_unanswered_approvals(&pending);
       state.push_suspended(pending);
       state.turn_finished(&turn);
     }
+    // Broadcast the moment the stored run is claimed, by whichever view claimed it —
+    // see `ChatEvent::SuspendedRunCleared` for why this and not "a turn started".
+    ChatEvent::SuspendedRunCleared => state.clear_suspended(),
     ChatEvent::Error { turn, message } => {
       state.turn_active.set(false);
+      state.reset_suspended_action();
       state.push(TimelineItem::Error {
         id: state.next_id(),
         message,

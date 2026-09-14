@@ -581,6 +581,12 @@ impl Agent {
   /// If this agent is not the one the run was suspended from — a different model, edited
   /// instructions, a tool that no longer exists. See [`RunFingerprint`] for why that is
   /// refused rather than attempted.
+  ///
+  /// Note that `state` is consumed either way, so a caller that took it out of a store
+  /// loses it on a refusal. Check [`RunFingerprint::mismatch`] against
+  /// [`Self::fingerprint`] *before* committing to the resume if the run needs to survive
+  /// being refused — losing a pending approval because the model was swapped is a poor
+  /// trade for the convenience of one less check.
   pub async fn resume(
     &self,
     state: AgentRunState,
@@ -809,7 +815,8 @@ impl Agent {
   ///
   /// A fingerprint mismatch arrives as the stream's first and only item, rather than as
   /// a `Result` around the stream itself, matching how every other failure here is
-  /// reported.
+  /// reported. As with [`Self::resume`], `state` is consumed either way — check
+  /// [`RunFingerprint::mismatch`] first if the run must survive a refusal.
   pub fn resume_stream(
     &self,
     state: AgentRunState,

@@ -584,8 +584,14 @@ async fn main() -> anyhow::Result<()> {
           text: input.to_owned(),
           origin: MessageOrigin::Terminal,
         });
-        let discarded =
-          discard_suspended_run(&store, &approvals_store, &turn_lock, &session_id).await;
+        let discarded = discard_suspended_run(
+          &store,
+          &approvals_store,
+          &turn_lock,
+          &session_id,
+          &web_events_tx,
+        )
+        .await;
         let _ = web_events_tx.send(ChatEvent::SystemNotice {
           text: if discarded {
             "已放弃被暂停的一轮，已完成的部分保留在历史中。".to_owned()
@@ -801,6 +807,7 @@ async fn drive_terminal_turn(
       turn_lock,
       session_id,
       channel,
+      events,
     )),
   };
   futures::pin_mut!(stream);
@@ -1092,6 +1099,10 @@ fn print_chat_event(event: ChatEvent) {
         }
       ));
     }
+    // Nothing to take down here: this terminal renders the suspension as a one-off
+    // printed notice, not as a card that stays on screen. The web UI is the one with
+    // persistent state to unwind.
+    ChatEvent::SuspendedRunCleared => {}
     ChatEvent::Done { .. } => term_write("\n\n"),
     ChatEvent::TurnSuspended { pending, .. } => {
       // Rendered here rather than by the turn driver for the same reason an approval
@@ -1315,6 +1326,18 @@ async fn record_suspension(
 /// the prompt is simply re-raised to whoever is listening now, through the very same
 /// [`ApprovalChannel`] a fresh turn uses. That is what makes "resume" need no approval UI
 /// of its own on either front-end.
+///
+/// # Why the fingerprint is checked here and not left to the agent
+///
+/// [`ApprovalStore::take`] is the point of no return: once taken, the run exists only in
+/// this function. [`Agent::resume_stream`] checks the fingerprint too, but by then it
+/// owns the state, so a refusal there would destroy the run — a model swapped between
+/// sessions would silently lose a pending approval rather than being told it cannot be
+/// resumed. Checking first, and putting the run back untouched when it cannot be used,
+/// makes a refused resume a no-op instead.
+///
+/// The take and the put-back are atomic against other turns because `turn_lock` is held
+/// across both.
 fn resume_turn_stream<'a>(
   agent: &'a Agent,
   store: &'a FileSessionStore,
@@ -1322,13 +1345,32 @@ fn resume_turn_stream<'a>(
   turn_lock: &'a AsyncMutex<()>,
   session_id: &'a str,
   channel: ApprovalChannel,
+  events: &'a broadcast::Sender<ChatEvent>,
 ) -> impl Stream<Item = anyhow::Result<AgentStreamEvent>> + 'a {
   stream! {
     let _guard = turn_lock.lock().await;
     let Some(state) = approvals_store.take(LOCAL_SCOPE, session_id).await else {
-      // Another view resumed or discarded it between the check and here.
+      // Another view resumed or discarded it between the check and here. Reported
+      // rather than ending the stream silently: a front-end waits for *some*
+      // terminating event to release the composer it disabled on submit, and an empty
+      // stream is not one.
+      yield Err(anyhow::anyhow!(
+        "没有被暂停的一轮可以继续——可能已被其他界面处理。"
+      ));
       return;
     };
+
+    if let Some(reason) = state.fingerprint.mismatch(&agent.fingerprint()) {
+      approvals_store.put(LOCAL_SCOPE, session_id, &state).await;
+      yield Err(anyhow::anyhow!(
+        "无法继续这一轮：{reason}。该轮仍保留，可在恢复原配置后继续，或用 /discard 放弃。"
+      ));
+      return;
+    }
+
+    // Only now is the run really claimed, so only now does every view's "paused"
+    // affordance come down.
+    let _ = events.send(ChatEvent::SuspendedRunCleared);
 
     let inner = agent.resume_stream(state, HashMap::new());
     futures::pin_mut!(inner);
@@ -1354,6 +1396,7 @@ async fn discard_suspended_run(
   approvals_store: &FileApprovalStore,
   turn_lock: &AsyncMutex<()>,
   session_id: &str,
+  events: &broadcast::Sender<ChatEvent>,
 ) -> bool {
   // The same lock a turn takes: this writes the session transcript, so it must not
   // interleave with a turn doing the same.
@@ -1361,6 +1404,7 @@ async fn discard_suspended_run(
   let Some(state) = approvals_store.take(LOCAL_SCOPE, session_id).await else {
     return false;
   };
+  let _ = events.send(ChatEvent::SuspendedRunCleared);
   let context = state.abandon();
   record_turn(store, session_id, context.events, false).await;
   true

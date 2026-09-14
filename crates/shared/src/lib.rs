@@ -190,6 +190,18 @@ pub enum ChatEvent {
     /// second request.
     pending: Vec<PendingApprovalView>,
   },
+  /// The suspended run is gone — taken up by a resume, or given up on.
+  ///
+  /// Separate from the turn that may follow, because the two are different facts and a
+  /// view needs the first without waiting for the second: a resume broadcasts this the
+  /// moment the stored run is claimed, which is before the model has produced anything.
+  ///
+  /// A renderer showing a "paused" affordance should take it down here and *only* here.
+  /// Inferring it from a turn starting looks equivalent but is not: a turn refused
+  /// because a run is suspended, and an in-chat command, both echo a
+  /// [`Self::UserMessage`] without anything having been claimed — so treating that as
+  /// the signal removes the one control the user needs, precisely when they need it.
+  SuspendedRunCleared,
   /// The turn finished normally. `turn` is the id its front-end was given when it
   /// started it (`ChatAccepted::turn` for a browser-submitted one), and is what lets a
   /// tab tell *its own* turn ending from any of the other turns sharing this stream —

@@ -617,3 +617,67 @@ RESULT[success]: Path: tmp-b.log
 新增测试覆盖：决策只替换挂起（含「后置守卫仍有否决权」）、部分答复、指纹不匹配拒绝恢复、状态 JSON round-trip、配对不变量的答复前后、`abandon` 补齐、流式恢复的五条路径、存储的路径穿越与键歧义。
 
 **尚未做**：真实浏览器端的挂起/恢复回归（需 `trunk build` 后用 Playwright 实测「超时挂起 → 重启进程 → tab 看到卡片 → 恢复 → 审批卡片回来 → 批准 → 工具执行」整条链路）。
+
+## 12. 浏览器与终端端验证记录（阶段三）
+
+`trunk build` 后以真实实例实测（DeepSeek provider，`tmp/hitl` 工作区，`AGENT_APPROVAL_TIMEOUT_SECS=20` 触发挂起）。终端侧用 Python `pty` 驱动，并代答 reedline 的光标位置查询（裸 pty 无人应答会超时）。
+
+### 12.1 通过的场景
+
+| 场景 | 结果 |
+|---|---|
+| 超时挂起 | ✅ 卡片出现，`/api/approvals` 转空，`/api/history` 为 0 条（实证未污染历史） |
+| 落盘状态结构 | ✅ 0700、指纹带真实模型名/digest/工具集、原始参数字符串保真 |
+| 落盘 transcript | ✅ 4 事件，`delete_file` 的 ToolCall **故意无配对结果**；`current_step: 1`（挂起轮未计预算） |
+| 跨进程重启 | ✅ 新 tab 经 `/api/suspended` 发现遗留挂起并渲染卡片 |
+| 恢复 → 审批重新 raise | ✅ 同一 `tool_call_id` 重新进入 registry |
+| 批准 → 工具执行 | ✅ 文件删除、挂起存储清空、历史写入且**完全配对** |
+| `/discard` | ✅ 文件保留、占位结果写入、完全配对 |
+| 放弃后继续对话 | ✅ 模型正确转述占位语义：「删除操作因未获得批准而没有执行」 |
+| 终端启动提示 | ✅ `⏸ 本会话有一轮在等待审批时被暂停（待批准: delete_file）` |
+| 终端 `/resume` → `y` | ✅ 控制台重新询问、批准、执行；**同时验证跨前端**（Web 产生挂起，另一进程的终端恢复） |
+| `/resumey` 这类带后缀输入 | ✅ 不被当作命令，落到挂起提示（`parse` 的「不接受参数」规则） |
+| `/` 菜单 | ✅ `/resume` 带译文出现在补全菜单 |
+
+### 12.2 实测发现并修复的 5 个缺陷
+
+实测的价值主要在这一节——这 5 个全部是单测覆盖不到的跨组件生命周期问题。
+
+**① 挂起后旧审批卡片仍带活按钮**（已确认 `POST /api/approve/{id}` 返回 404）
+
+turn 结束时 registry 条目被 `discard`，但卡片还在。更严重的是第二重后果：恢复后重新 raise 的提示**会被去重吃掉**——`push_approval` 以 `tool_call_id` 去重，而恢复保留原 id，于是新提示被当作旧卡片的重复丢弃，页面上只剩一张死卡片。
+
+修复：`TurnSuspended` 到达时移除 `pending` 中各调用对应的审批卡片。同轮已答复的兄弟调用保留（那是历史记录）。
+
+**② 挂起期间发新消息，卡片消失**
+
+`clear_suspended()` 挂在 `UserMessage` 上，理由是「turn 开始意味着 run 被取走」。但被拒绝的新 turn、以及任何 in-chat 命令，都会广播 `UserMessage` 而并未取走任何东西。结果：提示叫用户 `/resume`，按钮却没了。
+
+修复：新增 `ChatEvent::SuspendedRunCleared`，由服务端在 `take` 成功的那一刻广播（`resume_turn_stream` 与 `discard_suspended_run` 各一处）。UI 只在这一个事件上清卡片，不再从「turn 开始」反推。
+
+**③ 指纹不匹配会销毁挂起的 run**（数据丢失级）
+
+`ApprovalStore::take` 是不可逆点，而 `Agent::resume_stream` 的指纹校验发生在它之后且已按值拿走 state。实测：换模型重启后 `/resume`，文件确实没被删（安全目标达成），但 `/api/suspended` 转空——待批准的操作被静默丢弃。
+
+修复：`resume_turn_stream` 在 `take` 之后、消费之前先校验，不匹配则**原样 `put` 回去**并报错。`turn_lock` 全程持有，take/put-back 对其他 turn 原子。校验和比对确认文件字节级未变。`Agent::resume`/`resume_stream` 的文档补上这个陷阱。
+
+**④ 恢复失败后卡片按钮永久消失**
+
+`acted` 在点击时置位，但 `POST /api/chat` 返回 202 不等于恢复成功——指纹不匹配是**异步**失败的。于是页面显示「该轮仍保留，可在恢复原配置后继续」，旁边却是一张没有按钮的卡片。
+
+修复：`Error` 到达时复位 `acted`。成功的恢复已被 `SuspendedRunCleared` 移除卡片，所以复位是无害的 no-op。
+
+**⑤ 并发恢复导致 composer 卡死**
+
+两个视图同时 `/resume` 时，后到的 `take` 返回 `None`，`resume_turn_stream` 直接结束空流——没有任何终止事件，提交方 tab 的输入框永久禁用。
+
+修复：这种情况也 yield 一个错误。前端需要「某个终止事件」来释放它在提交时禁用的输入框，空流不是。
+
+### 12.3 已知限制（未修）
+
+- **重启后卡片上方没有上下文**：挂起的 turn 刻意不写历史，所以新 tab 只看到一张卡片，看不到当初的提问。卡片本身带工具名与参数，决策所需信息是全的。
+- **流式路径丢失穿插的 assistant 文本**：模型在调用工具前说的话（如「我先确认文件是否存在」）不进 transcript。这是**既有行为**，两条路径（流式与非流式）都如此，与本次改动无关。
+- **补全菜单打开时 Enter 选中而非提交**：打全 `/resume` 后需再按一次 Enter。既有 reedline 行为，对 `/help` `/reset` 一样。
+- `usage` 在流式路径下为 0：既有问题，需 `stream_options.include_usage`。
+
+所有临时文件与进程已清理，工作区已复原。

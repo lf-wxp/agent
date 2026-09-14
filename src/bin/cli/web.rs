@@ -392,6 +392,7 @@ pub(crate) async fn chat_handler(
           &state.approvals_store,
           &state.turn_lock,
           &state.session_id,
+          &state.events,
         )
         .await;
         let _ = state.events.send(ChatEvent::SystemNotice {
@@ -513,6 +514,7 @@ pub(crate) async fn drive_turn(state: Arc<WebState>, turn: String, input: TurnIn
         &state.turn_lock,
         &state.session_id,
         channel,
+        &state.events,
       )),
     };
   futures::pin_mut!(stream);
