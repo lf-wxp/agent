@@ -30,7 +30,10 @@ mcp.json
 tenants.json
 
 .DS_Store
-.agent/sessions
+# Whole directory rather than just `sessions`: it also holds suspended runs
+# (`.agent/approvals`), which carry the transcript so far plus the arguments of a call
+# still awaiting approval.
+.agent/
 tmp
 dist
 .playwright-mcp
