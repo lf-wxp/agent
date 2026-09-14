@@ -3,6 +3,8 @@
 //! Talks to the native side's routes in `src/bin/cli/web.rs`:
 //!
 //! - `GET /api/history` once, on mount, to show the conversation already on disk.
+//! - `GET /api/approvals` once, on mount, for any approval the session is already waiting
+//!   on — see [`load_pending_approvals`] for why the two sources below cannot cover that.
 //! - `GET /api/stream`, opened once on mount and kept open for as long as this tab is,
 //!   for every live [`ChatEvent`] this process produces from then on — from *any*
 //!   origin, not just this tab's own messages (see [`listen_stream`]'s docs). This is
@@ -253,6 +255,40 @@ impl ChatState {
     });
   }
 
+  /// Show an approval prompt, unless one for the same tool call is already on the
+  /// timeline.
+  ///
+  /// The de-duplication is what makes [`load_pending_approvals`] and [`listen_stream`]
+  /// safe to run side by side. Both can deliver the *same* prompt — the snapshot fetch
+  /// returns whatever is outstanding, while the live stream announces anything raised
+  /// from here on — and which of them gets there first is a matter of request timing, so
+  /// neither can assume it is the one introducing the prompt. Keyed on `tool_id` (the
+  /// tool call's own id) rather than on the timeline position, since the two paths append
+  /// independently.
+  fn push_approval(&self, tool_id: String, tool: String, arguments: String) {
+    // `_untracked`: called from an event handler and from a fetch continuation, neither
+    // of which is a reactive context — subscribing to the timeline here would only risk
+    // a self-triggering update, given this goes on to push to it.
+    let already_shown = self.timeline.with_untracked(|items| {
+      items.iter().any(|item| {
+        matches!(
+          item,
+          TimelineItem::Approval { tool_id: this_id, .. } if *this_id == tool_id
+        )
+      })
+    });
+    if already_shown {
+      return;
+    }
+    self.push(TimelineItem::Approval {
+      id: self.next_id(),
+      tool_id,
+      tool,
+      arguments,
+      resolved: RwSignal::new(None),
+    });
+  }
+
   /// Resolve whichever [`TimelineItem::Approval`] carries `tool_id`, if any is still
   /// waiting — a no-op if it was already resolved (e.g. this browser tab's own button
   /// click already set it, and this is the corresponding [`ChatEvent::ApprovalResolved`]
@@ -314,7 +350,15 @@ fn App() -> impl IntoView {
   // re-fetched from inside this page (every later change arrives live via `/api/stream`
   // instead — see `listen_stream`), so there is no dependency for a `Resource` to key
   // off of.
-  spawn_local(load_history(state));
+  //
+  // The two fetches are sequenced inside one task rather than spawned separately: an
+  // approval still awaiting a decision is by definition newer than the whole transcript,
+  // so it has to land after it. Two independent tasks could complete in either order and
+  // leave the prompt rendered above the conversation it belongs to.
+  spawn_local(async move {
+    load_history(state).await;
+    load_pending_approvals(state).await;
+  });
   // Opened once, kept open for this tab's whole lifetime — not per message (contrast
   // the old per-`POST /api/chat` stream this replaced): see the module docs for why a
   // single persistent connection is what makes cross-origin (terminal <-> browser, tab
@@ -857,16 +901,31 @@ fn render_approval(
   // it has succeeded, putting the buttons back (with the reason) if it has not.
   let submitting = RwSignal::new(false);
   let failure = RwSignal::new(None::<String>);
+  // Optional, and deliberately not a prompt-blocking step: a refusal has to stay a
+  // single click, since taxing the safe answer is how people learn to stop refusing.
+  // Whatever is typed here rides along with a `Deny`/`Always deny` (see
+  // `shared::ApprovalDecision::reason`) and is what the model is told instead of the
+  // generic "denied" message.
+  let reason = RwSignal::new(String::new());
 
-  let decide = move |approved: bool| {
+  // `sticky` distinguishes "allow this call" from "allow this tool for the rest of the
+  // session" — see `shared::ApprovalDecision`. Only the verdict is written back to
+  // `resolved`, since that is all the rendered outcome depends on; the scope and reason
+  // are the server's business once accepted.
+  let decide = move |approved: bool, sticky: bool| {
     if submitting.get_untracked() {
       return;
     }
     let tool_id = tool_id.clone();
+    // Only sent with a refusal: an approved call runs, so there is no result for a
+    // reason to replace.
+    let reason = (!approved)
+      .then(|| reason.get_untracked().trim().to_owned())
+      .filter(|text| !text.is_empty());
     submitting.set(true);
     failure.set(None);
     spawn_local(async move {
-      match submit_approval(&tool_id, approved).await {
+      match submit_approval(&tool_id, approved, sticky, reason).await {
         Ok(()) => resolved.set(Some(approved)),
         Err(err) => failure.set(Some(i18n::approval_submit_failed(
           lang.get_untracked(),
@@ -877,7 +936,9 @@ fn render_approval(
     });
   };
   let decide_yes = decide.clone();
-  let decide_no = decide;
+  let decide_no = decide.clone();
+  let decide_always = decide.clone();
+  let decide_never = decide;
 
   view! {
     <div class="approval">
@@ -899,13 +960,15 @@ fn render_approval(
           // invocation may be moved into the one-shot `on:click` closure below.
           let decide_yes = decide_yes.clone();
           let decide_no = decide_no.clone();
+          let decide_always = decide_always.clone();
+          let decide_never = decide_never.clone();
           view! {
             <div class="approval-buttons">
               <button
                 type="button"
                 class="approve"
                 disabled=move || submitting.get()
-                on:click=move |_| decide_yes(true)
+                on:click=move |_| decide_yes(true, false)
               >
                 {move || t(lang.get(), Key::ApprovalApprove)}
               </button>
@@ -913,11 +976,39 @@ fn render_approval(
                 type="button"
                 class="deny"
                 disabled=move || submitting.get()
-                on:click=move |_| decide_no(false)
+                on:click=move |_| decide_no(false, false)
               >
                 {move || t(lang.get(), Key::ApprovalDeny)}
               </button>
+              // The sticky pair is visually secondary: these are the consequential
+              // answers (they stop asking), so the one-off decision stays the obvious
+              // default rather than sitting beside an equally prominent "stop asking".
+              <button
+                type="button"
+                class="approve sticky"
+                disabled=move || submitting.get()
+                on:click=move |_| decide_always(true, true)
+              >
+                {move || t(lang.get(), Key::ApprovalAlways)}
+              </button>
+              <button
+                type="button"
+                class="deny sticky"
+                disabled=move || submitting.get()
+                on:click=move |_| decide_never(false, true)
+              >
+                {move || t(lang.get(), Key::ApprovalNever)}
+              </button>
             </div>
+            <p class="approval-hint">{move || t(lang.get(), Key::ApprovalStickyHint)}</p>
+            <input
+              class="approval-reason"
+              type="text"
+              disabled=move || submitting.get()
+              placeholder=move || t(lang.get(), Key::ApprovalReasonPlaceholder)
+              prop:value=move || reason.get()
+              on:input=move |ev| reason.set(event_target_value(&ev))
+            />
             {move || {
               failure.get().map(|message| view! { <p class="notice error compact">{message}</p> })
             }}
@@ -1037,6 +1128,38 @@ async fn load_history(state: ChatState) {
   }
 }
 
+/// `GET /api/approvals` — every approval the session is *currently* waiting on.
+///
+/// Runs on mount, right after [`load_history`]. Without it, reloading this tab while a
+/// turn sits waiting on a dangerous tool call left the prompt invisible here: the live
+/// announcement went out before this tab was subscribed and the broadcast does not
+/// replay, and an approval is deliberately not part of the transcript, so neither
+/// [`listen_stream`] nor [`load_history`] could show it. The page could then only watch
+/// the approval time out — while the terminal, which reads the same registry directly,
+/// could still answer it.
+///
+/// A failure here is logged rather than surfaced: the page is fully usable without it,
+/// and any approval raised from this point on still arrives via [`listen_stream`].
+async fn load_pending_approvals(state: ChatState) {
+  let response = match Request::get("/api/approvals").send().await {
+    Ok(response) => response,
+    Err(err) => {
+      leptos::logging::error!("failed to load pending approvals: {err}");
+      return;
+    }
+  };
+  let pending: Vec<shared::PendingApprovalView> = match response.json().await {
+    Ok(pending) => pending,
+    Err(err) => {
+      leptos::logging::error!("failed to parse pending approvals: {err}");
+      return;
+    }
+  };
+  for approval in pending {
+    state.push_approval(approval.id, approval.tool, approval.arguments);
+  }
+}
+
 /// `POST /api/approve/{id}` — a plain JSON request/response, no streaming involved, so
 /// `gloo-net` alone is enough here.
 ///
@@ -1044,7 +1167,12 @@ async fn load_history(state: ChatState) {
 /// [`error_status`]): a `404`/`410` means this decision reached no one — the prompt was
 /// already resolved elsewhere, or its turn is gone — which is precisely what the caller
 /// must not render as a decision taken.
-async fn submit_approval(tool_id: &str, approved: bool) -> Result<(), String> {
+async fn submit_approval(
+  tool_id: &str,
+  approved: bool,
+  sticky: bool,
+  reason: Option<String>,
+) -> Result<(), String> {
   // `Lang::En` here is fine even though this fails independently of it: `error_status`'s
   // message only reaches the user through [`i18n::approval_submit_failed`], which
   // re-wraps it in the *caller's* current language — this inner status text is a
@@ -1052,7 +1180,11 @@ async fn submit_approval(tool_id: &str, approved: bool) -> Result<(), String> {
   // text left untranslated, so it does not need `render_approval`'s own current
   // language threaded all the way down here just to immediately get wrapped again.
   let response = Request::post(&format!("/api/approve/{tool_id}"))
-    .json(&ApprovalDecision { approved })
+    .json(&ApprovalDecision {
+      approved,
+      sticky,
+      reason,
+    })
     .map_err(|err| err.to_string())?
     .send()
     .await
@@ -1226,13 +1358,9 @@ fn apply_chat_event(event: ChatEvent, state: ChatState) {
       tool,
       arguments,
     } => {
-      state.push(TimelineItem::Approval {
-        id: state.next_id(),
-        tool_id: id,
-        tool,
-        arguments,
-        resolved: RwSignal::new(None),
-      });
+      // De-duplicated against whatever `load_pending_approvals` may have already put
+      // there for this same tool call — see `push_approval`.
+      state.push_approval(id, tool, arguments);
     }
     ChatEvent::ApprovalResolved { id, approved } => {
       state.resolve_approval(&id, approved);

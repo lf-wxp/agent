@@ -145,10 +145,7 @@ impl ExecutionContext {
       .conversation_id
       .as_deref()
       .unwrap_or(&self.execution_id);
-    match self.conversation_scope.as_deref() {
-      Some(scope) => Cow::Owned(format!("{scope}\0{id}")),
-      None => Cow::Borrowed(id),
-    }
+    continuity_key_for(self.conversation_scope.as_deref(), id)
   }
 
   pub fn add_event(&mut self, event: Event) {
@@ -163,6 +160,22 @@ impl ExecutionContext {
 impl Default for ExecutionContext {
   fn default() -> Self {
     Self::new()
+  }
+}
+
+/// The [`ExecutionContext::continuity_key`] a given `(scope, id)` pair produces.
+///
+/// Exposed so a caller holding only those two values — rather than a live
+/// [`ExecutionContext`] — can name the same bucket. The case this exists for is clearing
+/// per-conversation hook state when a session is reset: the reset happens between turns,
+/// where no context exists, yet it has to address exactly the key the turns themselves
+/// used. Re-deriving the format at that call site instead would put the same NUL-joining
+/// rule in two places, and a silent mismatch there means state that survives a reset that
+/// was meant to clear it.
+pub fn continuity_key_for<'a>(scope: Option<&str>, id: &'a str) -> Cow<'a, str> {
+  match scope {
+    Some(scope) => Cow::Owned(format!("{scope}\0{id}")),
+    None => Cow::Borrowed(id),
   }
 }
 

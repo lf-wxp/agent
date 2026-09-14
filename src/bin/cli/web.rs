@@ -24,7 +24,10 @@ use std::{convert::Infallible, net::SocketAddr, path::Path as FsPath, sync::Arc}
 use agent::{
   Agent, AgentStreamEvent,
   agent::{ContentItem, Event, ToolResultStatus},
-  callback::dual_approval::{ApprovalChannel, ApprovalRegistry, PendingApproval},
+  callback::dual_approval::{
+    ApprovalChannel, ApprovalMeta, ApprovalOutcome, ApprovalRegistry, DualApprovalCallback,
+    PendingApproval,
+  },
   session::{FileSessionStore, SessionStore},
 };
 use anyhow::Context;
@@ -42,7 +45,7 @@ use axum::{
 use futures::{Stream, StreamExt};
 use shared::{
   ApprovalDecision, ChatAccepted, ChatEvent, ChatRequest, HistoryContentItem, HistoryEntry,
-  MessageOrigin, ToolCallSummary, ToolResultSummary, ToolStatus,
+  MessageOrigin, PendingApprovalView, ToolCallSummary, ToolResultSummary, ToolStatus,
 };
 use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc};
 use tower_http::{
@@ -76,6 +79,11 @@ pub struct WebState {
   /// browser-submitted turn is answerable there. See
   /// [`agent::callback::dual_approval`]'s module docs.
   approvals: Arc<ApprovalRegistry>,
+  /// The approval callback, when anything is gated — the *same* one the agent holds as a
+  /// hook, so a `/reset` submitted here clears the remembered "always allow" answers that
+  /// callback would otherwise keep applying. `None` under `--no-approval`/an empty
+  /// `--dangerous-tools`, where nothing is gated and so nothing can have been remembered.
+  approval_callback: Option<Arc<DualApprovalCallback>>,
   /// Every [`ChatEvent`] this process produces, from *any* turn regardless of which
   /// front-end started it — this is the one channel that makes a terminal-typed message
   /// (or one from a different browser tab) show up here. `main.rs`'s terminal loop
@@ -94,6 +102,7 @@ impl WebState {
     turn_lock: Arc<AsyncMutex<()>>,
     session_id: String,
     approvals: Arc<ApprovalRegistry>,
+    approval_callback: Option<Arc<DualApprovalCallback>>,
     events: broadcast::Sender<ChatEvent>,
   ) -> Self {
     Self {
@@ -102,6 +111,7 @@ impl WebState {
       turn_lock,
       session_id,
       approvals,
+      approval_callback,
       events,
     }
   }
@@ -186,6 +196,7 @@ pub async fn serve(
     .route("/api/chat", post(chat_handler))
     .route("/api/history", get(history_handler))
     .route("/api/stream", get(stream_handler))
+    .route("/api/approvals", get(approvals_handler))
     .route("/api/approve/{id}", post(approve_handler))
     // Only the API routes: a static asset is inert, and rejecting one would break the
     // `trunk serve` workflow above for no gain.
@@ -319,6 +330,7 @@ pub(crate) async fn chat_handler(
       &request.input,
       MessageOrigin::Web,
       &state.store,
+      state.approval_callback.as_deref(),
       &state.session_id,
       &state.events,
     )
@@ -384,12 +396,19 @@ pub(crate) async fn drive_turn(state: Arc<WebState>, turn: String, input: String
     tokio::select! {
       pending = approval_rx.recv(), if approvals_open => {
         match pending {
-          Some(PendingApproval { id, tool, raw_arguments, decision }) => {
-            raised.push(id.clone());
+          Some(PendingApproval { meta, decision }) => {
+            raised.push(meta.id.clone());
+            let announcement = ChatEvent::ApprovalRequired {
+              id: meta.id.clone(),
+              tool: meta.tool.clone(),
+              arguments: meta.raw_arguments.clone(),
+            };
             // Into the *session-wide* registry, so a terminal sharing this session can
-            // answer it too — not just the browser tab that submitted this turn.
-            state.approvals.register(id.clone(), decision);
-            let _ = state.events.send(ChatEvent::ApprovalRequired { id, tool, arguments: raw_arguments });
+            // answer it too — not just the browser tab that submitted this turn. Done
+            // before the announcement goes out, so a tab that reacts by immediately
+            // asking `GET /api/approvals` cannot see an empty list.
+            state.approvals.register(meta, decision);
+            let _ = state.events.send(announcement);
           }
           // The turn's last `ApprovalChannel::Session` clone was dropped: nothing will
           // ever be received here again. `stream` below is still the end-of-stream
@@ -423,6 +442,39 @@ pub(crate) async fn drive_turn(state: Arc<WebState>, turn: String, input: String
   state.approvals.discard(&raised);
 }
 
+/// `GET /api/approvals`: every approval this session is currently waiting on, oldest
+/// first.
+///
+/// The companion to [`history_handler`] for a freshly opened or reloaded tab. Live
+/// [`ChatEvent::ApprovalRequired`] frames only reach tabs that were already subscribed to
+/// `GET /api/stream` when they were sent, and that broadcast does not replay; an approval
+/// is also deliberately absent from the transcript, so `GET /api/history` does not show
+/// one either. Without this route, reloading a tab while a turn sits waiting left that
+/// tab unable to see — let alone answer — the prompt blocking it, with nothing to do but
+/// watch it time out.
+///
+/// Reads the same registry [`approve_handler`] writes to and the terminal shares, so what
+/// this returns is answerable immediately, whichever front-end raised it.
+async fn approvals_handler(State(state): State<Arc<WebState>>) -> Json<Vec<PendingApprovalView>> {
+  Json(
+    state
+      .approvals
+      .pending_snapshot()
+      .into_iter()
+      .map(to_pending_approval_view)
+      .collect(),
+  )
+}
+
+fn to_pending_approval_view(meta: ApprovalMeta) -> PendingApprovalView {
+  PendingApprovalView {
+    id: meta.id,
+    tool: meta.tool,
+    arguments: meta.raw_arguments,
+    requested_at: meta.requested_at,
+  }
+}
+
 /// `POST /api/approve/{id}`: resolve a pending [`ChatEvent::ApprovalRequired`] by tool
 /// call id — whichever front-end raised it. `404` if `id` is unknown: already answered
 /// (possibly from the terminal, which shares this registry), timed out, or belonging to a
@@ -433,13 +485,23 @@ async fn approve_handler(
   Path(id): Path<String>,
   Json(decision): Json<ApprovalDecision>,
 ) -> StatusCode {
-  if !state.approvals.resolve(&id, decision.approved) {
+  let approved = decision.approved;
+  let mut outcome = ApprovalOutcome {
+    approved,
+    sticky: decision.sticky,
+    reason: None,
+  };
+  if let Some(reason) = decision.reason {
+    // Via the builder rather than the field: it drops a blank reason, which would
+    // otherwise override the run-wide formatter with an empty tool result.
+    outcome = outcome.with_reason(reason);
+  }
+  if !state.approvals.resolve(&id, outcome) {
     return StatusCode::NOT_FOUND;
   }
-  let _ = state.events.send(ChatEvent::ApprovalResolved {
-    id,
-    approved: decision.approved,
-  });
+  let _ = state
+    .events
+    .send(ChatEvent::ApprovalResolved { id, approved });
   StatusCode::NO_CONTENT
 }
 

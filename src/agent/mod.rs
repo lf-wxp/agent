@@ -6,7 +6,9 @@ pub mod runtime;
 pub mod session;
 
 pub use callback::{AfterToolCallback, BeforeLlmCallback, BeforeToolCallback, ToolCallView};
-pub use context::{ContinuityCache, Conversation, ExecutionContext, TokenUsage};
+pub use context::{
+  ContinuityCache, Conversation, ExecutionContext, TokenUsage, continuity_key_for,
+};
 pub use event::{ContentItem, Event, ToolResultStatus};
 pub use llm_request::LlmRequest;
 pub use runtime::{Agent, AgentResult, AgentStreamEvent, StructuredAgentResult};

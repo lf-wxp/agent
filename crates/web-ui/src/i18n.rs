@@ -161,6 +161,10 @@ pub enum Key {
   ApprovalPrompt,
   ApprovalApprove,
   ApprovalDeny,
+  ApprovalAlways,
+  ApprovalNever,
+  ApprovalStickyHint,
+  ApprovalReasonPlaceholder,
   ApprovalApproved,
   ApprovalDenied,
   ThinkingAria,
@@ -251,6 +255,26 @@ pub fn t(lang: Lang, key: Key) -> &'static str {
     (ApprovalDeny, Zh) => "拒绝",
     (ApprovalDeny, En) => "Deny",
     (ApprovalDeny, Es) => "Rechazar",
+
+    (ApprovalAlways, Zh) => "总是允许",
+    (ApprovalAlways, En) => "Always allow",
+    (ApprovalAlways, Es) => "Permitir siempre",
+
+    (ApprovalNever, Zh) => "总是拒绝",
+    (ApprovalNever, En) => "Always deny",
+    (ApprovalNever, Es) => "Rechazar siempre",
+
+    (ApprovalStickyHint, Zh) => "「总是」适用于本会话内该工具的后续调用，/reset 后失效",
+    (ApprovalStickyHint, En) => {
+      "\"Always\" applies to later calls of this tool in this session, until /reset"
+    }
+    (ApprovalStickyHint, Es) => {
+      "\"Siempre\" se aplica a las siguientes llamadas de esta herramienta en esta sesión, hasta /reset"
+    }
+
+    (ApprovalReasonPlaceholder, Zh) => "拒绝理由（可选，会告知模型）",
+    (ApprovalReasonPlaceholder, En) => "Reason for denying (optional, shown to the model)",
+    (ApprovalReasonPlaceholder, Es) => "Motivo del rechazo (opcional, se muestra al modelo)",
 
     (ApprovalApproved, Zh) => "✓ 已批准",
     (ApprovalApproved, En) => "✓ Approved",
@@ -402,6 +426,10 @@ mod tests {
       Key::ApprovalPrompt,
       Key::ApprovalApprove,
       Key::ApprovalDeny,
+      Key::ApprovalAlways,
+      Key::ApprovalNever,
+      Key::ApprovalStickyHint,
+      Key::ApprovalReasonPlaceholder,
       Key::ApprovalApproved,
       Key::ApprovalDenied,
       Key::ThinkingAria,

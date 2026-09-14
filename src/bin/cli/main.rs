@@ -138,11 +138,11 @@ use std::{
 
 use agent::{
   Agent, AgentResult, AgentStreamEvent,
-  agent::{Conversation, Event},
+  agent::{BeforeToolCallback, Conversation, Event},
   callback::{
     dual_approval::{
-      ApprovalChannel, ApprovalRegistry, DualApprovalCallback, PendingApproval,
-      with_approval_channel,
+      ApprovalChannel, ApprovalMeta, ApprovalOutcome, ApprovalRegistry, DualApprovalCallback,
+      PendingApproval, parse_approval_answer, with_approval_channel,
     },
     mcp_guard::McpGuardCallback,
     path_guard::WorkspaceGuardCallback,
@@ -345,10 +345,24 @@ async fn main() -> anyhow::Result<()> {
     let agent = agent.with_before_tool_callback(Arc::new(WorkspaceGuardCallback::new(&workspace)?));
     agent.with_before_tool_callback(Arc::new(McpGuardCallback::new()))
   };
-  let agent = if dangerous_tools.is_empty() {
-    agent
-  } else {
-    agent.with_before_tool_callback(Arc::new(DualApprovalCallback::new(dangerous_tools)))
+  // Held onto rather than handed straight to the agent: the callback owns the "always
+  // allow/deny this tool" answers a human gave (see `DualApprovalCallback`'s `sticky`
+  // field), and `/reset`/`--fresh` have to be able to clear them. `Arc<DualApproval-
+  // Callback>` coerces to `Arc<dyn BeforeToolCallback>` at the registration below, so one
+  // allocation serves both.
+  //
+  // `None` when nothing is gated (`--no-approval`, or an empty `--dangerous-tools`), in
+  // which case no callback is registered at all.
+  let approval_callback =
+    (!dangerous_tools.is_empty()).then(|| Arc::new(DualApprovalCallback::new(dangerous_tools)));
+  let agent = match &approval_callback {
+    // The explicit coercion is the point of holding an `Arc<DualApprovalCallback>`: the
+    // same allocation is both the agent's hook and this binary's handle for clearing
+    // remembered decisions.
+    Some(callback) => {
+      agent.with_before_tool_callback(Arc::clone(callback) as Arc<dyn BeforeToolCallback>)
+    }
+    None => agent,
   };
   // On by default: a raw `web_search` result is mostly padding that gets re-sent to the
   // model on every subsequent tool round, so compressing it once, as it enters the
@@ -389,7 +403,8 @@ async fn main() -> anyhow::Result<()> {
   let web_events_tx = web::new_event_channel();
 
   if args.contains_key("fresh") {
-    clear_session(&store, &session_id).await;
+    commands::clear_session(&store, approval_callback.as_deref(), &session_id).await;
+    println!("Cleared history for session `{session_id}`.\n");
   }
 
   if run_web {
@@ -405,6 +420,7 @@ async fn main() -> anyhow::Result<()> {
       Arc::clone(&turn_lock),
       session_id.clone(),
       Arc::clone(&approvals),
+      approval_callback.clone(),
       web_events_tx.clone(),
     ));
     let dist_dir = config::cli_web_dist_dir();
@@ -520,6 +536,7 @@ async fn main() -> anyhow::Result<()> {
           input,
           MessageOrigin::Terminal,
           &store,
+          approval_callback.as_deref(),
           &session_id,
           &web_events_tx,
         )
@@ -673,9 +690,11 @@ async fn drive_terminal_turn(
   let mut raised = Vec::new();
   let mut failure = None;
   // Tool calls in one round run concurrently, so several prompts can be outstanding at
-  // once; they are asked one at a time so two console prompts cannot interleave.
-  let mut queued: VecDeque<PendingApproval> = VecDeque::new();
-  let mut asking: Option<(String, tokio::task::JoinHandle<Option<bool>>)> = None;
+  // once; they are asked one at a time so two console prompts cannot interleave. Only the
+  // description is queued — the decision channel lives in `approvals` from the moment the
+  // prompt is registered, so that any view can answer it.
+  let mut queued: VecDeque<ApprovalMeta> = VecDeque::new();
+  let mut asking: Option<(String, tokio::task::JoinHandle<Option<ApprovalOutcome>>)> = None;
 
   loop {
     // Take over the console for the next prompt that is still unanswered. The prompt
@@ -694,24 +713,22 @@ async fn drive_terminal_turn(
 
     tokio::select! {
       pending = approval_rx.recv() => {
-        let Some(pending) = pending else {
+        let Some(PendingApproval { meta, decision }) = pending else {
           // Every sender for this turn is gone; nothing more will arrive here, but the
           // stream below is what actually ends the loop.
           continue;
         };
-        raised.push(pending.id.clone());
+        raised.push(meta.id.clone());
         let _ = events.send(ChatEvent::ApprovalRequired {
-          id: pending.id.clone(),
-          tool: pending.tool.clone(),
-          arguments: pending.raw_arguments.clone(),
+          id: meta.id.clone(),
+          tool: meta.tool.clone(),
+          arguments: meta.raw_arguments.clone(),
         });
-        approvals.register(pending.id.clone(), pending.decision);
-        queued.push_back(PendingApproval {
-          // `decision` now lives in the registry; the queue only needs what it takes to
-          // render the prompt, so a placeholder channel stands in for it.
-          decision: tokio::sync::oneshot::channel().0,
-          ..pending
-        });
+        // Registered before being queued: registration is what makes the prompt
+        // answerable from any view (and visible to `GET /api/approvals`), whereas the
+        // queue below only decides whose turn it is to read an answer off this console.
+        approvals.register(meta.clone(), decision);
+        queued.push_back(meta);
       }
       answered = async {
                    // `&mut JoinHandle` is itself a future, so the handle stays in place
@@ -719,12 +736,17 @@ async fn drive_terminal_turn(
                    (&mut asking.as_mut().expect("guarded by the condition below").1).await
                  }, if asking.is_some() => {
         let (id, _) = asking.take().expect("guarded above");
-        // `None` means stdin could not be read; leave the prompt for another view or the
-        // timeout. A stale answer (another view got there first) resolves nothing.
-        if let Some(approved) = answered.unwrap_or(None)
-          && approvals.resolve(&id, approved) {
+        // `None` means stdin could not be read, or what was typed was not an answer;
+        // leave the prompt for another view or the timeout. A stale answer (another view
+        // got there first) resolves nothing.
+        if let Some(outcome) = answered.unwrap_or(None) {
+          // Read before the outcome is handed over: it carries a reason string, so it is
+          // moved rather than copied into `resolve`.
+          let approved = outcome.approved;
+          if approvals.resolve(&id, outcome) {
             let _ = events.send(ChatEvent::ApprovalResolved { id, approved });
           }
+        }
       }
       next = stream.next() => {
         match next {
@@ -767,17 +789,18 @@ async fn drive_terminal_turn(
   }
 }
 
-/// One blocking `y`/`n` read from the console. `None` if stdin is closed or unreadable
-/// (a non-interactive process, say), which the caller treats as "no answer from here".
+/// One blocking answer read from the console. `None` if stdin is closed or unreadable
+/// (a non-interactive process, say), or if what was typed is not an answer at all —
+/// either way the caller treats it as "no answer from here".
 ///
 /// Unbounded on purpose: the waiting side in [`agent::callback::dual_approval`] already
 /// applies [`agent::config::approval_timeout`], so bounding it here too would just race
 /// two clocks.
-fn read_approval_line() -> Option<bool> {
+fn read_approval_line() -> Option<ApprovalOutcome> {
   let mut input = String::new();
   match io::stdin().read_line(&mut input) {
     Ok(0) => None, // stdin closed.
-    Ok(_) => Some(input.trim().eq_ignore_ascii_case("y")),
+    Ok(_) => parse_approval_answer(&input),
     Err(err) => {
       tracing::warn!("failed to read approval answer: {err}");
       None
@@ -800,20 +823,17 @@ async fn publish_approvals(
   events: broadcast::Sender<ChatEvent>,
 ) -> Vec<String> {
   let mut raised = Vec::new();
-  while let Some(pending) = approvals_rx.recv().await {
-    let PendingApproval {
-      id,
-      tool,
-      raw_arguments,
-      decision,
-    } = pending;
-    raised.push(id.clone());
-    approvals.register(id.clone(), decision);
-    let _ = events.send(ChatEvent::ApprovalRequired {
-      id,
-      tool,
-      arguments: raw_arguments,
-    });
+  while let Some(PendingApproval { meta, decision }) = approvals_rx.recv().await {
+    raised.push(meta.id.clone());
+    let announcement = ChatEvent::ApprovalRequired {
+      id: meta.id.clone(),
+      tool: meta.tool.clone(),
+      arguments: meta.raw_arguments.clone(),
+    };
+    // Registered before the announcement goes out, so a view that reacts to it by
+    // immediately asking `GET /api/approvals` cannot see an empty list.
+    approvals.register(meta, decision);
+    let _ = events.send(announcement);
   }
   raised
 }
@@ -839,16 +859,17 @@ fn resolve_pending_approval(
     return false;
   };
 
-  let approved = match line.to_ascii_lowercase().as_str() {
-    "y" | "yes" | "/approve" => true,
-    "n" | "no" | "/deny" => false,
-    _ => {
-      term_write("\n[approval] 有待处理的审批，请先输入 y（批准）或 n（拒绝）\n");
-      return true;
-    }
+  let Some(outcome) = parse_approval_answer(line) else {
+    term_write(
+      "\n[approval] 有待处理的审批，请输入 y（本次允许）/ n（本次拒绝）/ \
+       a（本会话总是允许）/ d（本会话总是拒绝），可加「: 理由」\n",
+    );
+    return true;
   };
 
-  if approvals.resolve(&id, approved) {
+  // Read before `outcome` is moved into `resolve` — it owns an optional reason string.
+  let approved = outcome.approved;
+  if approvals.resolve(&id, outcome) {
     let _ = events.send(ChatEvent::ApprovalResolved { id, approved });
   }
   true
@@ -865,7 +886,10 @@ fn resolve_pending_approval(
 /// Raw arguments rather than parsed ones: a payload that failed to parse would render as
 /// `null`, and approving a call you cannot see is worse than not being asked.
 fn approval_prompt(tool: &str, raw_arguments: &str) -> String {
-  format!("\n⚠️  即将执行高危操作\n工具: {tool}\n参数: {raw_arguments}\n是否执行？(y/n): ")
+  format!(
+    "\n⚠️  即将执行高危操作\n工具: {tool}\n参数: {raw_arguments}\n\
+     是否执行？(y=本次允许 / n=本次拒绝 / a=本会话总是允许 / d=本会话总是拒绝): "
+  )
 }
 
 /// The single renderer for every [`ChatEvent`] this process broadcasts on
@@ -1092,14 +1116,6 @@ async fn record_turn(
   store.save(LOCAL_SCOPE, session_id, events).await;
 }
 
-/// Reset a session's stored history to empty, printing the same confirmation whether
-/// this was triggered by `--fresh` at startup or `/reset` mid-chat (both mean exactly
-/// "forget this conversation and start over").
-async fn clear_session(store: &FileSessionStore, session_id: &str) {
-  store.save(LOCAL_SCOPE, session_id, Vec::new()).await;
-  println!("Cleared history for session `{session_id}`.\n");
-}
-
 /// `--list`: print every session stored under [`LOCAL_SCOPE`], most recently active
 /// first, then exit without starting a chat.
 async fn list_sessions(store: &FileSessionStore) -> anyhow::Result<()> {
@@ -1253,26 +1269,52 @@ mod tests {
       prompt.contains(r#"{"path":"notes.txt"}"#),
       "the arguments are what the decision is made on"
     );
-    assert!(prompt.contains("y/n"), "the options must be spelled out");
+    // Every accepted key has to be offered, not just the one-off pair: an answer the
+    // parser understands but the prompt never mentions is an answer nobody will give.
+    for key in ["y", "n", "a", "d"] {
+      assert!(
+        prompt.contains(&format!("{key}=")),
+        "the prompt must spell out `{key}`, got: {prompt}"
+      );
+    }
   }
 
-  fn registry_with_one_pending() -> (ApprovalRegistry, tokio::sync::oneshot::Receiver<bool>) {
+  fn registry_with_one_pending() -> (
+    ApprovalRegistry,
+    tokio::sync::oneshot::Receiver<ApprovalOutcome>,
+  ) {
     let registry = ApprovalRegistry::new();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    registry.register("call-1".to_owned(), tx);
+    registry.register(
+      ApprovalMeta {
+        id: "call-1".to_owned(),
+        tool: "delete_file".to_owned(),
+        raw_arguments: r#"{"path":"notes.txt"}"#.to_owned(),
+        requested_at: 0,
+      },
+      tx,
+    );
     (registry, rx)
   }
 
   #[test]
-  fn a_pending_approval_captures_yes_and_no_at_the_prompt() {
+  fn a_pending_approval_captures_every_answer_at_the_prompt() {
     for (line, expected) in [
-      ("y", true),
-      ("Y", true),
-      ("yes", true),
-      ("/approve", true),
-      ("n", false),
-      ("no", false),
-      ("/deny", false),
+      ("y", ApprovalOutcome::once(true)),
+      ("Y", ApprovalOutcome::once(true)),
+      ("yes", ApprovalOutcome::once(true)),
+      ("/approve", ApprovalOutcome::once(true)),
+      ("n", ApprovalOutcome::once(false)),
+      ("no", ApprovalOutcome::once(false)),
+      ("/deny", ApprovalOutcome::once(false)),
+      // The sticky answers: the REPL has to carry the scope through, not just the
+      // verdict, or "always allow" would silently degrade to a one-off yes.
+      ("a", ApprovalOutcome::sticky(true)),
+      ("always", ApprovalOutcome::sticky(true)),
+      ("/always", ApprovalOutcome::sticky(true)),
+      ("d", ApprovalOutcome::sticky(false)),
+      ("never", ApprovalOutcome::sticky(false)),
+      ("/never", ApprovalOutcome::sticky(false)),
     ] {
       let (registry, rx) = registry_with_one_pending();
       let (events, _keepalive) = broadcast::channel(4);
@@ -1281,7 +1323,11 @@ mod tests {
         resolve_pending_approval(&registry, &events, line),
         "{line} should be taken as an answer"
       );
-      assert_eq!(rx.blocking_recv().unwrap(), expected);
+      assert_eq!(
+        rx.blocking_recv().unwrap(),
+        expected,
+        "{line} should resolve to {expected:?}"
+      );
       assert!(registry.is_empty(), "answering clears the prompt");
     }
   }

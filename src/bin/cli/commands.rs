@@ -6,12 +6,37 @@
 //! the half that cannot: performing a command's side effects and telling every view about
 //! them, which needs a session store and the broadcast channel.
 
-use agent::session::{FileSessionStore, SessionStore};
+use agent::{
+  agent::continuity_key_for,
+  callback::dual_approval::DualApprovalCallback,
+  session::{FileSessionStore, SessionStore},
+};
 use shared::{
   ChatEvent, MessageOrigin,
   commands::{Command, help_text},
 };
 use tokio::sync::broadcast;
+
+/// Forget everything a session accumulated outside its transcript.
+///
+/// Clearing the stored history is not by itself a reset: a remembered "always allow" for
+/// a destructive tool lives in the approval callback, not in the transcript, and leaving
+/// it in place would carry the single riskiest piece of session state across exactly the
+/// boundary the user asked to draw. Shared by `/reset` and `--fresh`, which mean the same
+/// thing.
+///
+/// `approvals` is `None` when nothing is gated (`--no-approval`, or an empty
+/// `--dangerous-tools`), in which case there is no remembered decision to forget.
+pub async fn clear_session(
+  store: &FileSessionStore,
+  approvals: Option<&DualApprovalCallback>,
+  session_id: &str,
+) {
+  store.save(super::LOCAL_SCOPE, session_id, Vec::new()).await;
+  if let Some(approvals) = approvals {
+    approvals.forget_sticky(&continuity_key_for(Some(super::LOCAL_SCOPE), session_id));
+  }
+}
 
 /// Carry out `command` and broadcast everything a front-end needs in order to render it:
 /// an echo of the line that asked for it, then the reply as a
@@ -37,6 +62,7 @@ pub async fn execute(
   input: &str,
   origin: MessageOrigin,
   store: &FileSessionStore,
+  approvals: Option<&DualApprovalCallback>,
   session_id: &str,
   events: &broadcast::Sender<ChatEvent>,
 ) {
@@ -50,7 +76,7 @@ pub async fn execute(
   let notice = match command {
     Command::Help => help_text(web),
     Command::Reset => {
-      store.save(super::LOCAL_SCOPE, session_id, Vec::new()).await;
+      clear_session(store, approvals, session_id).await;
       format!("已清空会话 `{session_id}` 的历史记录。")
     }
     // Nothing for a browser tab to exit: the process belongs to whoever launched it, and
@@ -91,7 +117,7 @@ mod tests {
   async fn run(command: Command, origin: MessageOrigin) -> Vec<ChatEvent> {
     let (tx, mut rx) = broadcast::channel(8);
     let store = test_store();
-    execute(command, "  /cmd  ", origin, &store, "s1", &tx).await;
+    execute(command, "  /cmd  ", origin, &store, None, "s1", &tx).await;
     drop(tx);
 
     let mut events = Vec::new();
@@ -164,6 +190,7 @@ mod tests {
       "/reset",
       MessageOrigin::Web,
       &store,
+      None,
       "s1",
       &tx,
     )
@@ -174,6 +201,71 @@ mod tests {
         .history(super::super::LOCAL_SCOPE, "s1")
         .await
         .is_empty()
+    );
+  }
+
+  /// A reset has to clear the remembered "always allow/deny" answers too, not just the
+  /// transcript: standing permission for a destructive tool is the one piece of session
+  /// state where carrying it across a reset is actively dangerous.
+  #[tokio::test]
+  async fn reset_forgets_remembered_approval_decisions() {
+    use agent::{
+      agent::{BeforeToolCallback, ExecutionContext, ToolCallView, ToolResultStatus},
+      callback::dual_approval::{ApprovalChannel, ApprovalOutcome, with_approval_channel},
+    };
+
+    let store = test_store();
+    let approvals = DualApprovalCallback::new(["delete_file"]);
+
+    // A context standing in for a turn of session `s1`, keyed the way the CLI keys its
+    // own — which is what `clear_session` has to address to clear anything at all.
+    let mut context = ExecutionContext::new();
+    context.conversation_id = Some("s1".to_owned());
+    context.conversation_scope = Some(super::super::LOCAL_SCOPE.to_owned());
+
+    let arguments = serde_json::json!({ "path": "notes.txt" });
+    let call = || ToolCallView {
+      tool_call_id: "call-1",
+      name: "delete_file",
+      arguments: &arguments,
+      raw_arguments: r#"{"path":"notes.txt"}"#,
+    };
+
+    // Grant standing permission by answering the first prompt with a sticky approval.
+    let (approval_tx, mut approval_rx) = tokio::sync::mpsc::unbounded_channel();
+    let first = with_approval_channel(
+      ApprovalChannel::Session(approval_tx),
+      approvals.call(&context, call()),
+    );
+    let answer = async {
+      let pending = approval_rx.recv().await.expect("a prompt was raised");
+      let _ = pending.decision.send(ApprovalOutcome::sticky(true));
+    };
+    let (result, ()) = tokio::join!(first, answer);
+    assert!(result.is_none(), "the sticky answer approved this call");
+
+    // With it remembered, a second call needs no prompt — no channel is attached, so if
+    // one were raised this would fall back to a terminal prompt and hang rather than
+    // return.
+    assert!(
+      approvals.call(&context, call()).await.is_none(),
+      "the remembered answer should apply without asking again"
+    );
+
+    clear_session(&store, Some(&approvals), "s1").await;
+
+    // Forgotten: nothing is remembered, and with no front-end listening the callback
+    // fails closed rather than silently re-approving.
+    let (dead_tx, dead_rx) = tokio::sync::mpsc::unbounded_channel();
+    drop(dead_rx);
+    let after_reset = with_approval_channel(
+      ApprovalChannel::Session(dead_tx),
+      approvals.call(&context, call()),
+    )
+    .await;
+    assert!(
+      matches!(after_reset, Some((ToolResultStatus::Error, _))),
+      "after a reset the tool must be gated again, not silently allowed"
     );
   }
 

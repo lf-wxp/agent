@@ -714,12 +714,13 @@ button {
 
 .approval-buttons {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.5rem;
   margin-top: 0.6rem;
 }
 
 .approval-buttons button {
-  flex: 1;
+  flex: 1 1 45%;
   min-height: 40px;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
@@ -738,9 +739,63 @@ button {
   color: var(--rose);
 }
 
+/* The "always" pair is deliberately quieter than the one-off pair: it stops the prompt
+   from appearing again for this tool, so it should not compete visually with the
+   decision that only covers the call in front of you. */
+.approval-buttons .sticky {
+  flex-basis: 45%;
+  min-height: 34px;
+  background: transparent;
+  font-size: 0.78rem;
+  font-weight: 500;
+}
+
+.approval-buttons .approve.sticky {
+  border-color: color-mix(in srgb, var(--teal) 45%, transparent);
+  color: var(--teal);
+}
+
+.approval-buttons .deny.sticky {
+  border-color: color-mix(in srgb, var(--rose) 40%, transparent);
+  color: color-mix(in srgb, var(--rose) 80%, var(--text-dim));
+}
+
 .approval-buttons button:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+.approval-hint {
+  margin: 0.45rem 0 0;
+  color: var(--text-dim);
+  font-size: 0.72rem;
+  line-height: 1.4;
+}
+
+/* Optional, so it stays visually unobtrusive: a refusal must not feel like it demands an
+   explanation before it will go through. */
+.approval-reason {
+  width: 100%;
+  margin-top: 0.45rem;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.25);
+  color: var(--text);
+  font-size: 0.78rem;
+}
+
+.approval-reason::placeholder {
+  color: var(--text-dim);
+}
+
+.approval-reason:focus-visible {
+  border-color: color-mix(in srgb, var(--rose) 55%, transparent);
+  outline: none;
+}
+
+.approval-reason:disabled {
+  opacity: 0.5;
 }
 
 .approval-decided {

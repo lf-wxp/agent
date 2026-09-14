@@ -33,9 +33,48 @@ pub struct ChatAccepted {
 }
 
 /// Request body for `POST /api/approve/{id}`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalDecision {
   pub approved: bool,
+  /// Apply this answer to every later call of the same tool in this conversation,
+  /// instead of only to the call being decided.
+  ///
+  /// `#[serde(default)]` so a front-end bundle built before this field existed still
+  /// deserializes — as a one-off decision, which is what it meant to send. Worth the
+  /// leniency here specifically: a stale bundle is a normal state for this page (see
+  /// `listen_stream`'s note on the same hazard), and the safe reading of a missing field
+  /// is the narrower of the two scopes.
+  #[serde(default)]
+  pub sticky: bool,
+  /// Why the call was refused, recorded in place of it so the model learns what to do
+  /// instead of merely that it was stopped. Ignored when `approved`.
+  #[serde(default)]
+  pub reason: Option<String>,
+}
+
+/// One approval still awaiting a decision, as returned by `GET /api/approvals`.
+///
+/// Carries exactly what [`ChatEvent::ApprovalRequired`] does, because it answers the same
+/// question for a view that arrived too late to have received that event: the broadcast
+/// behind `GET /api/stream` only reaches subscribers present when a frame is sent and
+/// never replays, so a tab opened (or reloaded) while a turn sits waiting on an approval
+/// would otherwise have no way to learn of it — and, since an approval is deliberately
+/// not part of the transcript, `GET /api/history` cannot cover for that either.
+///
+/// Named apart from the native side's `PendingApproval` on purpose: that type owns the
+/// decision channel the agent is blocked on, which is neither serializable nor meaningful
+/// off-process. This is only the description.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingApprovalView {
+  pub id: String,
+  pub tool: String,
+  /// The raw (unparsed) JSON arguments string, for the same reason
+  /// [`ChatEvent::ApprovalRequired`] carries it unparsed.
+  pub arguments: String,
+  /// Unix seconds at which the prompt was raised. Lets a client show how long something
+  /// has been waiting — relevant because an unanswered approval is denied once
+  /// `AGENT_APPROVAL_TIMEOUT_SECS` elapses.
+  pub requested_at: i64,
 }
 
 /// Mirrors `agent::agent::ToolResultStatus`.
@@ -201,6 +240,25 @@ mod tests {
 
     let back: ChatEvent = serde_json::from_value(json).unwrap();
     assert!(matches!(back, ChatEvent::ApprovalRequired { id, .. } if id == "call-1"));
+  }
+
+  #[test]
+  fn pending_approval_view_round_trips_through_json() {
+    let view = PendingApprovalView {
+      id: "call-1".to_owned(),
+      tool: "delete_file".to_owned(),
+      arguments: "{\"path\":\"notes.txt\"}".to_owned(),
+      requested_at: 1_700_000_000,
+    };
+    let json = serde_json::to_string(&view).unwrap();
+    let back: PendingApprovalView = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.id, "call-1");
+    assert_eq!(
+      back.arguments, "{\"path\":\"notes.txt\"}",
+      "the raw payload must survive intact — it is what a human judges the call by"
+    );
+    assert_eq!(back.requested_at, 1_700_000_000);
   }
 
   #[test]
