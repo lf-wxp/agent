@@ -18,12 +18,28 @@
 //! `wasm32-unknown-unknown` (see `cli::commands::execute`).
 
 /// What a line resolved to, once [`parse`] has had a look at it.
+///
+/// # Two kinds of command
+///
+/// Most are pure side effects and are carried out by `cli::commands::execute`, which is
+/// why none of them reaches the model or takes the turn lock. [`Self::Resume`] and
+/// [`Self::Discard`] are the exceptions: they act on a *turn*, so each front-end
+/// dispatches them itself rather than routing them through `execute` — the same
+/// arrangement [`Self::Exit`] already had. They are listed here regardless, because the
+/// table is also what `/help` and the `/` menu are built from, and a command nobody can
+/// discover may as well not exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
   /// Show [`help_text`].
   Help,
   /// Clear this session's stored history.
   Reset,
+  /// Carry on a turn that stopped waiting for an approval, re-raising whatever it is
+  /// waiting on. Drives a turn, so each front-end handles it itself.
+  Resume,
+  /// Give up on a turn that stopped waiting for an approval, committing what it had
+  /// already done so the conversation can carry on. Also front-end dispatched.
+  Discard,
   /// Leave the chat. Terminal-only in effect — a browser tab has no process to end, so
   /// the web front-end reports it as unsupported rather than pretending.
   Exit,
@@ -51,6 +67,18 @@ pub const COMMANDS: &[CommandSpec] = &[
     aliases: &["/reset", "/clear"],
     summary: "清空当前会话的历史记录",
     command: Command::Reset,
+    available_on_web: true,
+  },
+  CommandSpec {
+    aliases: &["/resume", "/continue"],
+    summary: "继续被暂停的一轮（会重新询问审批）",
+    command: Command::Resume,
+    available_on_web: true,
+  },
+  CommandSpec {
+    aliases: &["/discard"],
+    summary: "放弃被暂停的一轮，保留已完成的部分",
+    command: Command::Discard,
     available_on_web: true,
   },
   CommandSpec {
@@ -283,7 +311,17 @@ mod tests {
     // does not start with one could never be reached by extending what was typed.
     assert_eq!(
       aliases,
-      vec!["/help", "/?", "/commands", "/reset", "/clear", "/exit"]
+      vec![
+        "/help",
+        "/?",
+        "/commands",
+        "/reset",
+        "/clear",
+        "/resume",
+        "/continue",
+        "/discard",
+        "/exit"
+      ]
     );
   }
 

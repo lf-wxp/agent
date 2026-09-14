@@ -67,6 +67,15 @@ async fn main() -> anyhow::Result<()> {
           "run finished"
         );
       }
+      // Unreachable here: `run_stream` records an undecided call as unanswered and
+      // carries on, rather than suspending. Reaching this would mean the resumable
+      // entry points had been wired up by mistake.
+      AgentStreamEvent::Suspended(state) => {
+        tracing::warn!(
+          pending = state.suspended.len(),
+          "run suspended, which this example has no way to resume"
+        );
+      }
     }
   }
 

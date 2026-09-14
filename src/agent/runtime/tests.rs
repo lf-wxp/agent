@@ -1198,6 +1198,200 @@ fn a_suspended_state_round_trips_through_json() {
   assert_eq!(back.context().conversation_id.as_deref(), Some("s1"));
 }
 
+/// A fingerprint mismatch arrives as the stream's first item rather than as a `Result`
+/// wrapping the stream, matching how every other failure on this path is reported — and
+/// crucially *before* anything runs.
+#[tokio::test]
+async fn a_resumed_stream_reports_a_mismatch_before_running_anything() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let original = agent_with(spy_registry(&executed));
+  let state = suspended_state(&original, "call_1");
+
+  let changed = Agent::new(
+    Provider::shared().clone(),
+    "gpt-different",
+    Option::<String>::None,
+    Arc::new(spy_registry(&executed)),
+  );
+
+  let stream = changed.resume_stream(state, HashMap::new());
+  futures::pin_mut!(stream);
+  let first = stream.next().await.expect("one item");
+
+  assert!(
+    first
+      .expect_err("a changed agent must not resume")
+      .to_string()
+      .contains("model changed")
+  );
+  assert!(!executed.load(Ordering::SeqCst));
+  assert!(stream.next().await.is_none(), "nothing follows the error");
+}
+
+/// Resuming without an answer re-attempts the call, and whatever suspended it gets to
+/// ask again — which is what lets a front-end treat "resume" and "ask again" as one
+/// operation. The stream ends suspended again rather than erroring, and no request is
+/// ever issued, so this needs no provider.
+#[tokio::test]
+async fn a_resumed_stream_that_is_still_unanswered_suspends_again() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let agent =
+    agent_with(spy_registry(&executed)).with_before_tool_callback(Arc::new(SuspendEverything));
+  let state = suspended_state(&agent, "call_1");
+
+  let stream = agent.resume_stream(state, HashMap::new());
+  futures::pin_mut!(stream);
+  let first = stream
+    .next()
+    .await
+    .expect("one item")
+    .expect("not an error");
+
+  let AgentStreamEvent::Suspended(again) = first else {
+    panic!("expected a suspension, got {first:?}");
+  };
+  assert_eq!(again.suspended.len(), 1);
+  assert_eq!(again.suspended[0].tool_call_id, "call_1");
+  assert!(!executed.load(Ordering::SeqCst));
+  assert!(stream.next().await.is_none());
+}
+
+/// The budget flag survives a suspension. A run cut short before it stopped is still cut
+/// short after it resumes, and losing that would have the final answer claim to be
+/// based on complete work.
+#[tokio::test]
+async fn a_resumed_stream_carries_the_budget_flag_across() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let agent =
+    agent_with(spy_registry(&executed)).with_before_tool_callback(Arc::new(SuspendEverything));
+  let mut state = suspended_state(&agent, "call_1");
+  state.budget_exhausted = true;
+
+  let stream = agent.resume_stream(state, HashMap::new());
+  futures::pin_mut!(stream);
+  let first = stream
+    .next()
+    .await
+    .expect("one item")
+    .expect("not an error");
+
+  let AgentStreamEvent::Suspended(again) = first else {
+    panic!("expected a suspension, got {first:?}");
+  };
+  assert!(again.budget_exhausted);
+}
+
+/// A round that partly completes on resume reports the finished half before stopping, so
+/// a front-end's timeline shows what actually happened rather than losing it.
+#[tokio::test]
+async fn a_partly_answered_resume_reports_the_completed_half_first() {
+  let spy_executed = Arc::new(AtomicBool::new(false));
+  let other_executed = Arc::new(AtomicBool::new(false));
+
+  let mut registry = ToolRegistry::empty();
+  registry
+    .add(Arc::new(SpyTool {
+      executed: Arc::clone(&spy_executed),
+    }))
+    .unwrap();
+  registry
+    .add(Arc::new(OtherSpyTool {
+      executed: Arc::clone(&other_executed),
+    }))
+    .unwrap();
+
+  let agent = agent_with(registry).with_before_tool_callback(Arc::new(SuspendEverything));
+  let state = AgentRunState {
+    fingerprint: agent.fingerprint(),
+    suspended: vec![
+      SuspendedToolCall {
+        tool_call_id: "call_1".to_owned(),
+        name: "spy".to_owned(),
+        raw_arguments: "{}".to_owned(),
+      },
+      SuspendedToolCall {
+        tool_call_id: "call_2".to_owned(),
+        name: "other".to_owned(),
+        raw_arguments: "{}".to_owned(),
+      },
+    ],
+    budget_exhausted: false,
+    context: ExecutionContext::new(),
+  };
+
+  // Only the first is answered.
+  let decisions = HashMap::from([("call_1".to_owned(), ResumedDecision::Approved)]);
+  let stream = agent.resume_stream(state, decisions);
+  futures::pin_mut!(stream);
+
+  let first = stream
+    .next()
+    .await
+    .expect("one item")
+    .expect("not an error");
+  let AgentStreamEvent::ToolCallsFinished(items) = first else {
+    panic!("expected the completed half first, got {first:?}");
+  };
+  assert_eq!(items.len(), 1);
+
+  let second = stream
+    .next()
+    .await
+    .expect("one item")
+    .expect("not an error");
+  let AgentStreamEvent::Suspended(again) = second else {
+    panic!("expected a suspension, got {second:?}");
+  };
+  assert_eq!(again.suspended.len(), 1);
+  assert_eq!(again.suspended[0].tool_call_id, "call_2");
+
+  assert!(spy_executed.load(Ordering::SeqCst));
+  assert!(!other_executed.load(Ordering::SeqCst));
+}
+
+/// A state whose pending call is answered outright runs the tool. The stream then goes
+/// on to request the model, which this test does not reach — asserting the tool ran is
+/// the point, and is observable before that happens.
+#[tokio::test]
+async fn a_resumed_stream_runs_an_approved_call() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let agent =
+    agent_with(spy_registry(&executed)).with_before_tool_callback(Arc::new(SuspendEverything));
+  let state = suspended_state(&agent, "call_1");
+
+  let decisions = HashMap::from([("call_1".to_owned(), ResumedDecision::Approved)]);
+  let stream = agent.resume_stream(state, decisions);
+  futures::pin_mut!(stream);
+  let first = stream
+    .next()
+    .await
+    .expect("one item")
+    .expect("not an error");
+
+  assert!(
+    matches!(first, AgentStreamEvent::ToolCallsFinished(ref items) if items.len() == 1),
+    "expected the answered call's result, got {first:?}"
+  );
+  assert!(
+    executed.load(Ordering::SeqCst),
+    "the approved call should have reached the tool"
+  );
+}
+
+/// A state with one pending `spy` call and an empty transcript.
+fn suspended_state(agent: &Agent, tool_call_id: &str) -> AgentRunState {
+  AgentRunState {
+    fingerprint: agent.fingerprint(),
+    suspended: vec![SuspendedToolCall {
+      tool_call_id: tool_call_id.to_owned(),
+      name: "spy".to_owned(),
+      raw_arguments: "{}".to_owned(),
+    }],
+    budget_exhausted: false,
+    context: ExecutionContext::new(),
+  }
+}
+
 #[test]
 fn seed_context_appends_the_new_turn_after_prior_history() {
   let agent = agent_with(ToolRegistry::empty());

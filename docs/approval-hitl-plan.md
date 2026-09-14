@@ -402,13 +402,13 @@ OpenAI 文档明确建议：长时间挂起的审批要在序列化 state 旁存
 5. ✅ 粘性决策：`ApprovalOutcome { approved, sticky }` + 复用 `ContinuityCache` + `/reset`/`--fresh` 清除
 6. ✅ 自定义拒绝文案：`ApprovalOutcome.reason` + `with_rejection_formatter`，三级优先级（**含一处实测发现的修正，见 9.5**）
 
-### 阶段三：持久化与恢复（修 G5/G6）
+### 阶段三：持久化与恢复（修 G5/G6）— 已完成，见第 11 节
 
-7. ⬜ `ExecutionContext`/`TokenUsage` 加 serde；`AgentRunState` + `fingerprint`（P6 同步落地）
-8. ⬜ `execute_tool_calls` 支持部分完成（`completed` / `awaiting`）
-9. ⬜ `AgentOutcome` + `Agent::resume`；占位 `ToolResult` 补齐协议不变量 + `BeforeLlmCallback` 过滤
-10. ⬜ `ApprovalStore` + `FileApprovalStore`（0700 + 原子写，对齐 `FileSessionStore`）
-11. ⬜ CLI 接入：启动时扫描未决审批并提示；`--mode both` 两端都能对恢复的审批应答
+7. ✅ `ExecutionContext`/`TokenUsage` 加 serde；`AgentRunState` + `fingerprint`（P6 同步落地）
+8. ✅ `execute_tool_calls` 支持部分完成（`completed` / `suspended`）
+9. ✅ `AgentOutcome` + `Agent::resume` / `resume_stream`
+10. ✅ `ApprovalStore` + `FileApprovalStore`（0700 + 原子写，对齐 `FileSessionStore`）
+11. ✅ CLI + Web 接入：启动时提示未决审批；两端共用 `/resume` `/discard`
 
 ### 阶段四：可选增强
 
@@ -543,3 +543,77 @@ RESULT[success]: Path: tmp-b.log
 | 修正后带理由拒绝 | ✅ 模型接受并改道执行 |
 
 所有临时文件与进程已清理，工作区已复原。
+
+## 11. 实现记录：阶段三（持久化与恢复）
+
+**问题**：审批超时后 turn 被当作「用户拒绝」继续跑下去。人没回答不等于人说了不，且这个虚构不是免费的——模型会针对一个没人提出的反对意见继续推理若干轮。
+
+### 11.1 三态决策与部分完成
+
+`ToolCallDecision` 加 `Suspend`。一轮里的调用是并发的，所以一轮不再是全有全无：`ToolRoundOutcome { completed, suspended }`。这是后面所有事情的基础——恢复时只重试被挂起的调用，兄弟调用的结果已在 transcript 里，重跑整轮会把它们的副作用做第二遍。
+
+`SuspendedToolCall` 存**原始参数字符串**而非解析后的 `Value`。重新序列化会让工具拿到与被批准时文本上不同的载荷，也会抹掉「模型发了 `null`」和「模型的载荷没解析成功」的区别——而后者正是审批路径依赖的（不可解析的参数必须原样展示给人看，显示成 `null` 比不问还糟）。
+
+### 11.2 恢复：决策只替换挂起
+
+`ResumedDecision::Approved` **继续往下走 hook 链**，而不是跳过它。最初写成「有决策就跳过 before-hooks」，随即发现这会让人的一句 yes 顺带关掉工作区沙箱。人回答的是被问到的那个问题，不是「解除所有防护」。有测试钉住：在审批 hook 之后注册的守卫，对已批准的调用仍然有否决权。
+
+没有决策的调用会**再次挂起**而非报错——回答一轮里的一部分是受支持的半步。
+
+`resume` 不传决策也是合法的，而且是交互式前端的常态：未答复的调用重新走 hook 链，挂起它的东西会再问一次。对前端而言「恢复」和「重新询问」是同一个操作，用已有的审批卡片渲染即可，不需要为「回答一个已存储的审批」单独开一条路径。
+
+### 11.3 占位 `ToolResult` 的过滤 hook：最终不需要
+
+原计划用 `BeforeLlmCallback` 在恢复时滤掉占位项。重新检查控制流后发现不需要：`drive` 在轮次未完成时是 `return` 而非继续循环，两条回来的路（`resume` 答复、`run_continuing` 补记未答复）都会先把配对补齐。**带空洞的 transcript 没有机会被发到模型**。
+
+不变量由控制流保证比由 hook 保证更可靠——hook 会被下一个入口忘记注册，而「没有别处能发请求」是结构性的。已写入 `drive` 的文档，并有测试钉住答复前后的配对状态。
+
+占位补齐只留在 `AgentRunState::abandon()` 里，那正是唯一需要它的地方：放弃时要落盘一份可继续的 transcript。
+
+### 11.4 additive 而非 breaking
+
+第 6 节原计划让 `run_continuing` 改签名。实际做成了新增入口：
+
+| 原有（行为不变） | 新增（可恢复） |
+|---|---|
+| `run_continuing` | `run_continuing_resumable` |
+| `run_continuing_stream` | `run_continuing_stream_resumable` |
+| — | `resume` / `resume_stream` |
+
+原有入口遇到挂起时补记为「未答复」并继续，对一个要交出成品的入口来说这是诚实的。`WhenUnanswered::Suspend` 因此可以安全地做默认值：不能恢复的入口会自动降级到与 `Refuse` 相同的落点。
+
+### 11.5 `ApprovalStore` 与 `SessionStore` 分开
+
+不共用目录（第 7 节原倾向共用，实现时推翻）。两者生命周期相反：会话历史是要留的，挂起的 run 只活到有人回答为止。共用会导致 `/reset` 顺手丢掉一个待批准的操作，或被清理的会话留下孤儿 run。
+
+`take` 而非 `get`：已存的挂起是一次性的，留着它等于邀请同一个 run 被恢复两次——对有副作用的待决调用就是执行两遍。解析失败的状态同样取走并丢弃，因为它无法被恢复，留着只会一直报告一个没人能回答的审批。
+
+`pending()` 是只读的一瞥，且**只返回描述、永不返回状态**，这样展示路径不可能变成第二条恢复路径。
+
+落盘约定完全照抄 `FileSessionStore`（编码文件名、临时文件 + 原子 rename、目录 0700）。两者在同一个安装里并排存在，不一致是给运维挖坑；且每条约定在这里同样是必要的——run id 来自调用方，可能长得像 `../../escaped`。
+
+### 11.6 两端同源
+
+`run_turn_stream` / `resume_turn_stream` / `record_suspension` / `discard_suspended_run` / `suspended_run_notice` 都在 `main.rs`，CLI 与 Web 共用。前端差异只在渲染：
+
+- `/resume` `/discard` 进 `shared::commands` 表，两端同时获得命令与 `/` 菜单补全
+- Web 的按钮走 `POST /api/chat` 发这两个命令，与终端输入完全同路——顺带让恢复的 turn 也广播出去，另一端能看到
+- `GET /api/suspended` 之于挂起的 run，等同 `GET /api/approvals` 之于实时审批：晚到的 tab 否则什么都看不到（既没有答案，也刻意没写进 transcript）
+
+**一个会话同时只能有一个挂起的 run**，这是真实约束不是偷懒：存储的 run 持有尚未进入会话存储的历史，此时开新 turn 会从残缺的 transcript 分叉，之后恢复就会把两段分歧的历史拼在一起。所以有挂起时新输入被拒绝，并指明两条出路。
+
+`/reset` 与 `--fresh` 连带清除挂起的 run——run 持有的正是刚被清空的那段对话。
+
+### 11.7 UI 上的区分
+
+挂起卡片刻意比实时审批卡片安静：后者 pulse，因为**此刻**有东西被它阻塞着；前者静止，因为它会一直等下去。同一个 amber 色系表示相关，无动画表示不争夺注意力。
+
+挂起卡片**不提供批准/拒绝按钮**，只列出待批准的调用。回答发生在 run 重启之后——那时提示会作为一张普通的、背后有活的 agent 的审批卡片回来。在已存储的 run 上提供决策按钮，等于暗示一条已经不存在的决策通道。
+
+### 11.8 验证
+
+`cargo make ci` 全绿：438 lib + 29 shared + 9 cli + 2 doctest，两侧 clippy 零警告。
+
+新增测试覆盖：决策只替换挂起（含「后置守卫仍有否决权」）、部分答复、指纹不匹配拒绝恢复、状态 JSON round-trip、配对不变量的答复前后、`abandon` 补齐、流式恢复的五条路径、存储的路径穿越与键歧义。
+
+**尚未做**：真实浏览器端的挂起/恢复回归（需 `trunk build` 后用 Playwright 实测「超时挂起 → 重启进程 → tab 看到卡片 → 恢复 → 审批卡片回来 → 批准 → 工具执行」整条链路）。

@@ -21,7 +21,7 @@ use std::path::PathBuf;
 
 use base64::Engine;
 
-use crate::agent::runtime::AgentRunState;
+use crate::agent::runtime::{AgentRunState, SuspendedToolCall};
 
 /// Where a suspended run is kept while it waits to be answered.
 ///
@@ -42,6 +42,19 @@ pub trait ApprovalStore: Send + Sync {
   /// valid. Leaving it in place would invite resuming the same run twice — which for a
   /// run whose pending call has side effects means doing them twice.
   async fn take(&self, scope: &str, run_id: &str) -> Option<AgentRunState>;
+
+  /// What the run stored under `(scope, run_id)` is waiting on, without consuming it.
+  /// Empty when nothing is stored there.
+  ///
+  /// The read-only counterpart of [`Self::take`], for showing a human what is pending.
+  /// Returning only the description and never the state is what keeps it from
+  /// undermining `take`'s single-use guarantee: there is nothing here that could be
+  /// resumed, so a display path cannot accidentally become a second way to run the same
+  /// call.
+  ///
+  /// A stored run always has at least one pending call — it is only stored because a
+  /// round could not finish — so an empty result means "nothing stored", unambiguously.
+  async fn pending(&self, scope: &str, run_id: &str) -> Vec<SuspendedToolCall>;
 
   /// Every run id currently suspended under `scope`, most recently stored first.
   ///
@@ -175,6 +188,19 @@ impl ApprovalStore for FileApprovalStore {
         None
       }
     }
+  }
+
+  async fn pending(&self, scope: &str, run_id: &str) -> Vec<SuspendedToolCall> {
+    let path = self.path_for(scope, run_id);
+    let Ok(bytes) = tokio::fs::read(&path).await else {
+      return Vec::new();
+    };
+    // Unlike `take`, an unparseable file is left alone: this is a read, and deleting
+    // something on the way past would make merely looking at a pending approval a
+    // destructive act.
+    serde_json::from_slice::<AgentRunState>(&bytes)
+      .map(|state| state.suspended)
+      .unwrap_or_default()
   }
 
   async fn list(&self, scope: &str) -> Vec<String> {

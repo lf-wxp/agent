@@ -812,6 +812,80 @@ button {
   color: var(--rose);
 }
 
+/* Deliberately quieter than `.approval`: that one pulses because something is blocked
+   waiting on you right now, whereas a suspended run is at rest — it will wait as long as
+   it takes. Same amber family so the two read as related, no animation so only the live
+   prompt competes for attention. */
+.suspended-card {
+  align-self: stretch;
+  border: 1px solid color-mix(in srgb, var(--amber-strong) 55%, transparent);
+  border-radius: var(--radius-sm);
+  padding: 0.7rem 0.8rem;
+  background: rgba(240, 180, 41, 0.04);
+  animation: fade-in-up 0.25s ease both;
+}
+
+.suspended-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.88rem;
+  font-weight: 600;
+}
+
+.suspended-badge {
+  flex-shrink: 0;
+  color: var(--amber);
+}
+
+.suspended-body {
+  margin: 0.45rem 0 0;
+  color: var(--text-dim);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.suspended-calls {
+  list-style: none;
+  margin: 0.55rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.suspended-calls .tool-body {
+  padding: 0.35rem 0 0;
+  max-height: 140px;
+}
+
+.suspended-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+}
+
+.suspended-actions button {
+  flex: 1 1 45%;
+  min-height: 38px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.suspended-actions .approve {
+  background: var(--teal);
+  color: #04201c;
+}
+
+.suspended-actions .deny {
+  background: transparent;
+  border-color: var(--rose);
+  color: var(--rose);
+}
+
 .notice {
   align-self: stretch;
   display: flex;
@@ -1085,6 +1159,10 @@ button {
 
 @media (max-width: 360px) {
   .approval-buttons {
+    flex-direction: column;
+  }
+
+  .suspended-actions {
     flex-direction: column;
   }
 }

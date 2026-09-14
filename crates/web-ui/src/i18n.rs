@@ -173,6 +173,10 @@ pub enum Key {
   BudgetExhausted,
   CommandMenuAria,
   CommandMenuHint,
+  SuspendedTitle,
+  SuspendedBody,
+  SuspendedResume,
+  SuspendedDiscard,
 }
 
 pub fn t(lang: Lang, key: Key) -> &'static str {
@@ -305,6 +309,31 @@ pub fn t(lang: Lang, key: Key) -> &'static str {
        resultados parciales."
     }
 
+    (SuspendedTitle, Zh) => "已暂停，等待审批",
+    (SuspendedTitle, En) => "Paused, waiting for approval",
+    (SuspendedTitle, Es) => "En pausa, esperando aprobación",
+
+    (SuspendedBody, Zh) => {
+      "无人审批，这一轮已暂停并保存。继续会重新询问下面的操作；放弃会保留已完成的部分。"
+    }
+    (SuspendedBody, En) => {
+      "Nobody answered, so this turn was paused and saved. Carrying on asks about the \
+       calls below again; giving up keeps whatever already finished."
+    }
+    (SuspendedBody, Es) => {
+      "Nadie respondió, así que este turno se pausó y se guardó. Al continuar se \
+       volverá a preguntar por las llamadas de abajo; al descartar se conserva lo ya \
+       completado."
+    }
+
+    (SuspendedResume, Zh) => "继续",
+    (SuspendedResume, En) => "Carry on",
+    (SuspendedResume, Es) => "Continuar",
+
+    (SuspendedDiscard, Zh) => "放弃",
+    (SuspendedDiscard, En) => "Give up",
+    (SuspendedDiscard, Es) => "Descartar",
+
     (CommandMenuAria, Zh) => "可用命令",
     (CommandMenuAria, En) => "Available commands",
     (CommandMenuAria, Es) => "Comandos disponibles",
@@ -335,6 +364,14 @@ pub fn command_summary(lang: Lang, command: Command) -> &'static str {
     (Command::Reset, Lang::Zh) => "清空当前会话的历史记录",
     (Command::Reset, Lang::En) => "Clear this session's history",
     (Command::Reset, Lang::Es) => "Borrar el historial de esta sesión",
+
+    (Command::Resume, Lang::Zh) => "继续被暂停的一轮（会重新询问审批）",
+    (Command::Resume, Lang::En) => "Carry on the suspended turn (it will ask again)",
+    (Command::Resume, Lang::Es) => "Continuar el turno suspendido (volverá a preguntar)",
+
+    (Command::Discard, Lang::Zh) => "放弃被暂停的一轮，保留已完成的部分",
+    (Command::Discard, Lang::En) => "Give up the suspended turn, keeping what it finished",
+    (Command::Discard, Lang::Es) => "Descartar el turno suspendido, conservando lo hecho",
 
     // Never actually listed in this menu (`available_on_web` filters it out before it
     // gets here), but translated anyway rather than left to a fallback arm: a catch-all
@@ -438,6 +475,10 @@ mod tests {
       Key::BudgetExhausted,
       Key::CommandMenuAria,
       Key::CommandMenuHint,
+      Key::SuspendedTitle,
+      Key::SuspendedBody,
+      Key::SuspendedResume,
+      Key::SuspendedDiscard,
     ];
     for key in keys {
       for lang in ALL_LANGS {

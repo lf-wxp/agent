@@ -123,6 +123,19 @@ enum TimelineItem {
     id: u64,
     message: String,
   },
+  /// A turn stopped waiting on an approval nobody answered, and is stored. Distinct from
+  /// [`Self::Approval`] because the prompt behind that one is *live* — a decision POSTed
+  /// for it reaches an agent that is still blocked. Here there is nothing blocked to
+  /// answer: the run is on disk, and the way forward is to start it again (which
+  /// re-raises the prompt as a fresh [`Self::Approval`]) or to give it up.
+  Suspended {
+    id: u64,
+    /// What the stored run is waiting on, for display only.
+    pending: Vec<shared::PendingApprovalView>,
+    /// Set once this tab has asked to resume or discard, so the buttons cannot be
+    /// pressed twice while the request is in flight.
+    acted: RwSignal<bool>,
+  },
 }
 
 impl TimelineItem {
@@ -133,8 +146,13 @@ impl TimelineItem {
       | Self::ToolResult { id, .. }
       | Self::Approval { id, .. }
       | Self::Notice { id, .. }
-      | Self::Error { id, .. } => *id,
+      | Self::Error { id, .. }
+      | Self::Suspended { id, .. } => *id,
     }
+  }
+
+  fn is_suspended(&self) -> bool {
+    matches!(self, Self::Suspended { .. })
   }
 }
 
@@ -265,6 +283,45 @@ impl ChatState {
   /// neither can assume it is the one introducing the prompt. Keyed on `tool_id` (the
   /// tool call's own id) rather than on the timeline position, since the two paths append
   /// independently.
+  /// Show a suspended-run card, unless one is already on the timeline.
+  ///
+  /// De-duplicated for the same reason [`Self::push_approval`] is, and against a
+  /// stronger race: the card can arrive both from the live
+  /// [`ChatEvent::TurnSuspended`] and from [`load_suspended_run`]'s startup fetch, and
+  /// in `--mode both` a terminal `/resume` broadcasts a suspension this tab may already
+  /// be showing. Keyed on "is there one at all" rather than on an id, because a session
+  /// has at most one suspended run by construction (see `record_suspension` in
+  /// `src/bin/cli/main.rs`).
+  fn push_suspended(&self, pending: Vec<shared::PendingApprovalView>) {
+    if pending.is_empty() {
+      return;
+    }
+    let already_shown = self
+      .timeline
+      .with_untracked(|items| items.iter().any(|item| item.is_suspended()));
+    if already_shown {
+      return;
+    }
+    self.push(TimelineItem::Suspended {
+      id: self.next_id(),
+      pending,
+      acted: RwSignal::new(false),
+    });
+  }
+
+  /// Take down the suspended card, once the run behind it is no longer suspended.
+  ///
+  /// Called when a turn starts, which is the observable consequence of a successful
+  /// `/resume`, and after a `/discard`. Removing it rather than marking it resolved:
+  /// unlike an approval, whose outcome is worth keeping in the transcript, this card is
+  /// a call to action with nothing to say once acted on — and leaving a stale one would
+  /// offer to resume a run that is already running.
+  fn clear_suspended(&self) {
+    self
+      .timeline
+      .update(|items| items.retain(|item| !item.is_suspended()));
+  }
+
   fn push_approval(&self, tool_id: String, tool: String, arguments: String) {
     // `_untracked`: called from an event handler and from a fetch continuation, neither
     // of which is a reactive context — subscribing to the timeline here would only risk
@@ -358,6 +415,10 @@ fn App() -> impl IntoView {
   spawn_local(async move {
     load_history(state).await;
     load_pending_approvals(state).await;
+    // Last of the three for the same ordering reason: a suspended run is newer than the
+    // transcript, and it is the one thing on this page asking to be acted on, so it
+    // belongs at the bottom.
+    load_suspended_run(state).await;
   });
   // Opened once, kept open for this tab's whole lifetime — not per message (contrast
   // the old per-`POST /api/chat` stream this replaced): see the module docs for why a
@@ -588,7 +649,15 @@ fn App() -> impl IntoView {
             <p class="empty-state-hint">{move || t(lang.get(), Key::EmptyHint)}</p>
           </div>
         </Show>
-        <For each=move || state.timeline.get() key=TimelineItem::key children=render_item />
+        <For
+          each=move || state.timeline.get()
+          key=TimelineItem::key
+          // `ChatState` is `Copy` (see its docs), so the closure captures handles rather
+          // than state. Only the suspended card needs it — its buttons submit a turn —
+          // but threading it through one entry point keeps `render_item` a single
+          // function rather than splitting it by whether an arm happens to act.
+          children=move |item| render_item(state, item)
+        />
         <Show when=show_thinking>{render_thinking_indicator}</Show>
         {move || {
           let text = state.streaming_text.get();
@@ -762,7 +831,7 @@ fn connection_label(state: ConnectionState, lang: Lang) -> &'static str {
   t(lang, key)
 }
 
-fn render_item(item: TimelineItem) -> impl IntoView {
+fn render_item(state: ChatState, item: TimelineItem) -> impl IntoView {
   let lang = i18n::current_lang();
   match item {
     TimelineItem::Message { role, text, .. } => {
@@ -825,6 +894,7 @@ fn render_item(item: TimelineItem) -> impl IntoView {
       </div>
     }
     .into_any(),
+    TimelineItem::Suspended { pending, acted, .. } => render_suspended(state, pending, acted),
   }
 }
 
@@ -883,6 +953,82 @@ fn render_tool_card(
       </Show>
     </div>
   }
+}
+
+/// The card shown for a turn that was paused waiting on an approval.
+///
+/// Both buttons go through `POST /api/chat` with the corresponding command rather than
+/// a route of their own. That is not a shortcut: `/resume` and `/discard` are exactly
+/// what the terminal types, so routing them the same way is what keeps the two
+/// front-ends from growing separate notions of what resuming means — and it means the
+/// resulting turn is broadcast, so the terminal and every other tab see it unfold too.
+///
+/// The pending calls are listed but not answerable here. Answering happens *after* the
+/// run restarts, when the prompt comes back as an ordinary [`TimelineItem::Approval`]
+/// with a live agent behind it; offering approve/deny buttons on a stored run would
+/// imply a decision channel that no longer exists.
+fn render_suspended(
+  state: ChatState,
+  pending: Vec<shared::PendingApprovalView>,
+  acted: RwSignal<bool>,
+) -> AnyView {
+  let lang = i18n::current_lang();
+  let failure = RwSignal::new(None::<String>);
+
+  let act = move |command: &'static str| {
+    if acted.get_untracked() {
+      return;
+    }
+    acted.set(true);
+    failure.set(None);
+    spawn_local(async move {
+      match submit_chat(command.to_owned()).await {
+        Ok(turn) => state.turn_submitted(turn),
+        Err(err) => {
+          // Put the buttons back: nothing happened, so the run is still there to act on.
+          acted.set(false);
+          failure.set(Some(i18n::request_failed(lang.get_untracked(), &err)));
+        }
+      }
+    });
+  };
+
+  let calls: Vec<_> = pending
+    .into_iter()
+    .map(|call| {
+      view! {
+        <li>
+          <code class="tool-name">{call.tool}</code>
+          <pre class="tool-body">{call.arguments}</pre>
+        </li>
+      }
+    })
+    .collect();
+
+  view! {
+    <div class="suspended-card">
+      <div class="suspended-header">
+        <span class="suspended-badge">"⏸"</span>
+        <span>{move || t(lang.get(), Key::SuspendedTitle)}</span>
+      </div>
+      <p class="suspended-body">{move || t(lang.get(), Key::SuspendedBody)}</p>
+      <ul class="suspended-calls">{calls}</ul>
+      <Show when=move || !acted.get()>
+        <div class="suspended-actions">
+          <button type="button" class="approve" on:click=move |_| act("/resume")>
+            {move || t(lang.get(), Key::SuspendedResume)}
+          </button>
+          <button type="button" class="deny" on:click=move |_| act("/discard")>
+            {move || t(lang.get(), Key::SuspendedDiscard)}
+          </button>
+        </div>
+      </Show>
+      <Show when=move || failure.get().is_some()>
+        <div class="notice error">{move || failure.get().unwrap_or_default()}</div>
+      </Show>
+    </div>
+  }
+  .into_any()
 }
 
 fn render_approval(
@@ -1160,6 +1306,30 @@ async fn load_pending_approvals(state: ChatState) {
   }
 }
 
+/// `GET /api/suspended` on mount, after [`load_pending_approvals`].
+///
+/// Covers the case that one cannot: a turn that paused is no longer running, so there
+/// is no live prompt in the registry to find, and it was deliberately never written to
+/// the transcript either. A tab opened afterwards — or after the process restarted —
+/// would otherwise show a conversation that merely looks finished, with a stored run
+/// nobody is ever told about.
+///
+/// Logged rather than surfaced on failure, like its neighbour: the page works without
+/// it, and a suspension happening from here on still arrives over the stream.
+async fn load_suspended_run(state: ChatState) {
+  let response = match Request::get("/api/suspended").send().await {
+    Ok(response) => response,
+    Err(err) => {
+      leptos::logging::error!("failed to load the suspended run: {err}");
+      return;
+    }
+  };
+  match response.json::<Vec<shared::PendingApprovalView>>().await {
+    Ok(pending) => state.push_suspended(pending),
+    Err(err) => leptos::logging::error!("failed to parse the suspended run: {err}"),
+  }
+}
+
 /// `POST /api/approve/{id}` — a plain JSON request/response, no streaming involved, so
 /// `gloo-net` alone is enough here.
 ///
@@ -1302,6 +1472,11 @@ fn apply_chat_event(event: ChatEvent, state: ChatState) {
       // a browser tab never saw this input any other way — every `UserMessage`, from
       // any origin, is new information to this tab and rendered the same way.
       state.turn_active.set(true);
+      // A turn starting is the observable consequence of the suspended run being taken
+      // up — by this tab, another one, or the terminal. Taken down here rather than in
+      // the click handler so all three cases are covered by one rule, and so a card
+      // still showing after someone else resumed cannot be clicked a second time.
+      state.clear_suspended();
       state.push(TimelineItem::Message {
         id: state.next_id(),
         role: Role::User,
@@ -1391,6 +1566,23 @@ fn apply_chat_event(event: ChatEvent, state: ChatState) {
       // The composer, on the other hand, is this tab's alone: turns queue up behind each
       // other, so the one ending here may be someone else's while this tab's own is
       // still waiting its turn to run.
+      state.turn_finished(&turn);
+    }
+    ChatEvent::TurnSuspended { turn, pending, .. } => {
+      // Ends the turn exactly as `Done` does — the difference is what gets pushed in
+      // its place, not whether the UI unwinds. A tab left showing a spinner because a
+      // turn paused instead of finishing is the failure this mirrors `Done` to avoid.
+      let text = state.streaming_text.get_untracked();
+      if !text.is_empty() {
+        state.push(TimelineItem::Message {
+          id: state.next_id(),
+          role: Role::Assistant,
+          text,
+        });
+      }
+      state.streaming_text.set(String::new());
+      state.turn_active.set(false);
+      state.push_suspended(pending);
       state.turn_finished(&turn);
     }
     ChatEvent::Error { turn, message } => {

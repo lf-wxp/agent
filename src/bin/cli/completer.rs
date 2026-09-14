@@ -144,7 +144,17 @@ mod tests {
     let values: Vec<_> = complete("/").into_iter().map(|s| s.value).collect();
     assert_eq!(
       values,
-      vec!["/help", "/?", "/commands", "/reset", "/clear", "/exit"]
+      vec![
+        "/help",
+        "/?",
+        "/commands",
+        "/reset",
+        "/clear",
+        "/resume",
+        "/continue",
+        "/discard",
+        "/exit"
+      ]
     );
   }
 
@@ -200,9 +210,11 @@ mod tests {
   fn text_after_the_cursor_is_not_part_of_the_token() {
     let line = "/re then more";
     // Cursor just after `/re`.
-    let suggestions = rows(line, 3);
-    assert_eq!(suggestions.len(), 1);
-    assert_eq!(suggestions[0].value, "/reset");
+    let values: Vec<_> = rows(line, 3).into_iter().map(|s| s.value).collect();
+    // Both commands starting `/re`, and nothing influenced by the words after the
+    // cursor — had those been included the token would be `/re then more`, which
+    // matches nothing at all.
+    assert_eq!(values, vec!["/reset", "/resume"]);
   }
 
   /// `pos` is a byte offset, and this prompt takes Chinese as readily as ASCII, so a

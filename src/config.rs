@@ -39,6 +39,9 @@ const ENV_MCP_CONFIG_PATH: &str = "MCP_CONFIG_PATH";
 /// [`crate::agent::session::FileSessionStore`] sessions under.
 const ENV_CLI_SESSION_DIR: &str = "AGENT_CLI_SESSION_DIR";
 
+/// Environment variable: directory the `cli` binary persists suspended runs under.
+const ENV_CLI_APPROVAL_DIR: &str = "AGENT_CLI_APPROVAL_DIR";
+
 /// Environment variable: port the `cli` binary's `--mode web`/`--mode both` local web
 /// server binds to (always on `127.0.0.1`, see `src/bin/cli/web.rs`).
 const ENV_CLI_WEB_PORT: &str = "AGENT_CLI_WEB_PORT";
@@ -97,6 +100,12 @@ const DEFAULT_MCP_CONFIG_PATH: &str = "mcp.json";
 /// directory.
 const DEFAULT_CLI_SESSION_DIR: &str = ".agent/sessions";
 
+/// Default directory for the `cli` binary's suspended runs. A sibling of the session
+/// directory rather than a subdirectory of it: the two have opposite lifetimes (see
+/// [`crate::agent::approval_store`]), and nesting would make a recursive clear of one
+/// silently take the other with it.
+const DEFAULT_CLI_APPROVAL_DIR: &str = ".agent/approvals";
+
 /// Default port for the `cli` binary's local web server.
 const DEFAULT_CLI_WEB_PORT: u16 = 4173;
 
@@ -107,8 +116,8 @@ const DEFAULT_CLI_WEB_PORT: u16 = 4173;
 const DEFAULT_MAX_HISTORY_TOKENS: usize = 6_000;
 
 /// Default wait for a human approval decision: long enough to step away from the keyboard
-/// and come back, short enough that an abandoned prompt does not wedge the session for the
-/// rest of the day.
+/// and come back, short enough that an abandoned prompt does not hold the session's turn
+/// lock for the rest of the day.
 const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 300;
 
 /// Default Tavily search depth: `basic` costs 1 credit and balances latency against relevance.
@@ -200,20 +209,35 @@ pub fn cli_session_dir() -> PathBuf {
     .unwrap_or_else(|| PathBuf::from(DEFAULT_CLI_SESSION_DIR))
 }
 
+/// Directory the `cli` binary persists suspended runs under — a turn that stopped
+/// waiting on an approval nobody answered. See [`crate::agent::approval_store`].
+/// Override with `AGENT_CLI_APPROVAL_DIR`.
+pub fn cli_approval_dir() -> PathBuf {
+  non_empty_var(ENV_CLI_APPROVAL_DIR)
+    .map(PathBuf::from)
+    .unwrap_or_else(|| PathBuf::from(DEFAULT_CLI_APPROVAL_DIR))
+}
+
 /// Port the `cli` binary's local web server binds to on `127.0.0.1`. Override with
 /// `AGENT_CLI_WEB_PORT`; invalid values (non-numeric or 0) fall back to the default.
 pub fn cli_web_port() -> u16 {
   parsed_var_nonzero(ENV_CLI_WEB_PORT, DEFAULT_CLI_WEB_PORT)
 }
 
-/// How long a dangerous-tool approval waits for a human before giving up and denying
+/// How long a dangerous-tool approval waits for a human before the run stops waiting
 /// (see [`crate::callback::dual_approval::DualApprovalCallback`]). Override with
 /// `AGENT_APPROVAL_TIMEOUT_SECS`; invalid values (non-numeric or 0) fall back to the
 /// default.
 ///
 /// A bound is required rather than merely nice: a turn holds the session's turn lock for
-/// its whole duration, so an approval nobody ever answers would otherwise wedge every
+/// its whole duration, so an approval nobody ever answers would otherwise block every
 /// front-end sharing that session — permanently, with no way out but killing the process.
+///
+/// What happens when it expires is a separate question, and not this setting's to answer:
+/// see [`crate::callback::dual_approval::WhenUnanswered`]. By default the run is
+/// suspended and stored, so the timeout releases the lock without throwing the turn away
+/// — the question stays open, it just stops occupying the session while nobody is there
+/// to answer it.
 pub fn approval_timeout() -> Duration {
   Duration::from_secs(parsed_var_nonzero(
     ENV_APPROVAL_TIMEOUT_SECS,

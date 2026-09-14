@@ -72,8 +72,9 @@ pub struct PendingApprovalView {
   /// [`ChatEvent::ApprovalRequired`] carries it unparsed.
   pub arguments: String,
   /// Unix seconds at which the prompt was raised. Lets a client show how long something
-  /// has been waiting — relevant because an unanswered approval is denied once
-  /// `AGENT_APPROVAL_TIMEOUT_SECS` elapses.
+  /// has been waiting — relevant because an unanswered approval eventually suspends the
+  /// turn (see [`ChatEvent::TurnSuspended`]), so a prompt left alone does not stay live
+  /// indefinitely.
   pub requested_at: i64,
 }
 
@@ -168,6 +169,27 @@ pub enum ChatEvent {
   /// or another one) with `approved`. Sent so every tab watching this turn can update
   /// its `ApprovalRequired` prompt, not just the one that submitted the decision.
   ApprovalResolved { id: String, approved: bool },
+  /// The turn stopped without finishing, because nobody decided an approval it was
+  /// waiting on. It is stored and can be carried on later with `POST /api/resume/{run}`.
+  ///
+  /// Ends a turn the same way [`Self::Done`] does — a renderer must take down its
+  /// "waiting for the model" affordance on either — but says something different about
+  /// what happened: no answer was produced, and the transcript was *not* added to the
+  /// conversation. The turn's user message is held inside the stored run rather than in
+  /// history, so it reappears when the run is resumed rather than being lost.
+  ///
+  /// Deliberately not modelled as an error. Nothing went wrong; a question was asked and
+  /// is still open, which is the approval mechanism working.
+  TurnSuspended {
+    turn: String,
+    /// Identifies the stored run. What `POST /api/resume/{run}` takes, and what the
+    /// terminal's `/resume` uses.
+    run: String,
+    /// What the run is still waiting on, so a view that missed the original
+    /// [`Self::ApprovalRequired`] — or has been reloaded since — can show it without a
+    /// second request.
+    pending: Vec<PendingApprovalView>,
+  },
   /// The turn finished normally. `turn` is the id its front-end was given when it
   /// started it (`ChatAccepted::turn` for a browser-submitted one), and is what lets a
   /// tab tell *its own* turn ending from any of the other turns sharing this stream —

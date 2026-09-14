@@ -133,12 +133,13 @@ use std::{
   collections::{HashMap, VecDeque},
   io::{self, IsTerminal, Write},
   net::SocketAddr,
+  pin::Pin,
   sync::Arc,
 };
 
 use agent::{
-  Agent, AgentResult, AgentStreamEvent,
-  agent::{BeforeToolCallback, Conversation, Event},
+  Agent, AgentOutcome, AgentRunState, AgentStreamEvent,
+  agent::{ApprovalStore, BeforeToolCallback, Conversation, Event, FileApprovalStore},
   callback::{
     dual_approval::{
       ApprovalChannel, ApprovalMeta, ApprovalOutcome, ApprovalRegistry, DualApprovalCallback,
@@ -163,7 +164,7 @@ use reedline::{
   Reedline, Signal, Vi, default_emacs_keybindings, default_vi_insert_keybindings,
   default_vi_normal_keybindings,
 };
-use shared::{ChatEvent, MessageOrigin, commands as command_set};
+use shared::{ChatEvent, MessageOrigin, PendingApprovalView, commands as command_set};
 use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc};
 
 const SYSTEM_PROMPT: &str =
@@ -246,6 +247,10 @@ async fn main() -> anyhow::Result<()> {
   // normal thing to want from a CLI. Nothing is ever swept; only an explicit `--fresh` /
   // `/reset` clears a session.
   let store = FileSessionStore::new_persistent(config::cli_session_dir());
+
+  // Kept apart from the session store on purpose: a suspended run and a finished
+  // transcript have opposite lifetimes. See `agent::agent::approval_store`.
+  let approvals_store = Arc::new(FileApprovalStore::new(config::cli_approval_dir()));
 
   // `--list` / `--rm` are one-shot session-management commands, handled before touching
   // the LLM provider at all: neither needs a configured `Agent` (see the module docs).
@@ -404,6 +409,10 @@ async fn main() -> anyhow::Result<()> {
 
   if args.contains_key("fresh") {
     commands::clear_session(&store, approval_callback.as_deref(), &session_id).await;
+    // Same reasoning as `/reset`: the suspended run holds this conversation mid-turn,
+    // so clearing the history has to clear it too or the session could be resumed back
+    // into what was just cleared.
+    approvals_store.remove(LOCAL_SCOPE, &session_id).await;
     println!("Cleared history for session `{session_id}`.\n");
   }
 
@@ -421,6 +430,7 @@ async fn main() -> anyhow::Result<()> {
       session_id.clone(),
       Arc::clone(&approvals),
       approval_callback.clone(),
+      Arc::clone(&approvals_store),
       web_events_tx.clone(),
     ));
     let dist_dir = config::cli_web_dist_dir();
@@ -513,6 +523,12 @@ async fn main() -> anyhow::Result<()> {
     command_set::hint()
   );
 
+  // A suspended run is invisible otherwise: it produced no answer and, deliberately,
+  // left nothing in the session history. Announcing it here is what makes "come back
+  // tomorrow and approve it" a thing a person can actually do — without this, the run
+  // is on disk and nobody knows.
+  announce_suspended_run(&approvals_store, &session_id).await;
+
   loop {
     let (line, next_editor) = read_line(editor).await?;
     editor = next_editor;
@@ -530,6 +546,55 @@ async fn main() -> anyhow::Result<()> {
     // it through the one renderer (`print_chat_events`) rather than printing directly.
     match command_set::parse(input) {
       Some(command_set::Command::Exit) => break,
+      // Turn-level, so dispatched here rather than through `commands::execute` — see
+      // `command_set::Command`'s docs. `/resume` falls through to the turn driver below
+      // with `TurnInput::Resume`; `/discard` is settled right here.
+      Some(command_set::Command::Resume) => {
+        let _ = web_events_tx.send(ChatEvent::UserMessage {
+          text: input.to_owned(),
+          origin: MessageOrigin::Terminal,
+        });
+        if !approvals_store
+          .pending(LOCAL_SCOPE, &session_id)
+          .await
+          .is_empty()
+        {
+          let turn = web::new_turn_id();
+          drive_terminal_turn(
+            &agent,
+            &store,
+            &approvals_store,
+            &turn_lock,
+            &approvals,
+            &session_id,
+            TurnInput::Resume,
+            &turn,
+            &web_events_tx,
+          )
+          .await?;
+        } else {
+          let _ = web_events_tx.send(ChatEvent::SystemNotice {
+            text: "没有被暂停的一轮可以继续。".to_owned(),
+          });
+        }
+        continue;
+      }
+      Some(command_set::Command::Discard) => {
+        let _ = web_events_tx.send(ChatEvent::UserMessage {
+          text: input.to_owned(),
+          origin: MessageOrigin::Terminal,
+        });
+        let discarded =
+          discard_suspended_run(&store, &approvals_store, &turn_lock, &session_id).await;
+        let _ = web_events_tx.send(ChatEvent::SystemNotice {
+          text: if discarded {
+            "已放弃被暂停的一轮，已完成的部分保留在历史中。".to_owned()
+          } else {
+            "没有被暂停的一轮可以放弃。".to_owned()
+          },
+        });
+        continue;
+      }
       Some(command) => {
         commands::execute(
           command,
@@ -541,6 +606,12 @@ async fn main() -> anyhow::Result<()> {
           &web_events_tx,
         )
         .await;
+        // A reset clears the suspended run along with the history it belongs to: the
+        // run holds that same conversation mid-turn, so keeping it would let a cleared
+        // session be resumed straight back into what was just cleared.
+        if matches!(command, command_set::Command::Reset) {
+          approvals_store.remove(LOCAL_SCOPE, &session_id).await;
+        }
         continue;
       }
       None => {}
@@ -550,6 +621,18 @@ async fn main() -> anyhow::Result<()> {
     // before anything below treats the line as a message: while something is pending, a
     // bare `y` is far more likely to be an answer than a chat turn.
     if resolve_pending_approval(&approvals, &web_events_tx, input) {
+      continue;
+    }
+
+    // A turn cannot start while one is suspended — see `suspended_run_notice`. Checked
+    // after the approval path above, so answering a live prompt still works, and after
+    // the commands, so `/resume` and `/discard` are reachable from here.
+    if let Some(notice) = suspended_run_notice(&approvals_store, &session_id).await {
+      let _ = web_events_tx.send(ChatEvent::UserMessage {
+        text: input.to_owned(),
+        origin: MessageOrigin::Terminal,
+      });
+      let _ = web_events_tx.send(ChatEvent::SystemNotice { text: notice });
       continue;
     }
 
@@ -581,10 +664,11 @@ async fn main() -> anyhow::Result<()> {
       drive_terminal_turn(
         &agent,
         &store,
+        &approvals_store,
         &turn_lock,
         &approvals,
         &session_id,
-        input,
+        TurnInput::Fresh(input),
         &turn,
         &web_events_tx,
       )
@@ -615,18 +699,29 @@ async fn main() -> anyhow::Result<()> {
       // Dropping the turn's sender ends the pump, which then clears anything it raised.
       let raised = pump.await.unwrap_or_default();
       approvals.discard(&raised);
-      let result = result?;
-      // No per-round `ToolCallsStarted`/`Finished` to broadcast here (this branch never
-      // sees them at all — see `run_turn`'s docs), just the final text and completion,
-      // so a browser watching along at least sees *something* for a non-streaming turn
-      // instead of silence until the next streaming one.
-      let _ = web_events_tx.send(ChatEvent::Token {
-        text: result.output,
-      });
-      let _ = web_events_tx.send(ChatEvent::Done {
-        turn,
-        budget_exhausted: result.budget_exhausted,
-      });
+      match result? {
+        AgentOutcome::Done(result) => {
+          // No per-round `ToolCallsStarted`/`Finished` to broadcast here (this branch
+          // never sees them at all — see `run_turn`'s docs), just the final text and
+          // completion, so a browser watching along at least sees *something* for a
+          // non-streaming turn instead of silence until the next streaming one.
+          let _ = web_events_tx.send(ChatEvent::Token {
+            text: result.output,
+          });
+          let _ = web_events_tx.send(ChatEvent::Done {
+            turn,
+            budget_exhausted: result.budget_exhausted,
+          });
+        }
+        AgentOutcome::Suspended(state) => {
+          let pending = record_suspension(&approvals_store, &session_id, &state).await;
+          let _ = web_events_tx.send(ChatEvent::TurnSuspended {
+            turn,
+            run: session_id.clone(),
+            pending,
+          });
+        }
+      }
     }
   }
 
@@ -650,6 +745,19 @@ async fn main() -> anyhow::Result<()> {
   Ok(())
 }
 
+/// What a terminal turn is starting from.
+///
+/// A resumed turn takes no input text: the message that started it is already inside the
+/// stored run, which is the whole point of storing it. Modelling that as an enum rather
+/// than an `Option<&str>` keeps the two from being confused at the call site — an empty
+/// string is a perfectly valid thing to submit, and would otherwise silently mean
+/// "resume".
+#[derive(Debug, Clone, Copy)]
+enum TurnInput<'a> {
+  Fresh(&'a str),
+  Resume,
+}
+
 /// Run one terminal-originated streaming turn, publishing any approval it raises to the
 /// whole session and offering to answer it right here.
 ///
@@ -669,22 +777,32 @@ async fn main() -> anyhow::Result<()> {
 async fn drive_terminal_turn(
   agent: &Agent,
   store: &FileSessionStore,
+  approvals_store: &FileApprovalStore,
   turn_lock: &AsyncMutex<()>,
   approvals: &Arc<ApprovalRegistry>,
   session_id: &str,
-  input: &str,
+  input: TurnInput<'_>,
   turn: &str,
   events: &broadcast::Sender<ChatEvent>,
 ) -> anyhow::Result<()> {
   let (approval_tx, mut approval_rx) = mpsc::unbounded_channel::<PendingApproval>();
-  let stream = run_turn_stream(
-    agent,
-    store,
-    turn_lock,
-    session_id,
-    input,
-    ApprovalChannel::Session(approval_tx),
-  );
+  let channel = ApprovalChannel::Session(approval_tx);
+  // Both shapes of turn are driven identically from here on — same approval plumbing,
+  // same console prompt, same broadcast. Resuming differs only in where the transcript
+  // comes from, which is settled before the first event is yielded.
+  let stream: Pin<Box<dyn Stream<Item = anyhow::Result<AgentStreamEvent>> + '_>> = match input {
+    TurnInput::Fresh(text) => Box::pin(run_turn_stream(
+      agent, store, turn_lock, session_id, text, channel,
+    )),
+    TurnInput::Resume => Box::pin(resume_turn_stream(
+      agent,
+      store,
+      approvals_store,
+      turn_lock,
+      session_id,
+      channel,
+    )),
+  };
   futures::pin_mut!(stream);
 
   let mut raised = Vec::new();
@@ -750,6 +868,18 @@ async fn drive_terminal_turn(
       }
       next = stream.next() => {
         match next {
+          // Stored and announced here rather than inside the turn driver, because the
+          // description a view needs is only meaningful once the run is actually on
+          // disk to be resumed from.
+          Some(Ok(AgentStreamEvent::Suspended(state))) => {
+            let pending = record_suspension(approvals_store, session_id, &state).await;
+            let _ = events.send(ChatEvent::TurnSuspended {
+              turn: turn.to_owned(),
+              run: session_id.to_owned(),
+              pending,
+            });
+            break;
+          }
           Some(Ok(event)) => {
             for chat_event in web::to_chat_events(&event, turn) {
               let _ = events.send(chat_event);
@@ -963,6 +1093,21 @@ fn print_chat_event(event: ChatEvent) {
       ));
     }
     ChatEvent::Done { .. } => term_write("\n\n"),
+    ChatEvent::TurnSuspended { pending, .. } => {
+      // Rendered here rather than by the turn driver for the same reason an approval
+      // prompt is: this is the one renderer for the terminal, so a suspension caused by
+      // a browser-submitted turn shows up here too.
+      let tools: Vec<&str> = pending.iter().map(|call| call.tool.as_str()).collect();
+      term_write(&format!(
+        "\n\n[suspended] 无人审批，本轮已暂停并保存（待批准: {}）。\n\
+         输入 /resume 继续并重新询问，或 /discard 放弃本轮。\n\n",
+        if tools.is_empty() {
+          "—".to_owned()
+        } else {
+          tools.join(", ")
+        }
+      ));
+    }
     // `turn` is ignored here, unlike in a browser tab: this terminal has no per-turn UI
     // state to unwind (it prints as events arrive and blocks on its own turns), so which
     // turn an error belongs to changes nothing about how it is shown.
@@ -1054,7 +1199,7 @@ fn run_turn_stream<'a>(
     let _guard = turn_lock.lock().await;
     let history = store.history(LOCAL_SCOPE, session_id).await;
 
-    let inner = agent.run_continuing_stream(
+    let inner = agent.run_continuing_stream_resumable(
       Conversation::new(session_id, history).with_scope(LOCAL_SCOPE),
       input,
     );
@@ -1079,26 +1224,30 @@ async fn run_turn(
   session_id: &str,
   input: &str,
   channel: ApprovalChannel,
-) -> anyhow::Result<AgentResult> {
+) -> anyhow::Result<AgentOutcome> {
   let _guard = turn_lock.lock().await;
   let history = store.history(LOCAL_SCOPE, session_id).await;
 
-  let result = with_approval_channel(
+  let outcome = with_approval_channel(
     channel,
-    agent.run_continuing(
+    agent.run_continuing_resumable(
       Conversation::new(session_id, history).with_scope(LOCAL_SCOPE),
       input,
     ),
   )
   .await?;
-  record_turn(
-    store,
-    session_id,
-    result.context.events.clone(),
-    result.budget_exhausted,
-  )
-  .await;
-  Ok(result)
+  // A suspension is stored by the caller instead (see `record_suspension`): it has the
+  // approval store, and it is the one that has to announce the result either way.
+  if let AgentOutcome::Done(result) = &outcome {
+    record_turn(
+      store,
+      session_id,
+      result.context.events.clone(),
+      result.budget_exhausted,
+    )
+    .await;
+  }
+  Ok(outcome)
 }
 
 /// Persist a completed turn's transcript, warning first if the round budget ran out
@@ -1114,6 +1263,148 @@ async fn record_turn(
     tracing::warn!("tool round budget exhausted; answer may be based on partial work");
   }
   store.save(LOCAL_SCOPE, session_id, events).await;
+}
+
+/// Store a turn that stopped waiting on an approval, and describe what it is waiting on.
+///
+/// The suspension counterpart of [`record_turn`], and shared between the two front-ends
+/// for the same reason: both have to store the run before announcing it, or a view could
+/// be told to resume something that is not there yet.
+///
+/// Note what is *not* saved: the session transcript. A suspended turn did not happen —
+/// its user message and partial tool results live inside the stored run and come back
+/// when it resumes. Writing them to history instead would leave the conversation holding
+/// tool calls with no results, which is the one shape a provider will not accept (see
+/// [`AgentRunState`]).
+///
+/// Keyed by `session_id`, so a session has at most one suspended run. That is a real
+/// constraint rather than a shortcut: the stored run holds history the session store does
+/// not have yet, so a second turn started alongside it would branch from a transcript
+/// missing the first one — and resuming the first afterwards would splice two divergent
+/// histories together. [`suspended_run_notice`] is what keeps a session from getting
+/// there.
+async fn record_suspension(
+  approvals_store: &FileApprovalStore,
+  session_id: &str,
+  state: &AgentRunState,
+) -> Vec<PendingApprovalView> {
+  approvals_store.put(LOCAL_SCOPE, session_id, state).await;
+  let requested_at = chrono::Utc::now().timestamp();
+  state
+    .suspended
+    .iter()
+    .map(|call| PendingApprovalView {
+      id: call.tool_call_id.clone(),
+      tool: call.name.clone(),
+      arguments: call.raw_arguments.clone(),
+      requested_at,
+    })
+    .collect()
+}
+
+/// Carry on the suspended run stored for `session_id`, with the same load/run/save
+/// contract as [`run_turn_stream`] — and the same `turn_lock`, since a resumed turn is a
+/// turn like any other and races the same way with one typed in another view.
+///
+/// No history is loaded: the stored run already carries the transcript as it stood when
+/// it stopped, including the user message that started it. Reloading and replaying would
+/// re-run the tool calls that already completed in the suspended round.
+///
+/// No decisions are supplied either, so every pending call goes back through the
+/// before-tool chain and whatever suspended it asks again — for an approval, that means
+/// the prompt is simply re-raised to whoever is listening now, through the very same
+/// [`ApprovalChannel`] a fresh turn uses. That is what makes "resume" need no approval UI
+/// of its own on either front-end.
+fn resume_turn_stream<'a>(
+  agent: &'a Agent,
+  store: &'a FileSessionStore,
+  approvals_store: &'a FileApprovalStore,
+  turn_lock: &'a AsyncMutex<()>,
+  session_id: &'a str,
+  channel: ApprovalChannel,
+) -> impl Stream<Item = anyhow::Result<AgentStreamEvent>> + 'a {
+  stream! {
+    let _guard = turn_lock.lock().await;
+    let Some(state) = approvals_store.take(LOCAL_SCOPE, session_id).await else {
+      // Another view resumed or discarded it between the check and here.
+      return;
+    };
+
+    let inner = agent.resume_stream(state, HashMap::new());
+    futures::pin_mut!(inner);
+
+    while let Some(event) = with_approval_channel(channel.clone(), inner.next()).await {
+      if let Ok(AgentStreamEvent::Done { context, budget_exhausted, .. }) = &event {
+        record_turn(store, session_id, context.events.clone(), *budget_exhausted).await;
+      }
+      yield event;
+    }
+  }
+}
+
+/// Give up on the suspended run stored for `session_id` and commit what it had done, so
+/// the conversation can carry on from there instead of being stuck behind a decision
+/// nobody intends to make.
+///
+/// The transcript is repaired on the way out ([`AgentRunState::abandon`]) and only then
+/// written to history — the whole point being to leave a session that can take another
+/// turn. Returns whether there was anything to discard.
+async fn discard_suspended_run(
+  store: &FileSessionStore,
+  approvals_store: &FileApprovalStore,
+  turn_lock: &AsyncMutex<()>,
+  session_id: &str,
+) -> bool {
+  // The same lock a turn takes: this writes the session transcript, so it must not
+  // interleave with a turn doing the same.
+  let _guard = turn_lock.lock().await;
+  let Some(state) = approvals_store.take(LOCAL_SCOPE, session_id).await else {
+    return false;
+  };
+  let context = state.abandon();
+  record_turn(store, session_id, context.events, false).await;
+  true
+}
+
+/// The notice to show when a new turn is attempted while a run is suspended, or `None`
+/// if nothing is suspended.
+///
+/// A session with a suspended run cannot take a new turn: the stored run holds history
+/// that has not reached the session store, so a turn started now would branch from an
+/// incomplete transcript (see [`record_suspension`]). Rather than silently discarding
+/// either side, the input is refused and both ways forward are named.
+async fn suspended_run_notice(
+  approvals_store: &FileApprovalStore,
+  session_id: &str,
+) -> Option<String> {
+  (!approvals_store
+    .pending(LOCAL_SCOPE, session_id)
+    .await
+    .is_empty())
+  .then(|| {
+    "本会话有一轮正在等待审批，需先处理才能开始新对话：\
+       /resume 继续（会重新询问），/discard 放弃该轮。"
+      .to_owned()
+  })
+}
+
+/// Tell the person at the terminal that this session has a run waiting on them.
+///
+/// Printed directly rather than broadcast as a [`ChatEvent`]: this runs before the REPL
+/// starts, as part of the same banner block, and a browser tab has its own way of
+/// learning the same thing (`GET /api/suspended`, see [`web`]) that does not depend on
+/// having been connected when this happened.
+async fn announce_suspended_run(approvals_store: &FileApprovalStore, session_id: &str) {
+  let pending = approvals_store.pending(LOCAL_SCOPE, session_id).await;
+  if pending.is_empty() {
+    return;
+  }
+  let tools: Vec<&str> = pending.iter().map(|call| call.name.as_str()).collect();
+  println!(
+    "⏸  本会话有一轮在等待审批时被暂停（待批准: {}）。\n\
+     输入 /resume 继续（会重新询问待批准的操作），或 /discard 放弃该轮。\n",
+    tools.join(", ")
+  );
 }
 
 /// `--list`: print every session stored under [`LOCAL_SCOPE`], most recently active

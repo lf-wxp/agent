@@ -83,6 +83,16 @@ pub async fn execute(
     // a tab closing is not a reason to end it. `/help` does not offer this on the web for
     // the same reason (`available_on_web`); someone can still type it.
     Command::Exit => "该命令仅在命令行中可用，关闭标签页即可离开。".to_owned(),
+    // Turn-level, so every front-end dispatches these before reaching here — see
+    // `Command`'s docs. Reaching this arm means one of them forgot to, which would
+    // otherwise show up as a command that silently does nothing.
+    Command::Resume | Command::Discard => {
+      tracing::error!(
+        ?command,
+        "a turn-level command reached the side-effect path"
+      );
+      "该命令未被当前界面处理，请报告此问题。".to_owned()
+    }
   };
 
   let _ = events.send(ChatEvent::SystemNotice { text: notice });
@@ -210,9 +220,7 @@ mod tests {
   #[tokio::test]
   async fn reset_forgets_remembered_approval_decisions() {
     use agent::{
-      agent::{
-        BeforeToolCallback, ExecutionContext, ToolCallDecision, ToolCallView, ToolResultStatus,
-      },
+      agent::{BeforeToolCallback, ExecutionContext, ToolCallDecision, ToolCallView},
       callback::dual_approval::{ApprovalChannel, ApprovalOutcome, with_approval_channel},
     };
 
@@ -256,8 +264,10 @@ mod tests {
 
     clear_session(&store, Some(&approvals), "s1").await;
 
-    // Forgotten: nothing is remembered, and with no front-end listening the callback
-    // fails closed rather than silently re-approving.
+    // Forgotten: nothing is remembered, so the call is gated again rather than silently
+    // proceeding. With no front-end listening it suspends rather than refusing — the
+    // default, see `WhenUnanswered` — but either way the point holds: the tool does not
+    // run on the strength of an answer given before the reset.
     let (dead_tx, dead_rx) = tokio::sync::mpsc::unbounded_channel();
     drop(dead_rx);
     let after_reset = with_approval_channel(
@@ -266,11 +276,12 @@ mod tests {
     )
     .await;
     assert!(
-      matches!(
-        after_reset,
-        ToolCallDecision::ShortCircuit(ToolResultStatus::Error, _)
-      ),
+      !after_reset.is_proceed(),
       "after a reset the tool must be gated again, not silently allowed"
+    );
+    assert!(
+      matches!(after_reset, ToolCallDecision::Suspend),
+      "with nobody listening the question is kept, not answered"
     );
   }
 

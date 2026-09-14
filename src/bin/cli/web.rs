@@ -19,11 +19,11 @@
 //! proxy without adding real authentication; the host check is a guard against one
 //! specific trick, not a substitute for one.
 
-use std::{convert::Infallible, net::SocketAddr, path::Path as FsPath, sync::Arc};
+use std::{convert::Infallible, net::SocketAddr, path::Path as FsPath, pin::Pin, sync::Arc};
 
 use agent::{
   Agent, AgentStreamEvent,
-  agent::{ContentItem, Event, ToolResultStatus},
+  agent::{ApprovalStore, ContentItem, Event, FileApprovalStore, ToolResultStatus},
   callback::dual_approval::{
     ApprovalChannel, ApprovalMeta, ApprovalOutcome, ApprovalRegistry, DualApprovalCallback,
     PendingApproval,
@@ -53,7 +53,7 @@ use tower_http::{
   services::{ServeDir, ServeFile},
 };
 
-use super::{LOCAL_SCOPE, run_turn_stream};
+use super::{LOCAL_SCOPE, resume_turn_stream, run_turn_stream};
 
 /// Capacity of [`WebState::events`]: how many not-yet-delivered frames a slow/disconnected
 /// subscriber may fall behind by before [`broadcast::Sender::send`] starts overwriting
@@ -84,6 +84,11 @@ pub struct WebState {
   /// callback would otherwise keep applying. `None` under `--no-approval`/an empty
   /// `--dangerous-tools`, where nothing is gated and so nothing can have been remembered.
   approval_callback: Option<Arc<DualApprovalCallback>>,
+  /// Where a turn that stopped waiting on an approval is kept — the *same* store the
+  /// terminal loop holds, for the same reason the registry above is shared: a run
+  /// suspended by a terminal-typed turn must be resumable from a browser tab, and the
+  /// other way round.
+  approvals_store: Arc<FileApprovalStore>,
   /// Every [`ChatEvent`] this process produces, from *any* turn regardless of which
   /// front-end started it — this is the one channel that makes a terminal-typed message
   /// (or one from a different browser tab) show up here. `main.rs`'s terminal loop
@@ -96,6 +101,10 @@ pub struct WebState {
 }
 
 impl WebState {
+  // Eight `Arc`/handle parameters, each a distinct piece of process-wide state this
+  // binary already owns. A parameter struct would only move the same list one level out
+  // and add a type whose sole purpose is to be destructured here.
+  #[allow(clippy::too_many_arguments)]
   pub fn new(
     agent: Arc<Agent>,
     store: Arc<FileSessionStore>,
@@ -103,6 +112,7 @@ impl WebState {
     session_id: String,
     approvals: Arc<ApprovalRegistry>,
     approval_callback: Option<Arc<DualApprovalCallback>>,
+    approvals_store: Arc<FileApprovalStore>,
     events: broadcast::Sender<ChatEvent>,
   ) -> Self {
     Self {
@@ -112,8 +122,37 @@ impl WebState {
       session_id,
       approvals,
       approval_callback,
+      approvals_store,
       events,
     }
+  }
+
+  /// Whether this session has a turn waiting on an approval.
+  async fn has_suspended_run(&self) -> bool {
+    !self.suspended_pending().await.is_empty()
+  }
+
+  /// What this session's suspended run is waiting on, in the wire shape, or empty if
+  /// nothing is suspended.
+  ///
+  /// `requested_at` is stamped at read time rather than carried from when the prompt was
+  /// first raised: a stored run has no live clock behind it, and reporting the original
+  /// instant would have a client render "waiting for 14 hours" as though something were
+  /// still counting down. Nothing is — it waits until answered.
+  async fn suspended_pending(&self) -> Vec<PendingApprovalView> {
+    let now = chrono::Utc::now().timestamp();
+    self
+      .approvals_store
+      .pending(LOCAL_SCOPE, &self.session_id)
+      .await
+      .into_iter()
+      .map(|call| PendingApprovalView {
+        id: call.tool_call_id,
+        tool: call.name,
+        arguments: call.raw_arguments,
+        requested_at: now,
+      })
+      .collect()
   }
 }
 
@@ -198,6 +237,7 @@ pub async fn serve(
     .route("/api/stream", get(stream_handler))
     .route("/api/approvals", get(approvals_handler))
     .route("/api/approve/{id}", post(approve_handler))
+    .route("/api/suspended", get(suspended_handler))
     // Only the API routes: a static asset is inert, and rejecting one would break the
     // `trunk serve` workflow above for no gain.
     .layer(middleware::from_fn(guard_loopback_host))
@@ -325,16 +365,64 @@ pub(crate) async fn chat_handler(
 
   if let Some(command) = shared::commands::parse(&request.input) {
     let turn = new_turn_id();
-    super::commands::execute(
-      command,
-      &request.input,
-      MessageOrigin::Web,
-      &state.store,
-      state.approval_callback.as_deref(),
-      &state.session_id,
-      &state.events,
-    )
-    .await;
+
+    // Turn-level commands are dispatched here rather than through `commands::execute`,
+    // exactly as the terminal loop does — see `shared::commands::Command`.
+    match command {
+      shared::commands::Command::Resume => {
+        let _ = state.events.send(ChatEvent::UserMessage {
+          text: request.input.clone(),
+          origin: MessageOrigin::Web,
+        });
+        if state.has_suspended_run().await {
+          tokio::spawn(drive_turn(state, turn.clone(), TurnInput::Resume));
+          return Ok((StatusCode::ACCEPTED, Json(ChatAccepted { turn })));
+        }
+        let _ = state.events.send(ChatEvent::SystemNotice {
+          text: "没有被暂停的一轮可以继续。".to_owned(),
+        });
+      }
+      shared::commands::Command::Discard => {
+        let _ = state.events.send(ChatEvent::UserMessage {
+          text: request.input.clone(),
+          origin: MessageOrigin::Web,
+        });
+        let discarded = super::discard_suspended_run(
+          &state.store,
+          &state.approvals_store,
+          &state.turn_lock,
+          &state.session_id,
+        )
+        .await;
+        let _ = state.events.send(ChatEvent::SystemNotice {
+          text: if discarded {
+            "已放弃被暂停的一轮，已完成的部分保留在历史中。".to_owned()
+          } else {
+            "没有被暂停的一轮可以放弃。".to_owned()
+          },
+        });
+      }
+      _ => {
+        super::commands::execute(
+          command,
+          &request.input,
+          MessageOrigin::Web,
+          &state.store,
+          state.approval_callback.as_deref(),
+          &state.session_id,
+          &state.events,
+        )
+        .await;
+        // A reset clears the suspended run with it: see the terminal loop's equivalent.
+        if matches!(command, shared::commands::Command::Reset) {
+          state
+            .approvals_store
+            .remove(super::LOCAL_SCOPE, &state.session_id)
+            .await;
+        }
+      }
+    }
+
     // Reported as an immediately-finished turn purely to release *this tab's* composer:
     // it went into "sending" when it posted and only a `Done` carrying the id in this
     // response frees it, so a command producing no turn at all would leave it disabled
@@ -348,9 +436,40 @@ pub(crate) async fn chat_handler(
     return Ok((StatusCode::ACCEPTED, Json(ChatAccepted { turn })));
   }
 
+  // A turn cannot start while one is suspended — see `super::suspended_run_notice` for
+  // why the two cannot coexist. Reported as a notice plus an immediate `Done`, the same
+  // shape a command takes, so the tab's composer is released.
+  if let Some(notice) = super::suspended_run_notice(&state.approvals_store, &state.session_id).await
+  {
+    let turn = new_turn_id();
+    let _ = state.events.send(ChatEvent::UserMessage {
+      text: request.input.clone(),
+      origin: MessageOrigin::Web,
+    });
+    let _ = state.events.send(ChatEvent::SystemNotice { text: notice });
+    let _ = state.events.send(ChatEvent::Done {
+      turn: turn.clone(),
+      budget_exhausted: false,
+    });
+    return Ok((StatusCode::ACCEPTED, Json(ChatAccepted { turn })));
+  }
+
   let turn = new_turn_id();
-  tokio::spawn(drive_turn(state, turn.clone(), request.input));
+  tokio::spawn(drive_turn(
+    state,
+    turn.clone(),
+    TurnInput::Fresh(request.input),
+  ));
   Ok((StatusCode::ACCEPTED, Json(ChatAccepted { turn })))
+}
+
+/// What a web turn is starting from — the counterpart of the terminal's own
+/// `super::TurnInput`, and separate from it only because a spawned turn must own its
+/// input rather than borrow it.
+#[derive(Debug, Clone)]
+pub(crate) enum TurnInput {
+  Fresh(String),
+  Resume,
 }
 
 /// Runs one web-originated turn to completion, broadcasting every event it produces —
@@ -366,21 +485,36 @@ pub(crate) async fn chat_handler(
 /// `drive_terminal_turn` is documented as mirroring this function, and a module-private
 /// one is not nameable from there — so the reference that explains the symmetry would
 /// render as dead text.
-pub(crate) async fn drive_turn(state: Arc<WebState>, turn: String, input: String) {
-  let _ = state.events.send(ChatEvent::UserMessage {
-    text: input.clone(),
-    origin: MessageOrigin::Web,
-  });
+pub(crate) async fn drive_turn(state: Arc<WebState>, turn: String, input: TurnInput) {
+  if let TurnInput::Fresh(text) = &input {
+    let _ = state.events.send(ChatEvent::UserMessage {
+      text: text.clone(),
+      origin: MessageOrigin::Web,
+    });
+  }
 
   let (approval_tx, mut approval_rx) = mpsc::unbounded_channel::<PendingApproval>();
-  let stream = run_turn_stream(
-    &state.agent,
-    &state.store,
-    &state.turn_lock,
-    &state.session_id,
-    &input,
-    ApprovalChannel::Session(approval_tx),
-  );
+  let channel = ApprovalChannel::Session(approval_tx);
+  // Identical plumbing either way — see `drive_terminal_turn`, which mirrors this.
+  let stream: Pin<Box<dyn Stream<Item = anyhow::Result<AgentStreamEvent>> + Send + '_>> =
+    match &input {
+      TurnInput::Fresh(text) => Box::pin(run_turn_stream(
+        &state.agent,
+        &state.store,
+        &state.turn_lock,
+        &state.session_id,
+        text,
+        channel,
+      )),
+      TurnInput::Resume => Box::pin(resume_turn_stream(
+        &state.agent,
+        &state.store,
+        &state.approvals_store,
+        &state.turn_lock,
+        &state.session_id,
+        channel,
+      )),
+    };
   futures::pin_mut!(stream);
 
   // Ids this turn published, so anything still unanswered when it ends can be cleared
@@ -418,6 +552,24 @@ pub(crate) async fn drive_turn(state: Arc<WebState>, turn: String, input: String
       }
       next = stream.next() => {
         match next {
+          // Stored before it is announced, so a tab that reacts by calling
+          // `POST /api/resume` cannot get there before the run is on disk. Same
+          // ordering, and the same reason, as registering an approval before
+          // broadcasting it above.
+          Some(Ok(AgentStreamEvent::Suspended(run_state))) => {
+            let pending = super::record_suspension(
+              &state.approvals_store,
+              &state.session_id,
+              &run_state,
+            )
+            .await;
+            let _ = state.events.send(ChatEvent::TurnSuspended {
+              turn: turn.clone(),
+              run: state.session_id.clone(),
+              pending,
+            });
+            break;
+          }
           Some(Ok(event)) => {
             for chat_event in to_chat_events(&event, &turn) {
               let _ = state.events.send(chat_event);
@@ -473,6 +625,21 @@ fn to_pending_approval_view(meta: ApprovalMeta) -> PendingApprovalView {
     arguments: meta.raw_arguments,
     requested_at: meta.requested_at,
   }
+}
+
+/// `GET /api/suspended`: what this session's suspended run is waiting on, or an empty
+/// list if nothing is suspended.
+///
+/// The same role [`approvals_handler`] plays for a *live* prompt, for the case where the
+/// turn is no longer running at all. A tab opened after a suspension — or after the
+/// process restarted — missed the [`ChatEvent::TurnSuspended`] frame and will find
+/// nothing in [`history_handler`] either, since a suspended turn is deliberately not
+/// written to the transcript. Without this route such a tab shows a finished-looking
+/// conversation with no sign that anything is waiting.
+async fn suspended_handler(State(state): State<Arc<WebState>>) -> Json<Vec<PendingApprovalView>> {
+  // Peeked rather than taken: this is a read for display, and taking would consume the
+  // run that `POST /api/chat` with `/resume` is about to need.
+  Json(state.suspended_pending().await)
 }
 
 /// `POST /api/approve/{id}`: resolve a pending [`ChatEvent::ApprovalRequired`] by tool
@@ -616,6 +783,11 @@ pub(crate) fn to_chat_events(event: &AgentStreamEvent, turn: &str) -> Vec<ChatEv
       turn: turn.to_owned(),
       budget_exhausted: *budget_exhausted,
     }],
+    // Handled by the turn driver rather than here: announcing a suspension means first
+    // storing the run it can be resumed from, which is a side effect this conversion
+    // has no business performing — and the resulting `ChatEvent::TurnSuspended` needs
+    // the run id that storing it produces. See `drive_turn`.
+    AgentStreamEvent::Suspended(_) => Vec::new(),
   }
 }
 

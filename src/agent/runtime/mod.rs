@@ -125,6 +125,28 @@ pub enum AgentStreamEvent {
     /// See [`AgentResult::budget_exhausted`].
     budget_exhausted: bool,
   },
+  /// The run stopped before a tool call it could not decide, and can be carried on with
+  /// [`Agent::resume_stream`]. Always the last item, in place of [`Self::Done`].
+  ///
+  /// Only produced by [`Agent::run_continuing_stream_resumable`] and
+  /// [`Agent::resume_stream`]; [`Agent::run_stream`] and
+  /// [`Agent::run_continuing_stream`] record such a call as unanswered and carry on,
+  /// since their caller holds only a stream and has nowhere to resume from.
+  Suspended(AgentRunState),
+}
+
+/// What a streaming run should do about a round that cannot finish.
+///
+/// The streaming loop needs this as a parameter where the plain one does not: a
+/// non-resumable caller there simply re-enters [`Agent::drive`] after repairing the
+/// transcript, which is not something a caller can do to a generator half way through
+/// consuming it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnSuspend {
+  /// Close the calls out as unanswered and carry on.
+  RecordUnanswered,
+  /// Emit [`AgentStreamEvent::Suspended`] and end the stream.
+  Yield,
 }
 
 /// One tool call that was stopped before it ran, awaiting a decision that could not be
@@ -730,10 +752,142 @@ impl Agent {
     // and borrows nothing from the caller's argument.
     let conversation = conversation.into();
     stream! {
-      let mut context = self.seed_context(conversation, user_input);
+      let context = self.seed_context(conversation, user_input);
+      let inner = self.drive_stream(
+        context,
+        Vec::new(),
+        HashMap::new(),
+        OnSuspend::RecordUnanswered,
+        false,
+      );
+      futures::pin_mut!(inner);
+      while let Some(event) = inner.next().await {
+        yield event;
+      }
+    }
+  }
+
+  /// Like [`Self::run_continuing_stream`], but ends with
+  /// [`AgentStreamEvent::Suspended`] when a tool call cannot be decided, instead of
+  /// recording it as unanswered.
+  ///
+  /// The streaming counterpart of [`Self::run_continuing_resumable`]; see
+  /// [`Self::resume_stream`] for carrying on afterwards.
+  pub fn run_continuing_stream_resumable<'a>(
+    &'a self,
+    conversation: impl Into<Conversation>,
+    user_input: &'a str,
+  ) -> impl Stream<Item = anyhow::Result<AgentStreamEvent>> + 'a {
+    let conversation = conversation.into();
+    stream! {
+      let context = self.seed_context(conversation, user_input);
+      let inner = self.drive_stream(
+        context,
+        Vec::new(),
+        HashMap::new(),
+        OnSuspend::Yield,
+        false,
+      );
+      futures::pin_mut!(inner);
+      while let Some(event) = inner.next().await {
+        yield event;
+      }
+    }
+  }
+
+  /// Streaming counterpart of [`Self::resume`]: carry on a suspended run, forwarding
+  /// text as it arrives.
+  ///
+  /// `decisions` may be empty, and usually is for an interactive front-end. An
+  /// unanswered call goes back through the before-tool chain, so whatever suspended it
+  /// gets to ask again — which for [`crate::callback::dual_approval`] means the prompt
+  /// is simply re-raised to whoever is listening now. That is what makes "resume" and
+  /// "ask again" the same operation from a front-end's point of view: it renders the
+  /// prompt with the code it already has, rather than needing a second path for
+  /// answering a stored one. Supplying `decisions` is for the non-interactive case,
+  /// where the answer was collected out of band.
+  ///
+  /// A fingerprint mismatch arrives as the stream's first and only item, rather than as
+  /// a `Result` around the stream itself, matching how every other failure here is
+  /// reported.
+  pub fn resume_stream(
+    &self,
+    state: AgentRunState,
+    decisions: HashMap<String, ResumedDecision>,
+  ) -> impl Stream<Item = anyhow::Result<AgentStreamEvent>> + '_ {
+    stream! {
+      let current = self.fingerprint();
+      if let Some(reason) = state.fingerprint.mismatch(&current) {
+        yield Err(anyhow::anyhow!("cannot resume this run: {reason}"));
+        return;
+      }
+
+      let inner = self.drive_stream(
+        state.context,
+        state.suspended,
+        decisions,
+        OnSuspend::Yield,
+        state.budget_exhausted,
+      );
+      futures::pin_mut!(inner);
+      while let Some(event) = inner.next().await {
+        yield event;
+      }
+    }
+  }
+
+  /// The streaming tool-calling loop, shared by every streaming entry point.
+  ///
+  /// `pending` is non-empty only on the first pass of a resumed run, and is re-attempted
+  /// before the loop proper — only those calls, not the whole round, since their
+  /// siblings already ran (see [`Self::resume`]).
+  ///
+  /// `carried_budget_exhausted` is folded into whatever this run concludes, so a run
+  /// resumed after its budget ran out still reports having been cut short.
+  fn drive_stream<'a>(
+    &'a self,
+    mut context: ExecutionContext,
+    pending: Vec<SuspendedToolCall>,
+    decisions: HashMap<String, ResumedDecision>,
+    on_suspend: OnSuspend,
+    carried_budget_exhausted: bool,
+  ) -> impl Stream<Item = anyhow::Result<AgentStreamEvent>> + 'a {
+    stream! {
+      // The resumed round, if this is one. Re-executed before any request is issued, so
+      // the transcript is never sent to a model while it still holds calls with no
+      // results — see `drive`'s docs for why that invariant lives in the control flow.
+      if !pending.is_empty() {
+        let calls = rebuild_tool_calls(&pending);
+        let round = self.execute_tool_calls(&mut context, &calls, &decisions).await;
+        let mut finished_items = round.completed;
+
+        if !round.suspended.is_empty() {
+          match on_suspend {
+            OnSuspend::Yield => {
+              if !finished_items.is_empty() {
+                yield Ok(AgentStreamEvent::ToolCallsFinished(finished_items));
+              }
+              yield Ok(AgentStreamEvent::Suspended(AgentRunState {
+                fingerprint: self.fingerprint(),
+                suspended: round.suspended,
+                budget_exhausted: carried_budget_exhausted,
+                context,
+              }));
+              return;
+            }
+            OnSuspend::RecordUnanswered => {
+              finished_items.extend(self.record_unanswered(&mut context, &round.suspended));
+            }
+          }
+        }
+
+        yield Ok(AgentStreamEvent::ToolCallsFinished(finished_items));
+        context.increment_step();
+      }
 
       loop {
-        let (tools_allowed, budget_exhausted) = self.round_budget(&context);
+        let (tools_allowed, round_budget_exhausted) = self.round_budget(&context);
+        let budget_exhausted = round_budget_exhausted || carried_budget_exhausted;
 
         let llm_request = self.prepare_llm_request(&context).await;
         let messages = self.build_messages(llm_request)?;
@@ -819,16 +973,36 @@ impl Agent {
         yield Ok(AgentStreamEvent::ToolCallsStarted(started_items));
 
         let round = self
-        .execute_tool_calls(&mut context, &tool_calls, &HashMap::new())
-        .await;
+          .execute_tool_calls(&mut context, &tool_calls, &HashMap::new())
+          .await;
         let mut finished_items = round.completed;
-        // This entry point cannot suspend: its caller receives a stream, not a resumable
-        // handle. See `record_unanswered`.
-        if !round.suspended.is_empty() {
-          finished_items.extend(self.record_unanswered(&mut context, &round.suspended));
-        }
-        yield Ok(AgentStreamEvent::ToolCallsFinished(finished_items));
 
+        if !round.suspended.is_empty() {
+          match on_suspend {
+            // The siblings that did finish are reported before the run stops, so a
+            // front-end's timeline shows the round as it actually went rather than
+            // losing the completed half of it.
+            OnSuspend::Yield => {
+              if !finished_items.is_empty() {
+                yield Ok(AgentStreamEvent::ToolCallsFinished(finished_items));
+              }
+              yield Ok(AgentStreamEvent::Suspended(AgentRunState {
+                fingerprint: self.fingerprint(),
+                suspended: round.suspended,
+                budget_exhausted,
+                context,
+              }));
+              return;
+            }
+            // This caller holds only a stream, with nowhere to resume from. See
+            // `record_unanswered`.
+            OnSuspend::RecordUnanswered => {
+              finished_items.extend(self.record_unanswered(&mut context, &round.suspended));
+            }
+          }
+        }
+
+        yield Ok(AgentStreamEvent::ToolCallsFinished(finished_items));
         context.increment_step();
       }
     }

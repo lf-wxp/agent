@@ -61,6 +61,7 @@
 		"initialise",
 		"Inngest",
 		"inténtalo",
+		"interruptible",
 		"keepalive",
 		"leptos",
 		"línea",
@@ -153,6 +154,7 @@
 		"unencodable",
 		"ungated",
 		"unparseable",
+		"unresumable",
 		"upto",
 		"USERPROFILE",
 		"windir"
