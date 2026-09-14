@@ -314,6 +314,40 @@ pub struct AgentRunState {
 }
 
 impl AgentRunState {
+  /// Why this run must not be resumed, if it must not.
+  ///
+  /// Only [`StopReason::RoundInFlight`] qualifies, and the reason is in its docs: the
+  /// round's calls ran concurrently, so an unknown subset of them may already have taken
+  /// effect, and re-running the batch would repeat those side effects. Such a run can
+  /// only be closed out ([`Self::abandon`]).
+  ///
+  /// Enforced here, on the state, rather than left to whoever stores it: "never re-run
+  /// these calls" is the invariant the whole checkpoint mechanism exists to protect, and
+  /// a second front-end reaching for [`Agent::resume`] should not have to rediscover it.
+  /// A caller that needs the run to survive being refused must check this *before*
+  /// handing the state over, exactly as it must for [`RunFingerprint::mismatch`] — both
+  /// [`Agent::resume`] and [`Agent::resume_stream`] consume the state either way.
+  pub fn unresumable(&self) -> Option<String> {
+    match self.reason {
+      StopReason::AwaitingDecision => None,
+      StopReason::RoundInFlight => Some(format!(
+        "the process stopped while {} {} already running, so whether the call took \
+         effect is unknown; re-running could repeat it",
+        self
+          .suspended
+          .iter()
+          .map(|call| call.name.as_str())
+          .collect::<Vec<_>>()
+          .join(", "),
+        if self.suspended.len() == 1 {
+          "was"
+        } else {
+          "were"
+        }
+      )),
+    }
+  }
+
   /// The results that stand in for the pending calls when a run is given up on.
   ///
   /// Split out of [`Self::abandon`] for a caller that has to *announce* the outcome as
@@ -775,6 +809,9 @@ impl Agent {
     state: AgentRunState,
     decisions: &HashMap<String, ResumedDecision>,
   ) -> anyhow::Result<AgentOutcome> {
+    if let Some(reason) = state.unresumable() {
+      anyhow::bail!("cannot resume this run: {reason}");
+    }
     let current = self.fingerprint();
     if let Some(reason) = state.fingerprint.mismatch(&current) {
       anyhow::bail!("cannot resume this run: {reason}");
@@ -1021,6 +1058,10 @@ impl Agent {
     decisions: HashMap<String, ResumedDecision>,
   ) -> impl Stream<Item = anyhow::Result<AgentStreamEvent>> + '_ {
     stream! {
+      if let Some(reason) = state.unresumable() {
+        yield Err(anyhow::anyhow!("cannot resume this run: {reason}"));
+        return;
+      }
       let current = self.fingerprint();
       if let Some(reason) = state.fingerprint.mismatch(&current) {
         yield Err(anyhow::anyhow!("cannot resume this run: {reason}"));

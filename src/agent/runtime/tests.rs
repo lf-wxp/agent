@@ -1564,6 +1564,57 @@ fn the_stop_reason_round_trips_through_json() {
   assert_eq!(back.reason, StopReason::RoundInFlight);
 }
 
+/// The invariant the whole checkpoint mechanism protects: an interrupted round's calls
+/// may already have taken effect, so re-running the batch could repeat a side effect.
+/// Enforced on the agent, not just in whichever front-end happens to store the run.
+#[tokio::test]
+async fn an_interrupted_round_is_refused_by_resume() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let agent = agent_with(spy_registry(&executed));
+  let mut state = suspended_state(&agent, "call_1");
+  state.reason = StopReason::RoundInFlight;
+
+  let error = agent
+    .resume(state, &HashMap::new())
+    .await
+    .expect_err("an interrupted round must not be resumed");
+
+  assert!(
+    !executed.load(Ordering::SeqCst),
+    "the refusal has to come before the call runs, or it repeated the side effect"
+  );
+  assert!(error.to_string().contains("unknown"), "got: {error}");
+}
+
+/// Same invariant on the streaming path, where a refusal arrives as the first item
+/// rather than as an `Err` around the stream.
+#[tokio::test]
+async fn an_interrupted_round_is_refused_by_resume_stream() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let agent = agent_with(spy_registry(&executed));
+  let mut state = suspended_state(&agent, "call_1");
+  state.reason = StopReason::RoundInFlight;
+
+  let stream = agent.resume_stream(state, HashMap::new());
+  futures::pin_mut!(stream);
+  let first = stream.next().await.expect("a refusal is still an item");
+
+  assert!(first.is_err(), "expected a refusal, got {first:?}");
+  assert!(!executed.load(Ordering::SeqCst));
+}
+
+/// An ordinary suspension stays resumable — the guard above must not have swallowed the
+/// case the whole feature exists for.
+#[test]
+fn an_ordinary_suspension_is_resumable() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let agent = agent_with(spy_registry(&executed));
+  let state = suspended_state(&agent, "call_1");
+
+  assert_eq!(state.reason, StopReason::AwaitingDecision);
+  assert!(state.unresumable().is_none());
+}
+
 /// Giving up explicitly is a decision, and a decision has to be attributable — the same
 /// rule a refusal reason follows. Recording it as "nobody answered" loses the only
 /// instruction actually given, and invites the model to retry.

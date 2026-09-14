@@ -423,6 +423,27 @@ async fn main() -> anyhow::Result<()> {
     println!("Cleared history for session `{session_id}`.\n");
   }
 
+  // Both of these belong to the session, not to a front-end, so they happen here —
+  // before the `--mode web` branch below, which never returns.
+  //
+  // Getting this wrong is not a cosmetic matter, and it was wrong: with the recovery
+  // and the handler installed further down (past the point `--mode web` returns from),
+  // a browser-only run had neither. A signal killed it outright instead of parking the
+  // turn, so a clean resumable suspension degraded into a checkpoint marked
+  // [`StopReason::RoundInFlight`]; that checkpoint then survived every restart, since
+  // nothing closed it out; and `/resume` re-raised its calls, which is the one thing
+  // `RoundInFlight` exists to forbid — the delete really did run a second time.
+  //
+  // Recovery goes first for the same reason it precedes the suspension notice: a
+  // crashed round is not a pending approval. It also has to finish before the server
+  // starts serving, or a browser could reach `/resume` while the unresumable state is
+  // still on disk.
+  recover_interrupted_round(&store, &approvals_store, &session_id).await;
+
+  // Installed before the first turn can start, since the window it protects opens the
+  // moment one does. See `spawn_interrupt_handler`.
+  spawn_interrupt_handler(Arc::clone(&approvals), Arc::clone(&turn_lock));
+
   if run_web {
     let port = args
       .get("web-port")
@@ -530,18 +551,14 @@ async fn main() -> anyhow::Result<()> {
     command_set::hint()
   );
 
-  // Before the suspension notice below: a crashed round is not a pending approval, and
-  // reporting it as one would offer a `/resume` that cannot work.
-  recover_interrupted_round(&store, &approvals_store, &session_id).await;
-
-  // Installed before the first turn can start, since the window it protects opens the
-  // moment one does. See `spawn_interrupt_handler`.
-  spawn_interrupt_handler(Arc::clone(&approvals), Arc::clone(&turn_lock));
-
   // A suspended run is invisible otherwise: it produced no answer and, deliberately,
   // left nothing in the session history. Announcing it here is what makes "come back
   // tomorrow and approve it" a thing a person can actually do — without this, the run
   // is on disk and nobody knows.
+  //
+  // Terminal-only, unlike the recovery and the signal handler further up: a browser has
+  // its own standing affordance for this (the paused card `GET /api/suspended` feeds on
+  // load), so there is nothing for `--mode web` to miss by not reaching here.
   announce_suspended_run(&approvals_store, &session_id).await;
 
   loop {
@@ -1541,6 +1558,29 @@ fn resume_turn_stream<'a>(
       ));
       return;
     };
+
+    // Re-running an interrupted round would repeat side effects that may already have
+    // taken hold — the single thing [`StopReason::RoundInFlight`] exists to forbid.
+    // Startup closes these out before anything can ask (`recover_interrupted_round`),
+    // so reaching here means that did not happen; the check stays anyway, because
+    // "never re-run these calls" is a correctness invariant and not something to leave
+    // resting on the order of two startup lines.
+    //
+    // Asked of the state rather than tested here, so this and [`Agent::resume_stream`]'s
+    // own backstop cannot drift apart. Checked *before* handing the state over because
+    // resuming consumes it: put back rather than closed out silently, since `/resume`
+    // asked to carry the turn on, and quietly rewriting history instead is not a
+    // smaller surprise than refusing. `/discard` is the way out, and it records the
+    // interrupted wording either way.
+    if state.unresumable().is_some() {
+      approvals_store.put(LOCAL_SCOPE, session_id, &state).await;
+      yield Err(anyhow::anyhow!(
+        "这一轮无法继续：上次运行是在执行工具的过程中被中断的，这些调用是否已生效无法确定，\
+         重新执行可能会重复副作用。请用 /discard 放弃该轮（会如实记录为「结果未知」），\
+         然后正常继续对话。"
+      ));
+      return;
+    }
 
     if let Some(reason) = state.fingerprint.mismatch(&agent.fingerprint()) {
       approvals_store.put(LOCAL_SCOPE, session_id, &state).await;
