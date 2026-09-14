@@ -1,3 +1,4 @@
+pub mod approval_store;
 pub mod callback;
 pub mod context;
 pub mod event;
@@ -6,6 +7,7 @@ pub mod llm_request;
 pub mod runtime;
 pub mod session;
 
+pub use approval_store::{ApprovalStore, FileApprovalStore};
 pub use callback::{
   AfterToolCallback, BeforeLlmCallback, BeforeToolCallback, ToolCallDecision, ToolCallView,
 };

@@ -198,7 +198,11 @@ pub struct AgentRunState {
   /// See [`AgentResult::budget_exhausted`]. Carried across the suspension so a run
   /// resumed after its budget ran out still reports having been cut short.
   pub budget_exhausted: bool,
-  context: ExecutionContext,
+  /// Not `pub`: the two supported ways to get an owned context out of here repair it
+  /// first ([`Agent::resume`], [`Self::abandon`]), and handing it over raw would make it
+  /// easy to file a mid-turn transcript as history. `pub(crate)` rather than private so
+  /// [`crate::agent::approval_store`] can construct one in its own tests.
+  pub(crate) context: ExecutionContext,
 }
 
 impl AgentRunState {
