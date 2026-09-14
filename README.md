@@ -33,7 +33,7 @@
 | 🏢 **多租户（库内）** | `Provider` 封装每租户凭据 + 并发限流，互不干扰（见 [`examples/multi_tenant.rs`](examples/multi_tenant.rs)） |
 | 📚 **向量检索** | 文本分块 / embedding / 余弦相似度检索，适配 RAG 场景 |
 | 📊 **基准评测** | 内置 GAIA 数据集评测，量化模型 + 工具组合效果 |
-| ✅ **工程质量** | 无 `.unwrap()` 生产路径、零硬编码密钥、478 个测试、clippy 全绿（原生 + wasm） |
+| ✅ **工程质量** | 无 `.unwrap()` 生产路径、零硬编码密钥、484 个测试、clippy 全绿（原生 + wasm） |
 
 ## 🚀 快速开始
 
@@ -464,8 +464,6 @@ cargo make                  # = cargo make ci：fmt 检查 + clippy（原生 + w
 ### 其他
 
 - **Web UI 细节打磨**：审批卡片支持展示同一轮里多个待决策工具调用的关联关系、按 `session_id` 细粒度加锁（目前单会话全局一把锁）
-- **挂起轮次的上下文展示**：进程重启后新开的页面只看到一张「已暂停」卡片，看不到当初的提问——挂起的那一轮刻意不写历史所致。卡片本身带工具名与参数，决策所需信息是全的，但缺少上下文
-- **流式路径下的 `usage` 统计**：目前恒为 0，需要 `stream_options.include_usage`
 - **协议与可扩展性**：`Tool` trait 与 `async-openai` 解耦、类型化错误（`thiserror`）
 - **架构边界**：`gaia` 拆为独立 crate
 

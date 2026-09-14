@@ -83,6 +83,7 @@
 		"mpsc",
 		"MSVC",
 		"multibyte",
+		"neighbour",
 		"netrc",
 		"newtype",
 		"Nlcjpw",
@@ -113,6 +114,7 @@
 		"resetx",
 		"respuesta",
 		"resultados",
+		"resumey",
 		"retargets",
 		"rmcp",
 		"rondas",
@@ -155,6 +157,7 @@
 		"ungated",
 		"unparseable",
 		"unresumable",
+		"unsendable",
 		"upto",
 		"USERPROFILE",
 		"windir"

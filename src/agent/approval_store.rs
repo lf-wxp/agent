@@ -21,7 +21,28 @@ use std::path::PathBuf;
 
 use base64::Engine;
 
-use crate::agent::runtime::{AgentRunState, SuspendedToolCall};
+use crate::agent::{
+  Event,
+  runtime::{AgentRunState, SuspendedToolCall},
+};
+
+/// A stored run as seen by a display path: what it is waiting on, and what led up to it.
+///
+/// Deliberately not the run itself — see [`ApprovalStore::peek`].
+#[derive(Debug, Clone)]
+pub struct SuspendedRunView {
+  /// Always non-empty: a run is only stored because a round could not finish.
+  pub pending: Vec<SuspendedToolCall>,
+  /// The turn as it stood when it stopped, including the message that started it.
+  ///
+  /// This is the part a session store cannot supply — a suspended turn is deliberately
+  /// absent from conversation history (see the module docs), so without this a view that
+  /// arrives after the fact sees a pending approval with no idea what was being asked.
+  ///
+  /// Mid-turn, so the same caveat as [`AgentRunState`] applies: fine to render, not
+  /// something to send to a model or file as history.
+  pub events: Vec<Event>,
+}
 
 /// Where a suspended run is kept while it waits to be answered.
 ///
@@ -43,18 +64,15 @@ pub trait ApprovalStore: Send + Sync {
   /// run whose pending call has side effects means doing them twice.
   async fn take(&self, scope: &str, run_id: &str) -> Option<AgentRunState>;
 
-  /// What the run stored under `(scope, run_id)` is waiting on, without consuming it.
-  /// Empty when nothing is stored there.
+  /// What is stored under `(scope, run_id)`, without consuming it. `None` when nothing
+  /// is.
   ///
-  /// The read-only counterpart of [`Self::take`], for showing a human what is pending.
-  /// Returning only the description and never the state is what keeps it from
-  /// undermining `take`'s single-use guarantee: there is nothing here that could be
-  /// resumed, so a display path cannot accidentally become a second way to run the same
-  /// call.
-  ///
-  /// A stored run always has at least one pending call — it is only stored because a
-  /// round could not finish — so an empty result means "nothing stored", unambiguously.
-  async fn pending(&self, scope: &str, run_id: &str) -> Vec<SuspendedToolCall>;
+  /// The read-only counterpart of [`Self::take`], for showing a human what is waiting
+  /// and what led up to it. Returning a [`SuspendedRunView`] rather than the state
+  /// itself is what keeps this from undermining `take`'s single-use guarantee: there is
+  /// nothing here that could be resumed, so a display path cannot quietly become a
+  /// second way to run the same call.
+  async fn peek(&self, scope: &str, run_id: &str) -> Option<SuspendedRunView>;
 
   /// Every run id currently suspended under `scope`, most recently stored first.
   ///
@@ -190,17 +208,17 @@ impl ApprovalStore for FileApprovalStore {
     }
   }
 
-  async fn pending(&self, scope: &str, run_id: &str) -> Vec<SuspendedToolCall> {
+  async fn peek(&self, scope: &str, run_id: &str) -> Option<SuspendedRunView> {
     let path = self.path_for(scope, run_id);
-    let Ok(bytes) = tokio::fs::read(&path).await else {
-      return Vec::new();
-    };
+    let bytes = tokio::fs::read(&path).await.ok()?;
     // Unlike `take`, an unparseable file is left alone: this is a read, and deleting
     // something on the way past would make merely looking at a pending approval a
     // destructive act.
-    serde_json::from_slice::<AgentRunState>(&bytes)
-      .map(|state| state.suspended)
-      .unwrap_or_default()
+    let state: AgentRunState = serde_json::from_slice(&bytes).ok()?;
+    Some(SuspendedRunView {
+      pending: state.suspended,
+      events: state.context.events,
+    })
   }
 
   async fn list(&self, scope: &str) -> Vec<String> {
@@ -348,6 +366,65 @@ mod tests {
       store.list("local").await,
       listed,
       "the same listing must come back the same way twice"
+    );
+  }
+
+  /// Peeking is the display path, so it must not consume — and must carry the
+  /// transcript, which is the part no other store has: a suspended turn is deliberately
+  /// absent from conversation history.
+  #[tokio::test]
+  async fn peeking_reports_the_run_without_consuming_it() {
+    let store = FileApprovalStore::new(temp_dir("peek"));
+    let mut state = state("delete_file");
+    state.context.add_event(Event::new(
+      "exec",
+      "user",
+      vec![crate::agent::ContentItem::Message {
+        role: "user".to_owned(),
+        content: "delete a.txt".to_owned(),
+      }],
+    ));
+    store.put("local", "run-1", &state).await;
+
+    let first = store.peek("local", "run-1").await.expect("stored above");
+    assert_eq!(first.pending.len(), 1);
+    assert_eq!(first.pending[0].name, "delete_file");
+    assert_eq!(
+      first.events.len(),
+      1,
+      "the request that led to the pending call has to come back too"
+    );
+
+    assert!(
+      store.peek("local", "run-1").await.is_some(),
+      "peeking twice must work — unlike `take`, it is not a claim"
+    );
+    assert!(
+      store.take("local", "run-1").await.is_some(),
+      "and it must leave the run resumable"
+    );
+  }
+
+  #[tokio::test]
+  async fn peeking_an_unknown_run_reports_nothing() {
+    let store = FileApprovalStore::new(temp_dir("peek-unknown"));
+    assert!(store.peek("local", "nope").await.is_none());
+  }
+
+  /// Unlike `take`, a read must not delete: merely looking at a pending approval being
+  /// destructive would be a trap, and the file may yet be recoverable by hand.
+  #[tokio::test]
+  async fn peeking_leaves_an_unparseable_file_alone() {
+    let dir = temp_dir("peek-corrupt");
+    let store = FileApprovalStore::new(&dir);
+    store.put("local", "run-1", &state("delete_file")).await;
+    let path = store.path_for("local", "run-1");
+    tokio::fs::write(&path, b"{not json").await.unwrap();
+
+    assert!(store.peek("local", "run-1").await.is_none());
+    assert!(
+      path.exists(),
+      "a read must not delete what it could not parse"
     );
   }
 

@@ -1392,6 +1392,80 @@ fn suspended_state(agent: &Agent, tool_call_id: &str) -> AgentRunState {
   }
 }
 
+// ---- text the model says alongside its tool calls --------------------------------
+
+/// A model routinely explains a call on the same message it makes the call on. Dropping
+/// that text loses its stated reasoning from the transcript — on the next round it sees
+/// a bare tool call where it had explained itself.
+#[test]
+fn text_accompanying_a_round_is_recorded_before_the_calls() {
+  let agent = agent_with(ToolRegistry::empty());
+  let mut context = ExecutionContext::new();
+
+  agent.record_assistant_text(&mut context, "Let me check the file exists first.");
+  agent.record_tool_calls(&mut context, &[spy_call()]);
+
+  let items: Vec<&ContentItem> = context
+    .events
+    .iter()
+    .flat_map(|event| &event.content)
+    .collect();
+
+  assert_eq!(items.len(), 2);
+  assert!(
+    matches!(
+      items[0],
+      ContentItem::Message { role, content }
+        if role == "assistant" && content == "Let me check the file exists first."
+    ),
+    "the text has to come first, so it lands on the same assistant message as the calls"
+  );
+  assert!(matches!(items[1], ContentItem::ToolCall { .. }));
+}
+
+/// Most rounds are a bare tool call. An empty assistant message would be one more thing
+/// for every consumer of the transcript to skip, and some providers reject it outright.
+#[test]
+fn a_round_with_nothing_said_records_no_message() {
+  let agent = agent_with(ToolRegistry::empty());
+  let mut context = ExecutionContext::new();
+
+  agent.record_assistant_text(&mut context, "");
+  agent.record_assistant_text(&mut context, "   \n  ");
+
+  assert!(context.events.is_empty());
+}
+
+/// The reason the text is recorded *before* the calls: `build_messages` starts an
+/// assistant message for it and then appends the round's tool calls to that same
+/// message, reproducing the one message the provider actually sent.
+#[test]
+fn accompanying_text_and_its_calls_build_into_one_assistant_message() {
+  let agent = agent_with(ToolRegistry::empty());
+  let mut context = ExecutionContext::new();
+
+  agent.record_assistant_text(&mut context, "checking first");
+  agent.record_tool_calls(&mut context, &[spy_call()]);
+
+  let request = LlmRequest::new(None, &context.events);
+  let messages = agent.build_messages(request).unwrap();
+
+  assert_eq!(
+    messages.len(),
+    1,
+    "the text and the calls belong to one message, not two"
+  );
+  let ChatCompletionRequestMessage::Assistant(assistant) = &messages[0] else {
+    panic!("expected an assistant message, got {:?}", messages[0]);
+  };
+  assert!(assistant.content.is_some(), "the text must survive");
+  assert_eq!(
+    assistant.tool_calls.as_ref().map(Vec::len),
+    Some(1),
+    "and carry the call alongside it"
+  );
+}
+
 #[test]
 fn seed_context_appends_the_new_turn_after_prior_history() {
   let agent = agent_with(ToolRegistry::empty());

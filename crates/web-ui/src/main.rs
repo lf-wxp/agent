@@ -1270,6 +1270,16 @@ async fn load_history(state: ChatState) {
       return;
     }
   };
+  push_entries(state, entries);
+}
+
+/// Render a stretch of transcript onto the timeline.
+///
+/// Shared by [`load_history`] and [`load_suspended_run`]: a suspended turn's transcript
+/// has exactly the same shape as a finished one (that is why it travels as
+/// [`shared::HistoryEntry`]), and rendering it through a second copy of this match is
+/// how the two would drift on, say, what counts as too long to auto-expand.
+fn push_entries(state: ChatState, entries: Vec<shared::HistoryEntry>) {
   for entry in entries {
     for item in entry.content {
       let id = state.next_id();
@@ -1370,8 +1380,16 @@ async fn load_suspended_run(state: ChatState) {
       return;
     }
   };
-  match response.json::<Vec<shared::PendingApprovalView>>().await {
-    Ok(pending) => state.push_suspended(pending),
+  match response.json::<Option<shared::SuspendedRunView>>().await {
+    Ok(Some(run)) => {
+      // The turn that stopped, before the card that offers to carry it on: without it
+      // the page shows a pending approval floating above a conversation that never
+      // mentions it — the request that triggered the call is inside the stored run, not
+      // in the session history.
+      push_entries(state, run.transcript);
+      state.push_suspended(run.pending);
+    }
+    Ok(None) => {}
     Err(err) => leptos::logging::error!("failed to parse the suspended run: {err}"),
   }
 }

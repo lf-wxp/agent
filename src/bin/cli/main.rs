@@ -554,10 +554,10 @@ async fn main() -> anyhow::Result<()> {
           text: input.to_owned(),
           origin: MessageOrigin::Terminal,
         });
-        if !approvals_store
-          .pending(LOCAL_SCOPE, &session_id)
+        if approvals_store
+          .peek(LOCAL_SCOPE, &session_id)
           .await
-          .is_empty()
+          .is_some()
         {
           let turn = web::new_turn_id();
           drive_terminal_turn(
@@ -1421,15 +1421,14 @@ async fn suspended_run_notice(
   approvals_store: &FileApprovalStore,
   session_id: &str,
 ) -> Option<String> {
-  (!approvals_store
-    .pending(LOCAL_SCOPE, session_id)
+  approvals_store
+    .peek(LOCAL_SCOPE, session_id)
     .await
-    .is_empty())
-  .then(|| {
-    "本会话有一轮正在等待审批，需先处理才能开始新对话：\
+    .map(|_| {
+      "本会话有一轮正在等待审批，需先处理才能开始新对话：\
        /resume 继续（会重新询问），/discard 放弃该轮。"
-      .to_owned()
-  })
+        .to_owned()
+    })
 }
 
 /// Tell the person at the terminal that this session has a run waiting on them.
@@ -1439,11 +1438,10 @@ async fn suspended_run_notice(
 /// learning the same thing (`GET /api/suspended`, see [`web`]) that does not depend on
 /// having been connected when this happened.
 async fn announce_suspended_run(approvals_store: &FileApprovalStore, session_id: &str) {
-  let pending = approvals_store.pending(LOCAL_SCOPE, session_id).await;
-  if pending.is_empty() {
+  let Some(run) = approvals_store.peek(LOCAL_SCOPE, session_id).await else {
     return;
-  }
-  let tools: Vec<&str> = pending.iter().map(|call| call.name.as_str()).collect();
+  };
+  let tools: Vec<&str> = run.pending.iter().map(|call| call.name.as_str()).collect();
   println!(
     "⏸  本会话有一轮在等待审批时被暂停（待批准: {}）。\n\
      输入 /resume 继续（会重新询问待批准的操作），或 /discard 放弃该轮。\n",

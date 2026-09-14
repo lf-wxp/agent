@@ -39,8 +39,9 @@ use async_openai::types::chat::{
   ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
   ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
   ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
-  ChatCompletionRequestUserMessageArgs, ChatCompletionResponseStream,
-  CreateChatCompletionRequestArgs, CreateChatCompletionResponse, FunctionCall,
+  ChatCompletionRequestUserMessageArgs, ChatCompletionResponseStream, ChatCompletionStreamOptions,
+  CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+  CreateChatCompletionStreamResponse, FunctionCall,
 };
 use async_stream::stream;
 use futures::{Stream, StreamExt, future::join_all};
@@ -705,6 +706,11 @@ impl Agent {
         }));
       }
 
+      // Anything the model said alongside these calls, before the calls themselves so
+      // the two end up on one assistant message. See `record_assistant_text`.
+      if let Some(text) = &message.content {
+        self.record_assistant_text(&mut context, text);
+      }
       self.record_tool_calls(&mut context, &tool_calls);
       let round = self
         .execute_tool_calls(&mut context, &tool_calls, &HashMap::new())
@@ -926,6 +932,12 @@ impl Agent {
             }
           };
 
+          // Before the `choices` guard below, not after: the chunk carrying usage is
+          // precisely the one with an empty `choices` array (see `request_builder`'s
+          // `stream_options`), so reading it afterwards would skip the only chunk that
+          // ever has it.
+          self.record_stream_usage(&mut context, &chunk);
+
           let Some(choice) = chunk.choices.first() else {
             continue;
           };
@@ -976,6 +988,7 @@ impl Agent {
           }
         };
 
+        self.record_assistant_text(&mut context, &assistant_text);
         let started_items = self.record_tool_calls(&mut context, &tool_calls);
         yield Ok(AgentStreamEvent::ToolCallsStarted(started_items));
 
@@ -1050,10 +1063,25 @@ impl Agent {
 
   /// Streaming counterpart of [`Self::complete`]: same permit/retry handling, but opens a
   /// stream instead of awaiting one complete response.
+  ///
+  /// Asks for usage here rather than in the shared [`request_builder`]: `stream_options`
+  /// is only meaningful alongside `stream: true`, and a non-streaming request carrying
+  /// it is rejected outright by the API. This is the one place that knows the request is
+  /// a stream.
+  ///
+  /// Providers that do not implement `stream_options` ignore the field and simply never
+  /// send a usage chunk — the same as before it was asked for, so this cannot make a
+  /// working provider stop working.
   async fn complete_stream(
     &self,
     builder: &CreateChatCompletionRequestArgs,
   ) -> anyhow::Result<ChatCompletionResponseStream> {
+    let mut builder = builder.clone();
+    builder.stream_options(ChatCompletionStreamOptions {
+      include_usage: Some(true),
+      include_obfuscation: None,
+    });
+
     with_retry(
       || async {
         let _permit = self.provider.acquire().await?;
@@ -1121,6 +1149,30 @@ impl Agent {
     }
   }
 
+  /// Streaming counterpart of [`Self::record_usage`].
+  ///
+  /// A stream reports usage once, on a trailing chunk that carries no content — and only
+  /// when the request asked for it (see `stream_options` in
+  /// [`crate::llm::client::request_builder`]). Every other chunk carries `None` here, so
+  /// this is called for all of them and adds nothing until that last one arrives.
+  ///
+  /// A provider that ignores `stream_options`, or a stream that breaks before its final
+  /// chunk, simply never reports any — which is the behaviour every streaming run had
+  /// before this existed, so nothing depends on it being present.
+  fn record_stream_usage(
+    &self,
+    context: &mut ExecutionContext,
+    chunk: &CreateChatCompletionStreamResponse,
+  ) {
+    if let Some(usage) = &chunk.usage {
+      context.usage.add(
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.total_tokens,
+      );
+    }
+  }
+
   /// Build this round's [`LlmRequest`] — system prompt plus flattened transcript — and
   /// run every hook over it, in registration order, starting with the
   /// [`ContextOptimizer`] that [`Self::new`] installs by default.
@@ -1174,6 +1226,35 @@ impl Agent {
     }
 
     request
+  }
+
+  /// Record what the model said *alongside* a round's tool calls, when it said anything.
+  ///
+  /// A model routinely narrates before it acts — "let me check the file exists first" —
+  /// and that text arrives on the same message as the tool calls. Dropping it loses the
+  /// model's own stated reasoning from the transcript, so on the next round it sees a
+  /// bare tool call where it had explained itself, and a human reading the history back
+  /// sees the same gap.
+  ///
+  /// Recorded as its own item immediately before the calls, which is also the shape the
+  /// API wants: [`Self::build_messages`] starts an assistant message for this text and
+  /// then appends the round's tool calls to that very message (see its `ToolCall` arm),
+  /// reproducing the single assistant message carrying both that the provider sent.
+  ///
+  /// Blank text records nothing — most rounds are a bare tool call, and an empty
+  /// assistant message is one more thing for every consumer of the transcript to skip.
+  fn record_assistant_text(&self, context: &mut ExecutionContext, text: &str) {
+    if text.trim().is_empty() {
+      return;
+    }
+    context.add_event(Event::new(
+      context.execution_id.clone(),
+      "agent",
+      vec![ContentItem::Message {
+        role: "assistant".to_owned(),
+        content: text.to_owned(),
+      }],
+    ));
   }
 
   /// Record one round's tool calls into the transcript and return the same items, so a

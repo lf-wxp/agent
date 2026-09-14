@@ -45,7 +45,8 @@ use axum::{
 use futures::{Stream, StreamExt};
 use shared::{
   ApprovalDecision, ChatAccepted, ChatEvent, ChatRequest, HistoryContentItem, HistoryEntry,
-  MessageOrigin, PendingApprovalView, ToolCallSummary, ToolResultSummary, ToolStatus,
+  MessageOrigin, PendingApprovalView, SuspendedRunView, ToolCallSummary, ToolResultSummary,
+  ToolStatus,
 };
 use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc};
 use tower_http::{
@@ -129,30 +130,34 @@ impl WebState {
 
   /// Whether this session has a turn waiting on an approval.
   async fn has_suspended_run(&self) -> bool {
-    !self.suspended_pending().await.is_empty()
+    self.suspended_run().await.is_some()
   }
 
-  /// What this session's suspended run is waiting on, in the wire shape, or empty if
-  /// nothing is suspended.
+  /// This session's suspended run in the wire shape, or `None` if nothing is suspended.
   ///
   /// `requested_at` is stamped at read time rather than carried from when the prompt was
   /// first raised: a stored run has no live clock behind it, and reporting the original
   /// instant would have a client render "waiting for 14 hours" as though something were
   /// still counting down. Nothing is — it waits until answered.
-  async fn suspended_pending(&self) -> Vec<PendingApprovalView> {
+  async fn suspended_run(&self) -> Option<SuspendedRunView> {
     let now = chrono::Utc::now().timestamp();
-    self
+    let view = self
       .approvals_store
-      .pending(LOCAL_SCOPE, &self.session_id)
-      .await
-      .into_iter()
-      .map(|call| PendingApprovalView {
-        id: call.tool_call_id,
-        tool: call.name,
-        arguments: call.raw_arguments,
-        requested_at: now,
-      })
-      .collect()
+      .peek(LOCAL_SCOPE, &self.session_id)
+      .await?;
+    Some(SuspendedRunView {
+      pending: view
+        .pending
+        .into_iter()
+        .map(|call| PendingApprovalView {
+          id: call.tool_call_id,
+          tool: call.name,
+          arguments: call.raw_arguments,
+          requested_at: now,
+        })
+        .collect(),
+      transcript: view.events.into_iter().map(to_history_entry).collect(),
+    })
   }
 }
 
@@ -629,19 +634,21 @@ fn to_pending_approval_view(meta: ApprovalMeta) -> PendingApprovalView {
   }
 }
 
-/// `GET /api/suspended`: what this session's suspended run is waiting on, or an empty
-/// list if nothing is suspended.
+/// `GET /api/suspended`: this session's suspended run, or `null` if there is none.
 ///
 /// The same role [`approvals_handler`] plays for a *live* prompt, for the case where the
 /// turn is no longer running at all. A tab opened after a suspension — or after the
 /// process restarted — missed the [`ChatEvent::TurnSuspended`] frame and will find
 /// nothing in [`history_handler`] either, since a suspended turn is deliberately not
-/// written to the transcript. Without this route such a tab shows a finished-looking
-/// conversation with no sign that anything is waiting.
-async fn suspended_handler(State(state): State<Arc<WebState>>) -> Json<Vec<PendingApprovalView>> {
+/// written to the session transcript. Without this route such a tab shows a
+/// finished-looking conversation with no sign that anything is waiting.
+///
+/// Returns the turn's own transcript alongside the pending calls for the same reason the
+/// route exists at all: it is the only place that has it.
+async fn suspended_handler(State(state): State<Arc<WebState>>) -> Json<Option<SuspendedRunView>> {
   // Peeked rather than taken: this is a read for display, and taking would consume the
   // run that `POST /api/chat` with `/resume` is about to need.
-  Json(state.suspended_pending().await)
+  Json(state.suspended_run().await)
 }
 
 /// `POST /api/approve/{id}`: resolve a pending [`ChatEvent::ApprovalRequired`] by tool

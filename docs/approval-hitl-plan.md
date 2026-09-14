@@ -673,12 +673,9 @@ turn 结束时 registry 条目被 `discard`，但卡片还在。更严重的是�
 
 修复：这种情况也 yield 一个错误。前端需要「某个终止事件」来释放它在提交时禁用的输入框，空流不是。
 
-### 12.3 已知限制（未修）
+### 12.3 已知限制 — 已全部处理，见第 14 节
 
-- **重启后卡片上方没有上下文**：挂起的 turn 刻意不写历史，所以新 tab 只看到一张卡片，看不到当初的提问。卡片本身带工具名与参数，决策所需信息是全的。
-- **流式路径丢失穿插的 assistant 文本**：模型在调用工具前说的话（如「我先确认文件是否存在」）不进 transcript。这是**既有行为**，两条路径（流式与非流式）都如此，与本次改动无关。
-- **补全菜单打开时 Enter 选中而非提交**：打全 `/resume` 后需再按一次 Enter。既有 reedline 行为，对 `/help` `/reset` 一样。
-- `usage` 在流式路径下为 0：既有问题，需 `stream_options.include_usage`。
+四条里三条已修，一条重新归类为设计选择。
 
 所有临时文件与进程已清理，工作区已复原。
 
@@ -737,3 +734,54 @@ turn 结束时 registry 条目被 `discard`，但卡片还在。更严重的是�
 现有的「带理由拒绝」已覆盖大部分场景：`n: 路径应该是 /tmp/x 而不是 /` 会让模型自己改参数重试。路径长一步，但不需要任何新机制，也不引入上述任何问题。
 
 `edit` 是四种响应模式里使用频率最低的一种，在出现「模型反复改不对、只能人来填」的真实场景之前，它的成本买不到相应的价值。结论与影响面已同步到 `README.md` 的 Roadmap。
+
+## 14. 处理 12.3 的四条已知限制
+
+逐条核实后：三条可修且已修，一条不该修。
+
+### 14.1 穿插的 assistant 文本丢失（已修）
+
+12.3 把它记为「既有行为，与本次改动无关」——**这个归类淡化了它**。它不是流式路径独有的小瑕疵，而是**三条路径都在发生的数据丢失，每一轮工具调用都会触发**。
+
+模型常常在同一条消息里既说话又调用工具（"我先确认文件是否存在" + `list_files`）。`drive`、`drive_stream`、`structured` 三处都只取 `tool_calls` 而丢弃 `message.content` / `assistant_text`。后果：
+
+- 模型下一轮看到的是一个没有任何解释的工具调用，它自己说过的推理不见了
+- 人回看历史同样看不到
+
+修复是 `record_assistant_text`，在 `record_tool_calls` **之前**记录。顺序是关键：`build_messages` 为这段文字开一条 assistant 消息，随后的 `ToolCall` 通过 `messages.last_mut()` 追加到**同一条**消息上——正好还原 provider 实际发出的那条消息（content 与 tool_calls 并存）。所以这个修复不仅补回了内容，还让回放比之前更忠实。
+
+空白文本不记录：绝大多数轮次是裸调用，空 assistant 消息只会让每个消费 transcript 的地方多一次跳过。
+
+实测：`I'll list the current directory and read a.txt for you.` 与 `我先看一下当前目录，确认 notes.txt 是否存在。` 都进了 transcript。
+
+### 14.2 流式路径 `usage` 恒为 0（已修）
+
+`stream_options.include_usage = true` + 读 `chunk.usage`。有一个坑：携带 usage 的正是 `choices` 为空的那个尾部 chunk，而原循环 `let Some(choice) = chunk.choices.first() else { continue }` 会跳过它。所以读取必须放在这个 guard **之前**。
+
+`stream_options` 设在 `complete_stream` 而非共享的 `request_builder`：它只在 `stream: true` 时合法，非流式请求带上它会被 API 直接拒绝。不支持该字段的 provider 会忽略它、不发 usage chunk——与此前行为一致，不会让能用的 provider 变得不能用。
+
+实测：`TokenUsage { prompt_tokens: 4643, completion_tokens: 184, total_tokens: 4827 }`，跨 3 轮累加正确（此前恒为 0）。
+
+### 14.3 重启后卡片上方没有上下文（已修）
+
+12.3 说「决策所需信息是全的」——工具名与参数确实都在，但这话只在"审批"这个尺度上成立。人看到的是一张悬在空白页面上的卡片，不知道自己当初问了什么才导致它。
+
+数据一直都在（`AgentRunState.context.events`），只是没往外送。改动：
+
+- `ApprovalStore::pending()` → `peek()`，返回 `SuspendedRunView { pending, events }`。仍然只返回**视图**而非状态本身，`take()` 的一次性语义不受影响：拿着一份 transcript 无法恢复任何东西。
+- `GET /api/suspended` 从 `Vec<PendingApprovalView>` 变为 `Option<SuspendedRunView>`，带上 transcript
+- 前端把 `load_history` 的渲染循环抽成 `push_entries`，两处共用——挂起的 transcript 与已完成的形状完全一样（所以它就用 `HistoryEntry` 传输），另写一份 match 迟早会在"多长算太长、要不要默认折叠"这类细节上跑偏
+
+实测：重启后页面显示「当初的提问 → 工具调用卡 → 已暂停卡片」，`GET /api/history` 仍为 `[]`（挂起依然不污染历史），恢复后无重复渲染。
+
+终端侧未做对应改动：启动横幅已列出待批准的工具名，把整段 transcript 打到横幅里只会更吵。
+
+### 14.4 补全菜单里 Enter 选中而非提交（不修，归类错误）
+
+这条不是缺陷，是 README 已写明的设计选择：
+
+> 选中后只填入而不发送，是为了让选错的命令还能改，终端与网页在这点上行为一致。
+
+改成"单候选时 Enter 直接提交"会让行为依赖候选数量——打 `/re` 有两个候选（`/reset` / `/resume`）时是选中，打 `/discard` 只有一个时却直接执行了。对一个能清空历史的命令集来说，这种不一致比多按一次 Enter 危险得多。
+
+12.3 把它和三个真缺陷列在一起是归类错误，已改正。

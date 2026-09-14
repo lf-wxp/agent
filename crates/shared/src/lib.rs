@@ -78,6 +78,22 @@ pub struct PendingApprovalView {
   pub requested_at: i64,
 }
 
+/// What `GET /api/suspended` returns when a turn is waiting to be resumed; `null` when
+/// none is.
+///
+/// Carries the transcript as well as the pending calls, because that is the part no
+/// other endpoint can supply: a suspended turn is deliberately absent from
+/// `GET /api/history` (its transcript is mid-turn and would make the whole session
+/// unsendable), so a tab that arrives after the fact would otherwise show a pending
+/// approval floating above a conversation that does not mention it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuspendedRunView {
+  pub pending: Vec<PendingApprovalView>,
+  /// The turn as it stood when it stopped, in the same shape `GET /api/history` uses so
+  /// a client renders it with the code it already has.
+  pub transcript: Vec<HistoryEntry>,
+}
+
 /// Mirrors `agent::agent::ToolResultStatus`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

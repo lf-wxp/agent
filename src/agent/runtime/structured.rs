@@ -374,6 +374,11 @@ impl Agent {
           // rather than looping forever.
           tracing::warn!("model requested tools after they were disabled");
         } else {
+          // See `record_assistant_text`: the model often explains a call on the same
+          // message it makes the call on.
+          if let Some(text) = &message.content {
+            self.record_assistant_text(&mut context, text);
+          }
           self.record_tool_calls(&mut context, &tool_calls);
           let round = self
             .execute_tool_calls(&mut context, &tool_calls, &HashMap::new())
