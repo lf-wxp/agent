@@ -862,3 +862,50 @@ turn 结束时 registry 条目被 `discard`，但卡片还在。更严重的是�
 - **写盘本身被打断**：临时文件 + 原子 rename 保证要么旧要么新，不会半截。但 rename 之后、轮次结束之前断电，会留下一个 `RoundInFlight` 记录——收尾为「未知」，是正确的保守答案。
 - **轮次完成与清除 checkpoint 之间崩溃**：会把已完成的调用标成「未知」。「未知」永远不是错的，只是偏保守。
 - **`--mode web` 下的信号**：Web 服务器任务与终端共享同一个处理器，行为一致。但纯 web 场景下没有终端可打印提示，只能靠下次启动时发现。
+
+## 16. `/discard` 之后 web 只剩一张孤立的 tool call
+
+**问题**（用户报告）：resume 后放弃，web 历史里只看到 tool 的 call，没有 give up 的标识。
+
+### 16.1 两个独立的缺陷
+
+实测先分清了是持久化还是展示的问题：`GET /api/history` 在 discard 后**确实**包含占位 `tool_result`。所以持久化是对的，问题在别处——而且是两个。
+
+**① 占位结果从未广播。** `discard_suspended_run` 只发了 `SuspendedRunCleared`（撤掉暂停卡片）和一条 `SystemNotice`。而正在看的那个 tab，时间线上早就有这张 tool call 卡（turn 第一次跑的时候来的），此后**永远等不到它的结果**——广播不重放，所以除非刷新页面，它就一直停在"像还在跑"的样子。这正是用户描述的现象。
+
+修复：把 `abandon()` 要写进历史的那批占位结果，同时以 `ChatEvent::ToolCallsFinished` 广播出去。为此把构造占位的逻辑从 `abandon()` 里拆成 `unanswered_results()`——**文案只能有一处来源**，两份拷贝迟早会偏（`StopReason` 的措辞已经证明过一次）。有测试钉住「广播的和落盘的是同一批」。
+
+**② `/discard` 记的是超时的措辞。** 这个更深，是顺着用户「没有 give up 标识」这句话查出来的：
+
+`/discard` 是**用户明确的决定**，但它走 `abandon()` 时用的是「waiting for approval that never arrived」——那是**没人应答**的措辞。两件事完全不同，而 transcript 当时分不出来。
+
+这违反了 9.5 定下的规则：**注入 transcript 的人类意图必须可归因**。拒绝会记成 `User denied execution of X: 理由`，前缀把它标记为运行者本人的决定；而放弃却记成了一句关于环境的陈述，读起来像"系统超时了"。
+
+于是加了 `GiveUp { Unanswered, ByUser }`，与 `StopReason` 组合：
+
+| `StopReason` | `GiveUp` | 记录 |
+|---|---|---|
+| `RoundInFlight` | 任意 | 「被中断，是否生效未知」 |
+| `AwaitingDecision` | `ByUser` | 「**User gave up on X** instead of deciding, so it was not run. Do not retry it without being asked to.」 |
+| `AwaitingDecision` | `Unanswered` | 「waiting for approval that never arrived」 |
+
+`RoundInFlight` 优先于谁放弃：谁按了什么，不改变这个调用到底有没有生效，而后者是更重要的事实。
+
+这同时也是给模型的正确信息：「没人应答」意味着可以等个更好的时机，「用户放弃了」意味着**别做这件事**。把后者报成前者，会丢掉唯一真正给出的指令。
+
+### 16.2 为什么不是加一个新的 UI 标识
+
+考虑过在 web 上把「已放弃」渲染成一张专门的卡片。没有这么做：transcript 同时是模型的输入和历史的渲染源，而 `tool_result` 已经是「这个调用怎么结束的」的既定位置——拒绝就是这么记的。再加一类只有 UI 认得的条目，会让同一件事有两种表示，且模型看不到那一种。
+
+修好归因之后，历史里那张结果卡的文字本身就是 give up 标识，且在**刷新后依然在**——而 `SystemNotice` 不进 transcript，刷新即消失，本来就不能承担这个职责。
+
+### 16.3 实测
+
+| 场景 | 结果 |
+|---|---|
+| 放弃前的时间线 | ✅ 复现原始缺陷：只有 `Call delete_file`，无结果 |
+| 点 Give up（**不刷新**） | ✅ 结果卡当场出现：`User gave up on delete_file instead of deciding, so it was not run.` |
+| 刷新后 | ✅ 标识依然在（`SystemNotice` 如预期消失），`/api/suspended` 为 `null` |
+| 模型的理解 | ✅ 答「还在——因为刚才的删除操作没有实际执行」，且**没有重试删除** |
+
+一个测试环境的教训：第一次实测拿到的是一堆莫名其妙的重复条目，查日志才发现 `Address already in use` ——之前某条 `pkill` 被取消，旧进程（旧二进制 + 累积状态）仍占着端口，实际验证的是旧代码。改用新端口起干净实例后结论才可信。**日志里的绑定失败必须先看**，否则会对着错误的进程解释现象。

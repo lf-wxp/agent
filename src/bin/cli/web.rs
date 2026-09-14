@@ -815,7 +815,7 @@ fn to_tool_call_summary(item: ContentItem) -> Option<ToolCallSummary> {
   }
 }
 
-fn to_tool_result_summary(item: ContentItem) -> Option<ToolResultSummary> {
+pub(crate) fn to_tool_result_summary(item: ContentItem) -> Option<ToolResultSummary> {
   match item {
     ContentItem::ToolResult {
       tool_call_id,

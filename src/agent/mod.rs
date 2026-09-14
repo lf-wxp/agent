@@ -18,7 +18,7 @@ pub use event::{ContentItem, Event, ToolResultStatus};
 pub use fingerprint::RunFingerprint;
 pub use llm_request::LlmRequest;
 pub use runtime::{
-  Agent, AgentOutcome, AgentResult, AgentRunState, AgentStreamEvent, ResumedDecision,
+  Agent, AgentOutcome, AgentResult, AgentRunState, AgentStreamEvent, GiveUp, ResumedDecision,
   RunCheckpoint, StopReason, StructuredAgentResult, SuspendedToolCall,
 };
 pub use session::{FileSessionStore, SessionStore};

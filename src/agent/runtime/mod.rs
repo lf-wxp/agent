@@ -257,6 +257,26 @@ pub trait RunCheckpoint: Send + Sync {
   async fn clear(&self, context: &ExecutionContext);
 }
 
+/// How a run is being given up on, for [`AgentRunState::abandon`].
+///
+/// Not the same question as [`StopReason`], which says why the run *stopped*. This says
+/// who is closing it out now, and the two combine: a round whose outcome is unknown
+/// stays unknown no matter who gives up on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GiveUp {
+  /// Nobody ever answered — the approval expired, or the run was stored and never
+  /// picked back up.
+  Unanswered,
+  /// A human explicitly chose not to run it.
+  ///
+  /// Recorded as the runner's own decision rather than as a fact about the environment,
+  /// for the same reason a refusal reason is prefixed (see
+  /// [`crate::callback::dual_approval::DualApprovalCallback`]): a model reading "nobody
+  /// answered" when someone in fact decided is being told the wrong thing, and it is
+  /// the difference between waiting for a better moment and not doing this at all.
+  ByUser,
+}
+
 /// A run that stopped to ask a human, in a form that outlives the process it started in.
 ///
 /// # The context inside is deliberately mid-turn
@@ -294,40 +314,63 @@ pub struct AgentRunState {
 }
 
 impl AgentRunState {
-  /// Give up on the pending calls and return the transcript, repaired.
+  /// The results that stand in for the pending calls when a run is given up on.
   ///
-  /// For a caller that has decided not to wait any longer — the human is gone, the
-  /// approval expired, the operator cancelled it — and the only way forward for a run
-  /// that cannot be resumed at all ([`StopReason::RoundInFlight`]). Every pending call
-  /// gets a result, which is both true and what makes the transcript sendable again, so
-  /// the conversation can carry on from here instead of being stuck.
+  /// Split out of [`Self::abandon`] for a caller that has to *announce* the outcome as
+  /// well as file it: a live view is already showing these calls, and it needs the same
+  /// items that reach history, or the call it is displaying never gets a result and sits
+  /// there looking as though it were still running.
   ///
-  /// What the result *says* follows [`Self::reason`], and the difference matters to the
-  /// model: a call that was never approved definitely did not run, while one
-  /// interrupted mid-round may well have. Telling it the first when the second is true
-  /// would have it confidently retry something that already happened.
-  pub fn abandon(mut self) -> ExecutionContext {
-    let items: Vec<ContentItem> = self
+  /// One source for the wording rather than two, because the wording is load-bearing —
+  /// see [`Self::abandon`].
+  pub fn unanswered_results(&self, give_up: GiveUp) -> Vec<ContentItem> {
+    self
       .suspended
       .iter()
       .map(|call| ContentItem::ToolResult {
         tool_call_id: call.tool_call_id.clone(),
         name: call.name.clone(),
         status: ToolResultStatus::Error,
-        content: match self.reason {
-          StopReason::AwaitingDecision => format!(
-            "Tool execution stopped: {} was waiting for approval that never arrived.",
-            call.name
-          ),
-          StopReason::RoundInFlight => format!(
+        content: match (self.reason, give_up) {
+          // Takes precedence over who is giving up: whether this call took effect is
+          // unknown either way, and that is the more important thing to say.
+          (StopReason::RoundInFlight, _) => format!(
             "Tool execution was interrupted: the process stopped while {} was running, \
              so whether it took effect is unknown. Check the current state before \
              trying again.",
             call.name
           ),
+          (StopReason::AwaitingDecision, GiveUp::ByUser) => format!(
+            "User gave up on {} instead of deciding, so it was not run. Do not retry it \
+             without being asked to.",
+            call.name
+          ),
+          (StopReason::AwaitingDecision, GiveUp::Unanswered) => format!(
+            "Tool execution stopped: {} was waiting for approval that never arrived.",
+            call.name
+          ),
         },
       })
-      .collect();
+      .collect()
+  }
+
+  /// Give up on the pending calls and return the transcript, repaired.
+  ///
+  /// For a caller that has decided not to wait any longer — the approval expired, the
+  /// operator cancelled it — and the only way forward for a run that cannot be resumed
+  /// at all ([`StopReason::RoundInFlight`]). Every pending call gets a result, which is
+  /// both true and what makes the transcript sendable again, so the conversation can
+  /// carry on from here instead of being stuck.
+  ///
+  /// What the result *says* follows [`Self::reason`] and `give_up`, and the differences
+  /// matter to the model. A call that was never approved definitely did not run, while
+  /// one interrupted mid-round may well have — telling it the first when the second is
+  /// true would have it confidently retry something that already happened. And a human
+  /// who chose to give up said something, where a human who never answered said
+  /// nothing; reporting the second as the first loses the only instruction actually
+  /// given.
+  pub fn abandon(mut self, give_up: GiveUp) -> ExecutionContext {
+    let items = self.unanswered_results(give_up);
     self
       .context
       .add_event(Event::new(self.context.execution_id.clone(), "tool", items));

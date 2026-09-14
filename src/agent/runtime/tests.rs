@@ -1045,7 +1045,7 @@ async fn abandoning_a_suspended_run_closes_out_every_call() {
   assert_eq!(count_items(state.context(), false), 1);
   assert_eq!(count_items(state.context(), true), 0);
 
-  let context = state.abandon();
+  let context = state.abandon(GiveUp::Unanswered);
 
   assert_eq!(
     count_items(&context, true),
@@ -1494,7 +1494,7 @@ fn an_interrupted_round_is_closed_out_as_unknown_not_as_unapproved() {
     context: ExecutionContext::new(),
   };
 
-  let context = state.abandon();
+  let context = state.abandon(GiveUp::Unanswered);
   let ContentItem::ToolResult { content, .. } = &context.events[0].content[0] else {
     panic!("expected a tool result");
   };
@@ -1516,7 +1516,7 @@ fn an_unanswered_call_still_says_it_was_never_approved() {
   let agent = agent_with(spy_registry(&executed));
   let state = suspended_state(&agent, "call_1");
 
-  let context = state.abandon();
+  let context = state.abandon(GiveUp::Unanswered);
   let ContentItem::ToolResult { content, .. } = &context.events[0].content[0] else {
     panic!("expected a tool result");
   };
@@ -1562,6 +1562,70 @@ fn the_stop_reason_round_trips_through_json() {
   let back: AgentRunState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
 
   assert_eq!(back.reason, StopReason::RoundInFlight);
+}
+
+/// Giving up explicitly is a decision, and a decision has to be attributable — the same
+/// rule a refusal reason follows. Recording it as "nobody answered" loses the only
+/// instruction actually given, and invites the model to retry.
+#[test]
+fn a_user_giving_up_is_recorded_as_the_users_own_decision() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let agent = agent_with(spy_registry(&executed));
+  let state = suspended_state(&agent, "call_1");
+
+  let context = state.abandon(GiveUp::ByUser);
+  let ContentItem::ToolResult { content, .. } = &context.events[0].content[0] else {
+    panic!("expected a tool result");
+  };
+
+  assert!(
+    content.starts_with("User "),
+    "it has to read as the runner's decision, not as a fact about the environment: \
+     {content}"
+  );
+  assert!(
+    !content.contains("never arrived"),
+    "that is the wording for nobody answering, which is a different fact: {content}"
+  );
+}
+
+/// An interrupted round stays "unknown" whichever way it is given up on: who pressed
+/// what does not change whether the call took effect, and that is the more important
+/// thing to tell the model.
+#[test]
+fn an_interrupted_round_reports_unknown_even_when_the_user_gives_up() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let agent = agent_with(spy_registry(&executed));
+  let mut state = suspended_state(&agent, "call_1");
+  state.reason = StopReason::RoundInFlight;
+
+  let context = state.abandon(GiveUp::ByUser);
+  let ContentItem::ToolResult { content, .. } = &context.events[0].content[0] else {
+    panic!("expected a tool result");
+  };
+
+  assert!(content.contains("unknown"), "got: {content}");
+}
+
+/// The announced results and the filed ones must be the same items: a live view is
+/// already showing these calls and completes them from the broadcast, while a view that
+/// arrives later reads history — and the two disagreeing is how one tab ends up
+/// claiming something the other does not.
+#[test]
+fn the_results_announced_on_giving_up_are_the_ones_filed() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let agent = agent_with(spy_registry(&executed));
+  let state = suspended_state(&agent, "call_1");
+
+  let announced = state.unanswered_results(GiveUp::ByUser);
+  let filed = state.abandon(GiveUp::ByUser);
+
+  // Compared as JSON because that is also the form both actually travel in — one over
+  // the event stream, the other into the session file.
+  assert_eq!(
+    serde_json::to_value(&announced).unwrap(),
+    serde_json::to_value(&filed.events[0].content).unwrap()
+  );
 }
 
 #[test]

@@ -138,7 +138,7 @@ use std::{
 };
 
 use agent::{
-  Agent, AgentOutcome, AgentRunState, AgentStreamEvent, RunCheckpoint, StopReason,
+  Agent, AgentOutcome, AgentRunState, AgentStreamEvent, GiveUp, RunCheckpoint, StopReason,
   agent::{ApprovalStore, BeforeToolCallback, Conversation, Event, FileApprovalStore},
   callback::{
     dual_approval::{
@@ -164,7 +164,9 @@ use reedline::{
   Reedline, Signal, Vi, default_emacs_keybindings, default_vi_insert_keybindings,
   default_vi_normal_keybindings,
 };
-use shared::{ChatEvent, MessageOrigin, PendingApprovalView, commands as command_set};
+use shared::{
+  ChatEvent, MessageOrigin, PendingApprovalView, ToolResultSummary, commands as command_set,
+};
 use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc};
 
 const SYSTEM_PROMPT: &str =
@@ -1571,6 +1573,13 @@ fn resume_turn_stream<'a>(
 /// The transcript is repaired on the way out ([`AgentRunState::abandon`]) and only then
 /// written to history — the whole point being to leave a session that can take another
 /// turn. Returns whether there was anything to discard.
+///
+/// The repaired results are broadcast as well as filed, and both halves are needed for
+/// different views. A tab that was watching already has the tool call on its timeline
+/// from when the turn first ran, and nothing else would ever complete it: the broadcast
+/// does not replay, so the card would sit there looking unfinished until the page
+/// happened to be reloaded. Filing it covers the opposite case, a tab that arrives
+/// later and reads `GET /api/history`.
 async fn discard_suspended_run(
   store: &FileSessionStore,
   approvals_store: &FileApprovalStore,
@@ -1585,7 +1594,19 @@ async fn discard_suspended_run(
     return false;
   };
   let _ = events.send(ChatEvent::SuspendedRunCleared);
-  let context = state.abandon();
+
+  // Taken before `abandon` consumes the state, and from the state itself rather than
+  // composed here, so a view ends up with exactly what history will hold.
+  let results: Vec<ToolResultSummary> = state
+    .unanswered_results(GiveUp::ByUser)
+    .into_iter()
+    .filter_map(web::to_tool_result_summary)
+    .collect();
+  if !results.is_empty() {
+    let _ = events.send(ChatEvent::ToolCallsFinished { results });
+  }
+
+  let context = state.abandon(GiveUp::ByUser);
   record_turn(store, session_id, context.events, false).await;
   true
 }
@@ -1653,7 +1674,7 @@ async fn recover_interrupted_round(
     tools.join(", ")
   );
 
-  let context = state.abandon();
+  let context = state.abandon(GiveUp::Unanswered);
   record_turn(store, session_id, context.events, false).await;
 }
 

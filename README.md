@@ -33,7 +33,7 @@
 | 🏢 **多租户（库内）** | `Provider` 封装每租户凭据 + 并发限流，互不干扰（见 [`examples/multi_tenant.rs`](examples/multi_tenant.rs)） |
 | 📚 **向量检索** | 文本分块 / embedding / 余弦相似度检索，适配 RAG 场景 |
 | 📊 **基准评测** | 内置 GAIA 数据集评测，量化模型 + 工具组合效果 |
-| ✅ **工程质量** | 无 `.unwrap()` 生产路径、零硬编码密钥、492 个测试、clippy 全绿（原生 + wasm） |
+| ✅ **工程质量** | 无 `.unwrap()` 生产路径、零硬编码密钥、495 个测试、clippy 全绿（原生 + wasm） |
 
 ## 🚀 快速开始
 
