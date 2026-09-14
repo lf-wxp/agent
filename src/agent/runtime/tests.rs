@@ -338,7 +338,9 @@ async fn execute_tool_calls_records_success_and_unknown_tool() {
     }),
   ];
 
-  agent.execute_tool_calls(&mut context, &calls).await;
+  agent
+    .execute_tool_calls(&mut context, &calls, &HashMap::new())
+    .await;
 
   let event = context.events.last().unwrap();
   assert_eq!(event.author, "tool");
@@ -501,7 +503,9 @@ async fn before_tool_callback_short_circuits_without_running_the_tool() {
     agent_with(spy_registry(&executed)).with_before_tool_callback(Arc::new(DenyEverything));
   let mut context = ExecutionContext::new();
 
-  agent.execute_tool_calls(&mut context, &[spy_call()]).await;
+  agent
+    .execute_tool_calls(&mut context, &[spy_call()], &HashMap::new())
+    .await;
 
   assert!(!executed.load(Ordering::SeqCst), "the tool must not run");
   let ContentItem::ToolResult {
@@ -520,7 +524,9 @@ async fn after_tool_callback_replaces_the_recorded_result() {
   let agent = agent_with(spy_registry(&executed)).with_after_tool_callback(Arc::new(RewriteResult));
   let mut context = ExecutionContext::new();
 
-  agent.execute_tool_calls(&mut context, &[spy_call()]).await;
+  agent
+    .execute_tool_calls(&mut context, &[spy_call()], &HashMap::new())
+    .await;
 
   assert!(executed.load(Ordering::SeqCst), "the tool should have run");
   let ContentItem::ToolResult { content, .. } = &context.events.last().unwrap().content[0] else {
@@ -538,7 +544,9 @@ async fn after_tool_callback_is_skipped_for_a_short_circuited_call() {
     .with_after_tool_callback(Arc::new(CountingAfter(Arc::clone(&after_calls))));
   let mut context = ExecutionContext::new();
 
-  agent.execute_tool_calls(&mut context, &[spy_call()]).await;
+  agent
+    .execute_tool_calls(&mut context, &[spy_call()], &HashMap::new())
+    .await;
 
   assert_eq!(
     after_calls.load(Ordering::SeqCst),
@@ -559,7 +567,9 @@ async fn multiple_before_tool_callbacks_run_in_order_until_one_short_circuits() 
     .with_before_tool_callback(Arc::new(DenyEverything));
   let mut context = ExecutionContext::new();
 
-  agent.execute_tool_calls(&mut context, &[spy_call()]).await;
+  agent
+    .execute_tool_calls(&mut context, &[spy_call()], &HashMap::new())
+    .await;
 
   assert_eq!(
     first_calls.load(Ordering::SeqCst),
@@ -590,7 +600,9 @@ async fn multiple_before_tool_callbacks_all_run_when_none_short_circuits() {
     .with_before_tool_callback(Arc::new(CountingBefore(Arc::clone(&second_calls))));
   let mut context = ExecutionContext::new();
 
-  agent.execute_tool_calls(&mut context, &[spy_call()]).await;
+  agent
+    .execute_tool_calls(&mut context, &[spy_call()], &HashMap::new())
+    .await;
 
   assert_eq!(first_calls.load(Ordering::SeqCst), 1);
   assert_eq!(second_calls.load(Ordering::SeqCst), 1);
@@ -607,7 +619,9 @@ async fn multiple_after_tool_callbacks_thread_the_result_through_in_order() {
     .with_after_tool_callback(Arc::new(AppendSuffix("-b")));
   let mut context = ExecutionContext::new();
 
-  agent.execute_tool_calls(&mut context, &[spy_call()]).await;
+  agent
+    .execute_tool_calls(&mut context, &[spy_call()], &HashMap::new())
+    .await;
 
   let ContentItem::ToolResult { content, .. } = &context.events.last().unwrap().content[0] else {
     panic!("expected a tool result");
@@ -696,7 +710,9 @@ async fn a_suspended_call_neither_runs_nor_produces_a_result() {
     agent_with(spy_registry(&executed)).with_before_tool_callback(Arc::new(SuspendEverything));
   let mut context = ExecutionContext::new();
 
-  let round = agent.execute_tool_calls(&mut context, &[spy_call()]).await;
+  let round = agent
+    .execute_tool_calls(&mut context, &[spy_call()], &HashMap::new())
+    .await;
 
   assert!(!executed.load(Ordering::SeqCst), "the tool must not run");
   assert!(round.completed.is_empty());
@@ -737,6 +753,7 @@ async fn a_partially_suspended_round_keeps_the_results_it_already_has() {
     .execute_tool_calls(
       &mut context,
       &[call_named("call_1", "spy"), call_named("call_2", "other")],
+      &HashMap::new(),
     )
     .await;
 
@@ -781,7 +798,9 @@ async fn a_suspension_ends_the_before_hook_chain() {
     .with_before_tool_callback(Arc::new(CountingBefore(Arc::clone(&later_calls))));
   let mut context = ExecutionContext::new();
 
-  agent.execute_tool_calls(&mut context, &[spy_call()]).await;
+  agent
+    .execute_tool_calls(&mut context, &[spy_call()], &HashMap::new())
+    .await;
 
   assert_eq!(
     later_calls.load(Ordering::SeqCst),
@@ -811,7 +830,9 @@ async fn a_suspended_call_keeps_its_raw_arguments() {
     },
   });
 
-  let round = agent.execute_tool_calls(&mut context, &[call]).await;
+  let round = agent
+    .execute_tool_calls(&mut context, &[call], &HashMap::new())
+    .await;
 
   assert_eq!(round.suspended[0].raw_arguments, raw);
 }
@@ -826,7 +847,9 @@ async fn an_entry_point_that_cannot_resume_records_the_call_as_unanswered() {
     agent_with(spy_registry(&executed)).with_before_tool_callback(Arc::new(SuspendEverything));
   let mut context = ExecutionContext::new();
 
-  let round = agent.execute_tool_calls(&mut context, &[spy_call()]).await;
+  let round = agent
+    .execute_tool_calls(&mut context, &[spy_call()], &HashMap::new())
+    .await;
   let placeholders = agent.record_unanswered(&mut context, &round.suspended);
 
   assert_eq!(placeholders.len(), 1);
@@ -854,6 +877,325 @@ async fn an_entry_point_that_cannot_resume_records_the_call_as_unanswered() {
     .filter(|item| matches!(item, ContentItem::ToolResult { .. }))
     .collect();
   assert_eq!(results.len(), 1);
+}
+
+// ---- resuming a suspended round ----------------------------------------------------
+
+/// A supplied approval lets a previously suspended call run, without the hook that
+/// suspended it having to change its mind.
+#[tokio::test]
+async fn a_supplied_approval_lets_a_suspended_call_run() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let agent =
+    agent_with(spy_registry(&executed)).with_before_tool_callback(Arc::new(SuspendEverything));
+  let mut context = ExecutionContext::new();
+
+  let decisions = HashMap::from([("call_1".to_owned(), ResumedDecision::Approved)]);
+  let round = agent
+    .execute_tool_calls(&mut context, &[spy_call()], &decisions)
+    .await;
+
+  assert!(
+    executed.load(Ordering::SeqCst),
+    "the approved call should have reached the tool"
+  );
+  assert!(round.suspended.is_empty());
+  assert_eq!(round.completed.len(), 1);
+}
+
+/// A supplied refusal records the front-end's own wording, since that is what the model
+/// reads and what the human actually said.
+#[tokio::test]
+async fn a_supplied_refusal_records_its_reason_verbatim() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let agent =
+    agent_with(spy_registry(&executed)).with_before_tool_callback(Arc::new(SuspendEverything));
+  let mut context = ExecutionContext::new();
+
+  let decisions = HashMap::from([(
+    "call_1".to_owned(),
+    ResumedDecision::Refused("User denied execution of spy: not this one".to_owned()),
+  )]);
+  let round = agent
+    .execute_tool_calls(&mut context, &[spy_call()], &decisions)
+    .await;
+
+  assert!(!executed.load(Ordering::SeqCst), "the tool must not run");
+  let ContentItem::ToolResult {
+    status, content, ..
+  } = &round.completed[0]
+  else {
+    panic!("expected a tool result");
+  };
+  assert_eq!(*status, ToolResultStatus::Error);
+  assert_eq!(content, "User denied execution of spy: not this one");
+}
+
+/// The decision replaces the *suspension*, not the whole chain. A guard registered after
+/// the approval hook still gets to rule on an approved call — otherwise a human's "yes"
+/// would silently switch off the workspace sandbox.
+#[tokio::test]
+async fn an_approval_does_not_bypass_the_rest_of_the_chain() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let agent = agent_with(spy_registry(&executed))
+    .with_before_tool_callback(Arc::new(SuspendEverything))
+    .with_before_tool_callback(Arc::new(DenyEverything));
+  let mut context = ExecutionContext::new();
+
+  let decisions = HashMap::from([("call_1".to_owned(), ResumedDecision::Approved)]);
+  let round = agent
+    .execute_tool_calls(&mut context, &[spy_call()], &decisions)
+    .await;
+
+  assert!(
+    !executed.load(Ordering::SeqCst),
+    "a later guard must still be able to stop an approved call"
+  );
+  let ContentItem::ToolResult { content, .. } = &round.completed[0] else {
+    panic!("expected a tool result");
+  };
+  assert_eq!(content, "denied spy");
+}
+
+/// A decision for one call must not answer another. Answering part of a round is a
+/// supported half-step: the rest comes back suspended rather than erroring or, worse,
+/// running unapproved.
+#[tokio::test]
+async fn a_decision_applies_only_to_the_call_it_names() {
+  let spy_executed = Arc::new(AtomicBool::new(false));
+  let other_executed = Arc::new(AtomicBool::new(false));
+
+  let mut registry = ToolRegistry::empty();
+  registry
+    .add(Arc::new(SpyTool {
+      executed: Arc::clone(&spy_executed),
+    }))
+    .unwrap();
+  registry
+    .add(Arc::new(OtherSpyTool {
+      executed: Arc::clone(&other_executed),
+    }))
+    .unwrap();
+
+  let agent = agent_with(registry).with_before_tool_callback(Arc::new(SuspendEverything));
+  let mut context = ExecutionContext::new();
+
+  let decisions = HashMap::from([("call_1".to_owned(), ResumedDecision::Approved)]);
+  let round = agent
+    .execute_tool_calls(
+      &mut context,
+      &[call_named("call_1", "spy"), call_named("call_2", "other")],
+      &decisions,
+    )
+    .await;
+
+  assert!(spy_executed.load(Ordering::SeqCst), "call_1 was approved");
+  assert!(
+    !other_executed.load(Ordering::SeqCst),
+    "call_2 had no decision and must not run"
+  );
+  assert_eq!(round.suspended.len(), 1);
+  assert_eq!(round.suspended[0].tool_call_id, "call_2");
+}
+
+/// `rebuild_tool_calls` is what a resumed call is re-executed from, so it has to
+/// reproduce the call exactly — including an argument string that does not parse, which
+/// the approval path relies on being able to tell apart from a literal `null`.
+#[test]
+fn rebuilding_a_suspended_call_preserves_it_exactly() {
+  let suspended = vec![SuspendedToolCall {
+    tool_call_id: "call_9".to_owned(),
+    name: "delete_file".to_owned(),
+    raw_arguments: r#"{"path": "a.txt""#.to_owned(),
+  }];
+
+  let rebuilt = rebuild_tool_calls(&suspended);
+  let ChatCompletionMessageToolCalls::Function(call) = &rebuilt[0] else {
+    panic!("a rebuilt call must stay a function call");
+  };
+
+  assert_eq!(call.id, "call_9");
+  assert_eq!(call.function.name, "delete_file");
+  assert_eq!(call.function.arguments, r#"{"path": "a.txt""#);
+}
+
+/// Giving up has to leave a sendable transcript: `record_tool_calls` already wrote the
+/// call, and a call with no result is a conversation most providers reject.
+#[tokio::test]
+async fn abandoning_a_suspended_run_closes_out_every_call() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let agent =
+    agent_with(spy_registry(&executed)).with_before_tool_callback(Arc::new(SuspendEverything));
+
+  let mut context = ExecutionContext::new();
+  agent.record_tool_calls(&mut context, &[spy_call()]);
+  let round = agent
+    .execute_tool_calls(&mut context, &[spy_call()], &HashMap::new())
+    .await;
+
+  let state = AgentRunState {
+    fingerprint: agent.fingerprint(),
+    suspended: round.suspended,
+    budget_exhausted: false,
+    context,
+  };
+
+  // Before: the call is recorded with nothing answering it.
+  assert_eq!(count_items(state.context(), false), 1);
+  assert_eq!(count_items(state.context(), true), 0);
+
+  let context = state.abandon();
+
+  assert_eq!(
+    count_items(&context, true),
+    1,
+    "every recorded call must end up with a result"
+  );
+}
+
+/// Counts `ToolCall`s (`results = false`) or `ToolResult`s (`results = true`).
+fn count_items(context: &ExecutionContext, results: bool) -> usize {
+  context
+    .events
+    .iter()
+    .flat_map(|event| &event.content)
+    .filter(|item| {
+      if results {
+        matches!(item, ContentItem::ToolResult { .. })
+      } else {
+        matches!(item, ContentItem::ToolCall { .. })
+      }
+    })
+    .count()
+}
+
+/// Tool call ids with no matching result — the shape a provider rejects.
+fn unpaired_call_ids(context: &ExecutionContext) -> Vec<String> {
+  let items: Vec<&ContentItem> = context
+    .events
+    .iter()
+    .flat_map(|event| &event.content)
+    .collect();
+  let answered: std::collections::HashSet<&str> = items
+    .iter()
+    .filter_map(|item| match item {
+      ContentItem::ToolResult { tool_call_id, .. } => Some(tool_call_id.as_str()),
+      _ => None,
+    })
+    .collect();
+  items
+    .iter()
+    .filter_map(|item| match item {
+      ContentItem::ToolCall { tool_call_id, .. } if !answered.contains(tool_call_id.as_str()) => {
+        Some(tool_call_id.clone())
+      }
+      _ => None,
+    })
+    .collect()
+}
+
+/// The invariant that makes a placeholder-filtering hook unnecessary: a suspended round
+/// leaves the transcript unpaired, and answering it pairs it up again — so no request is
+/// ever built from the gap. `drive` enforces the other half by returning rather than
+/// looping while a round is incomplete.
+#[tokio::test]
+async fn answering_a_suspended_round_restores_the_pairing_invariant() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let agent =
+    agent_with(spy_registry(&executed)).with_before_tool_callback(Arc::new(SuspendEverything));
+  let mut context = ExecutionContext::new();
+
+  agent.record_tool_calls(&mut context, &[spy_call()]);
+  let round = agent
+    .execute_tool_calls(&mut context, &[spy_call()], &HashMap::new())
+    .await;
+  assert_eq!(
+    unpaired_call_ids(&context),
+    vec!["call_1".to_owned()],
+    "a suspended call is deliberately left unanswered"
+  );
+
+  // The resume step, with the answer in hand.
+  let decisions = HashMap::from([("call_1".to_owned(), ResumedDecision::Approved)]);
+  let calls = rebuild_tool_calls(&round.suspended);
+  agent
+    .execute_tool_calls(&mut context, &calls, &decisions)
+    .await;
+
+  assert!(
+    unpaired_call_ids(&context).is_empty(),
+    "answering the call must pair it up, since the next request is built from here"
+  );
+}
+
+/// Resuming with a different agent is refused rather than attempted — the transcript
+/// references tools by name and was produced under instructions that no longer apply.
+#[tokio::test]
+async fn resuming_with_a_changed_agent_is_refused() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let original = agent_with(spy_registry(&executed));
+
+  let state = AgentRunState {
+    fingerprint: original.fingerprint(),
+    suspended: vec![SuspendedToolCall {
+      tool_call_id: "call_1".to_owned(),
+      name: "spy".to_owned(),
+      raw_arguments: "{}".to_owned(),
+    }],
+    budget_exhausted: false,
+    context: ExecutionContext::new(),
+  };
+
+  // Same tools, different model.
+  let changed = Agent::new(
+    Provider::shared().clone(),
+    "gpt-different",
+    Option::<String>::None,
+    Arc::new(spy_registry(&executed)),
+  );
+
+  let err = changed
+    .resume(state, &HashMap::new())
+    .await
+    .expect_err("a changed agent must not resume the run");
+
+  assert!(
+    err.to_string().contains("model changed"),
+    "the error should say what changed: {err}"
+  );
+  assert!(
+    !executed.load(Ordering::SeqCst),
+    "nothing may run once the resume is refused"
+  );
+}
+
+/// The state is the thing that crosses a process boundary, so it has to survive a round
+/// trip with the pending calls and their arguments intact.
+#[test]
+fn a_suspended_state_round_trips_through_json() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let agent = agent_with(spy_registry(&executed));
+  let mut context = ExecutionContext::new();
+  context.conversation_id = Some("s1".to_owned());
+
+  let state = AgentRunState {
+    fingerprint: agent.fingerprint(),
+    suspended: vec![SuspendedToolCall {
+      tool_call_id: "call_1".to_owned(),
+      name: "spy".to_owned(),
+      raw_arguments: r#"{"n":1}"#.to_owned(),
+    }],
+    budget_exhausted: true,
+    context,
+  };
+
+  let json = serde_json::to_string(&state).unwrap();
+  let back: AgentRunState = serde_json::from_str(&json).unwrap();
+
+  assert_eq!(back.suspended, state.suspended);
+  assert!(back.budget_exhausted);
+  assert!(back.fingerprint.matches(&agent.fingerprint()));
+  assert_eq!(back.context().conversation_id.as_deref(), Some("s1"));
 }
 
 #[test]

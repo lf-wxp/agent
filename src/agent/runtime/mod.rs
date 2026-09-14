@@ -33,7 +33,7 @@
 
 mod structured;
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use async_openai::types::chat::{
   ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
@@ -158,6 +158,116 @@ pub struct ToolRoundOutcome {
   pub completed: Vec<ContentItem>,
   /// Calls that were suspended, in call order. Empty in the ordinary case.
   pub suspended: Vec<SuspendedToolCall>,
+}
+
+/// A human's answer to a call that was suspended, supplied to [`Agent::resume`].
+///
+/// Stands in for the decision a [`BeforeToolCallback`] could not make at the time — and
+/// *only* for that. It replaces a [`ToolCallDecision::Suspend`], never a denial and never
+/// a `Proceed`, so a hook that rules on the call for some other reason still rules on it:
+/// a workspace sandbox does not stop applying because a human approved the call.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ResumedDecision {
+  /// Carry on down the hook chain and, if nothing else objects, run the tool.
+  Approved,
+  /// Record `reason` in place of the call. Owns its message rather than deriving one,
+  /// because the refusal was decided elsewhere — by a front-end that already knows how
+  /// to word it (see [`crate::callback::dual_approval`]).
+  Refused(String),
+}
+
+/// A run that stopped to ask a human, in a form that outlives the process it started in.
+///
+/// # The context inside is deliberately mid-turn
+///
+/// It holds the [`ContentItem::ToolCall`] for every suspended call with no matching
+/// [`ContentItem::ToolResult`] — a shape most providers reject outright. That is the
+/// honest representation (no decision has been made, so no result exists), but it means
+/// this context must not be sent to a model or filed as conversation history as-is. The
+/// two ways out both repair it: [`Agent::resume`] answers the calls, and
+/// [`Self::abandon`] closes them out as unanswered.
+///
+/// Persisting it is fine, and is the point — the invariant is about what is *sent*, not
+/// about what is stored.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct AgentRunState {
+  /// What this run was produced by; checked before it is resumed. See [`RunFingerprint`].
+  pub fingerprint: RunFingerprint,
+  /// Calls waiting on a decision, in the order the model requested them.
+  pub suspended: Vec<SuspendedToolCall>,
+  /// See [`AgentResult::budget_exhausted`]. Carried across the suspension so a run
+  /// resumed after its budget ran out still reports having been cut short.
+  pub budget_exhausted: bool,
+  context: ExecutionContext,
+}
+
+impl AgentRunState {
+  /// Give up on the pending decisions and return the transcript, repaired.
+  ///
+  /// For a caller that has decided not to wait any longer — the human is gone, the
+  /// approval expired, the operator cancelled it. Every suspended call gets a result
+  /// saying it was never answered, which is both true and what makes the transcript
+  /// sendable again, so the conversation can carry on from here in a later turn instead
+  /// of being stuck.
+  pub fn abandon(mut self) -> ExecutionContext {
+    let items: Vec<ContentItem> = self
+      .suspended
+      .iter()
+      .map(|call| ContentItem::ToolResult {
+        tool_call_id: call.tool_call_id.clone(),
+        name: call.name.clone(),
+        status: ToolResultStatus::Error,
+        content: format!(
+          "Tool execution stopped: {} was waiting for approval that never arrived.",
+          call.name
+        ),
+      })
+      .collect();
+    self
+      .context
+      .add_event(Event::new(self.context.execution_id.clone(), "tool", items));
+    self.context
+  }
+
+  /// The transcript so far, for a caller that wants to show what has happened while the
+  /// decision is outstanding.
+  ///
+  /// Read-only on purpose: see the type's docs for why this context is not something to
+  /// hand to a model or a session store directly.
+  pub fn context(&self) -> &ExecutionContext {
+    &self.context
+  }
+}
+
+/// How a resumable run ended: with an answer, or with a question.
+#[derive(Debug)]
+pub enum AgentOutcome {
+  Done(AgentResult),
+  /// The run stopped before a tool call it could not decide. Answer the calls in
+  /// [`AgentRunState::suspended`] and hand the state to [`Agent::resume`], or give up on
+  /// them with [`AgentRunState::abandon`].
+  Suspended(AgentRunState),
+}
+
+/// Rebuild the API-shaped calls for a set of suspended ones, so they can go back through
+/// [`Agent::execute_tool_calls`] unchanged.
+///
+/// Lossless because [`SuspendedToolCall`] keeps the raw argument string: the tool is
+/// handed textually what the model sent and what a human was shown, not a re-serialized
+/// approximation of it.
+fn rebuild_tool_calls(suspended: &[SuspendedToolCall]) -> Vec<ChatCompletionMessageToolCalls> {
+  suspended
+    .iter()
+    .map(|call| {
+      ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+        id: call.tool_call_id.clone(),
+        function: FunctionCall {
+          name: call.name.clone(),
+          arguments: call.raw_arguments.clone(),
+        },
+      })
+    })
+    .collect()
 }
 
 /// Drives a model to a final answer, executing tool calls as it requests them.
@@ -309,7 +419,7 @@ impl Agent {
   /// not of the agent, so adjusting it means installing a differently-configured one.
   ///
   /// ```no_run
-  /// # use std::sync::Arc;
+  /// # use std::{collections::HashMap, sync::Arc};
   /// use agent::agent::Agent;
   /// use agent::callback::context_optimizer::ContextOptimizer;
   /// # use agent::llm::provider::Provider;
@@ -386,8 +496,138 @@ impl Agent {
     conversation: impl Into<Conversation>,
     user_input: &str,
   ) -> anyhow::Result<AgentResult> {
-    let mut context = self.seed_context(conversation.into(), user_input);
+    let context = self.seed_context(conversation.into(), user_input);
+    let mut outcome = self.drive(context).await?;
 
+    // This entry point hands its caller a finished result, so there is nowhere to resume
+    // to: a suspension is closed out as unanswered and the loop carries on from there.
+    // Re-entering `drive` rather than looping inside it keeps the resumable path free of
+    // a "can I suspend?" flag — see `run_continuing_resumable`.
+    loop {
+      match outcome {
+        AgentOutcome::Done(result) => return Ok(result),
+        AgentOutcome::Suspended(state) => {
+          let budget_exhausted = state.budget_exhausted;
+          let suspended = state.suspended.clone();
+          let mut context = state.context;
+          self.record_unanswered(&mut context, &suspended);
+          // The round is over now that every call has a result, which is what
+          // `increment_step` accounts for; `drive` leaves it alone precisely because a
+          // suspended round is not finished.
+          context.increment_step();
+          outcome = self.drive(context).await?;
+          if let AgentOutcome::Done(mut result) = outcome {
+            result.budget_exhausted |= budget_exhausted;
+            return Ok(result);
+          }
+        }
+      }
+    }
+  }
+
+  /// Like [`Self::run_continuing`], but stops and hands back a resumable state when a
+  /// tool call cannot be decided, instead of recording it as unanswered.
+  ///
+  /// For a caller that has somewhere to come back from — a stored session, a web request
+  /// that will be followed by another. See [`AgentOutcome`] and [`Self::resume`].
+  pub async fn run_continuing_resumable(
+    &self,
+    conversation: impl Into<Conversation>,
+    user_input: &str,
+  ) -> anyhow::Result<AgentOutcome> {
+    let context = self.seed_context(conversation.into(), user_input);
+    self.drive(context).await
+  }
+
+  /// Carry on a run that stopped to ask, now that `decisions` answer what it asked.
+  ///
+  /// Only the suspended calls are re-attempted; their siblings from that round already
+  /// ran and their results are in the transcript. That is the whole reason a round
+  /// reports partial completion (see [`ToolRoundOutcome`]) — re-running the round wholesale
+  /// would repeat every side effect those siblings had.
+  ///
+  /// `decisions` is keyed by [`SuspendedToolCall::tool_call_id`]. A call with no entry
+  /// stays suspended and comes back in the returned state, so answering some of a round's
+  /// questions and not others is a supported half-step rather than an error.
+  ///
+  /// # Errors
+  ///
+  /// If this agent is not the one the run was suspended from — a different model, edited
+  /// instructions, a tool that no longer exists. See [`RunFingerprint`] for why that is
+  /// refused rather than attempted.
+  pub async fn resume(
+    &self,
+    state: AgentRunState,
+    decisions: &HashMap<String, ResumedDecision>,
+  ) -> anyhow::Result<AgentOutcome> {
+    let current = self.fingerprint();
+    if let Some(reason) = state.fingerprint.mismatch(&current) {
+      anyhow::bail!("cannot resume this run: {reason}");
+    }
+
+    let mut outcome = self
+      .drive_from_round(
+        state.context,
+        &state.suspended,
+        decisions,
+        state.budget_exhausted,
+      )
+      .await?;
+
+    // A suspension carried over: some call still has no answer. Report it with the
+    // budget flag intact rather than losing that the run was already cut short.
+    match &mut outcome {
+      AgentOutcome::Suspended(carried) => carried.budget_exhausted |= state.budget_exhausted,
+      AgentOutcome::Done(result) => result.budget_exhausted |= state.budget_exhausted,
+    }
+    Ok(outcome)
+  }
+
+  /// Re-attempt `pending` with `decisions` in hand, then carry on with the ordinary loop.
+  async fn drive_from_round(
+    &self,
+    mut context: ExecutionContext,
+    pending: &[SuspendedToolCall],
+    decisions: &HashMap<String, ResumedDecision>,
+    budget_exhausted: bool,
+  ) -> anyhow::Result<AgentOutcome> {
+    let calls = rebuild_tool_calls(pending);
+    let round = self
+      .execute_tool_calls(&mut context, &calls, decisions)
+      .await;
+
+    if !round.suspended.is_empty() {
+      return Ok(AgentOutcome::Suspended(AgentRunState {
+        fingerprint: self.fingerprint(),
+        suspended: round.suspended,
+        budget_exhausted,
+        context,
+      }));
+    }
+
+    // Every call in the round now has a result, so the round is spent.
+    context.increment_step();
+    self.drive(context).await
+  }
+
+  /// The tool-calling loop itself, shared by every plain-text entry point.
+  ///
+  /// Returns [`AgentOutcome::Suspended`] the moment a round cannot finish, leaving
+  /// `current_step` untouched: a suspended round is not a spent one, and charging the
+  /// budget for it would mean a run that waits on a human gets fewer rounds than one that
+  /// does not.
+  ///
+  /// # Why no placeholder repair happens here
+  ///
+  /// Between [`Self::record_tool_calls`] and a round's results, the transcript holds
+  /// calls with no results — a shape providers reject. This loop never issues a request
+  /// from that gap: it returns instead of looping while a round is incomplete, and the
+  /// two ways back in both close the gap first ([`Self::resume`] answers the calls,
+  /// [`Self::run_continuing`] records them as unanswered). So the invariant is kept by
+  /// control flow rather than by filtering a bad request afterwards — which is worth
+  /// preferring, because a filter can be forgotten by the next entry point while this
+  /// cannot: there is nowhere else to issue a request from.
+  async fn drive(&self, mut context: ExecutionContext) -> anyhow::Result<AgentOutcome> {
     loop {
       let (tools_allowed, budget_exhausted) = self.round_budget(&context);
 
@@ -413,11 +653,11 @@ impl Agent {
           .content
           .ok_or_else(|| anyhow::anyhow!("No content in final response"))?;
         self.record_final_answer(&mut context, &content);
-        return Ok(AgentResult {
+        return Ok(AgentOutcome::Done(AgentResult {
           output: content,
           context,
           budget_exhausted,
-        });
+        }));
       };
 
       // The model ignored the disabled tools. Returning its message beats looping
@@ -426,18 +666,27 @@ impl Agent {
         tracing::warn!("model requested tools after they were disabled");
         let content = message.content.unwrap_or_default();
         self.record_final_answer(&mut context, &content);
-        return Ok(AgentResult {
+        return Ok(AgentOutcome::Done(AgentResult {
           output: content,
           context,
           budget_exhausted: true,
-        });
+        }));
       }
 
       self.record_tool_calls(&mut context, &tool_calls);
-      let round = self.execute_tool_calls(&mut context, &tool_calls).await;
+      let round = self
+        .execute_tool_calls(&mut context, &tool_calls, &HashMap::new())
+        .await;
+
       if !round.suspended.is_empty() {
-        self.record_unanswered(&mut context, &round.suspended);
+        return Ok(AgentOutcome::Suspended(AgentRunState {
+          fingerprint: self.fingerprint(),
+          suspended: round.suspended,
+          budget_exhausted,
+          context,
+        }));
       }
+
       context.increment_step();
     }
   }
@@ -565,7 +814,9 @@ impl Agent {
         let started_items = self.record_tool_calls(&mut context, &tool_calls);
         yield Ok(AgentStreamEvent::ToolCallsStarted(started_items));
 
-        let round = self.execute_tool_calls(&mut context, &tool_calls).await;
+        let round = self
+        .execute_tool_calls(&mut context, &tool_calls, &HashMap::new())
+        .await;
         let mut finished_items = round.completed;
         // This entry point cannot suspend: its caller receives a stream, not a resumable
         // handle. See `record_unanswered`.
@@ -791,10 +1042,15 @@ impl Agent {
   /// a caller that also wants to forward them live (see
   /// [`AgentStreamEvent::ToolCallsFinished`]) does not have to reach back into
   /// `context.events` to find them.
+  ///
+  /// `resumed` carries answers obtained since a previous attempt suspended these calls;
+  /// it is empty for an ordinary round. See [`ResumedDecision`] for why an answer
+  /// replaces only a suspension and leaves the rest of the chain in force.
   async fn execute_tool_calls(
     &self,
     context: &mut ExecutionContext,
     tool_calls: &[ChatCompletionMessageToolCalls],
+    resumed: &HashMap<String, ResumedDecision>,
   ) -> ToolRoundOutcome {
     // Reborrowed immutably: every concurrent call below may read `context` (e.g. to make
     // an allow/deny decision), while the mutable borrow needed to record the resulting
@@ -849,15 +1105,41 @@ impl Agent {
               });
             }
             ToolCallDecision::Suspend => {
-              tracing::debug!(
-                tool = %function_name,
-                "tool call suspended by before-tool callback, awaiting a decision"
-              );
-              return Ok(SuspendedToolCall {
-                tool_call_id: function_call.id.clone(),
-                name: function_name.clone(),
-                raw_arguments: arguments.clone(),
-              });
+              // An answer obtained since this call last suspended stands in for the
+              // decision the hook still cannot make. Only the suspension is replaced:
+              // `Approved` falls through to the rest of the chain and then the tool, so a
+              // sandbox or guard registered after this hook still gets its say.
+              match resumed.get(&function_call.id) {
+                Some(ResumedDecision::Approved) => {
+                  tracing::debug!(
+                    tool = %function_name,
+                    "a supplied decision approved a previously suspended call"
+                  );
+                }
+                Some(ResumedDecision::Refused(reason)) => {
+                  tracing::debug!(
+                    tool = %function_name,
+                    "a supplied decision refused a previously suspended call"
+                  );
+                  return Err(ContentItem::ToolResult {
+                    tool_call_id: function_call.id.clone(),
+                    name: function_name.clone(),
+                    status: ToolResultStatus::Error,
+                    content: reason.clone(),
+                  });
+                }
+                None => {
+                  tracing::debug!(
+                    tool = %function_name,
+                    "tool call suspended by before-tool callback, awaiting a decision"
+                  );
+                  return Ok(SuspendedToolCall {
+                    tool_call_id: function_call.id.clone(),
+                    name: function_name.clone(),
+                    raw_arguments: arguments.clone(),
+                  });
+                }
+              }
             }
           }
         }

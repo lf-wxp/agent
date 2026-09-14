@@ -21,6 +21,8 @@
 //! that builds the schema-as-data inputs and calls the same core a compile-time-typed
 //! caller would reach through `schemars::JsonSchema`.
 
+use std::collections::HashMap;
+
 use async_openai::types::chat::{
   ChatCompletionMessageToolCalls, ChatCompletionRequestSystemMessageArgs,
   ChatCompletionToolChoiceOption, ChatCompletionTools, FinishReason, ResponseFormat,
@@ -249,7 +251,9 @@ impl Agent {
         ));
       }
 
-      let round = self.execute_tool_calls(&mut context, &tool_calls).await;
+      let round = self
+        .execute_tool_calls(&mut context, &tool_calls, &HashMap::new())
+        .await;
       if !round.suspended.is_empty() {
         self.record_unanswered(&mut context, &round.suspended);
       }
@@ -371,7 +375,9 @@ impl Agent {
           tracing::warn!("model requested tools after they were disabled");
         } else {
           self.record_tool_calls(&mut context, &tool_calls);
-          let round = self.execute_tool_calls(&mut context, &tool_calls).await;
+          let round = self
+            .execute_tool_calls(&mut context, &tool_calls, &HashMap::new())
+            .await;
           if !round.suspended.is_empty() {
             self.record_unanswered(&mut context, &round.suspended);
           }

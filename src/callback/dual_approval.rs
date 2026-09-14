@@ -436,6 +436,28 @@ fn unreadable_arguments(tool_call: &ToolCallView<'_>) -> Option<UnreadableArgume
   None
 }
 
+/// What to do about a prompt nobody answered — the timeout expired, no front-end was
+/// listening, or the decision was dropped.
+///
+/// Note that neither option ever *allows* the call: the choice is between refusing it now
+/// and asking again later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WhenUnanswered {
+  /// Refuse the call. The default, and the only sound choice for a caller that cannot
+  /// come back to the question: it ends the round with a decision rather than leaving a
+  /// turn holding a lock while nobody is being asked anything.
+  #[default]
+  Refuse,
+  /// Suspend the call, so the run can stop and be resumed once someone answers. See
+  /// [`ToolCallDecision::Suspend`].
+  ///
+  /// Safe to set even for an entry point that cannot resume: `Agent::run` and the
+  /// streaming routes record a suspended call as unanswered, which lands in the same
+  /// place `Refuse` would. So this expresses intent, and the runtime degrades it when the
+  /// intent cannot be honoured.
+  Suspend,
+}
+
 /// Builds the result recorded for a refused call that carried no reason of its own — the
 /// run-wide default, as set by [`DualApprovalCallback::with_rejection_formatter`].
 pub type RejectionFormatter = Arc<dyn Fn(&ToolCallView<'_>) -> String + Send + Sync>;
@@ -477,6 +499,8 @@ pub struct DualApprovalCallback {
   /// What to record for a refusal that came with no reason of its own. `None` falls back
   /// to a generic message; see [`Self::with_rejection_formatter`].
   rejection_formatter: Option<RejectionFormatter>,
+  /// See [`WhenUnanswered`].
+  when_unanswered: WhenUnanswered,
   // Serializes the terminal prompt/read pair below: tool calls in the same round run
   // concurrently (see `Agent::execute_tool_calls`), and without this lock two concurrent
   // dangerous calls would interleave their console prompts and could read the wrong
@@ -497,6 +521,7 @@ impl DualApprovalCallback {
       timeout: config::approval_timeout(),
       sticky: Mutex::new(ContinuityCache::new(STICKY_CONVERSATIONS)),
       rejection_formatter: None,
+      when_unanswered: WhenUnanswered::default(),
       terminal_prompt_lock: AsyncMutex::new(()),
     }
   }
@@ -532,6 +557,13 @@ impl DualApprovalCallback {
     formatter: impl Fn(&ToolCallView<'_>) -> String + Send + Sync + 'static,
   ) -> Self {
     self.rejection_formatter = Some(Arc::new(formatter));
+    self
+  }
+
+  /// What to do when nobody answers a prompt. Defaults to [`WhenUnanswered::Refuse`].
+  #[must_use]
+  pub fn when_unanswered(mut self, policy: WhenUnanswered) -> Self {
+    self.when_unanswered = policy;
     self
   }
 
@@ -619,10 +651,12 @@ impl DualApprovalCallback {
       .unwrap_or_else(|poisoned| poisoned.into_inner())
   }
 
-  /// Console prompt for the standalone [`ApprovalChannel::Terminal`] shape. Denies by
-  /// default if stdin cannot be read (e.g. a non-interactive process) or nobody answers
-  /// within the timeout.
-  async fn prompt_terminal(&self, tool_call: &ToolCallView<'_>) -> ApprovalOutcome {
+  /// Console prompt for the standalone [`ApprovalChannel::Terminal`] shape.
+  ///
+  /// `None` when no answer arrived — stdin could not be read (a non-interactive process,
+  /// say), what was typed was not an answer, or nobody answered within the timeout. See
+  /// [`Self::prompt_session`] for why that is kept distinct from an explicit refusal.
+  async fn prompt_terminal(&self, tool_call: &ToolCallView<'_>) -> Option<ApprovalOutcome> {
     let _guard = self.terminal_prompt_lock.lock().await;
 
     eprintln!("\n⚠️  即将执行高危操作");
@@ -639,10 +673,10 @@ impl DualApprovalCallback {
       }
       let mut input = String::new();
       if let Err(err) = io::stdin().read_line(&mut input) {
-        tracing::warn!("failed to read approval answer, denying by default: {err}");
-        return ApprovalOutcome::once(false);
+        tracing::warn!("failed to read approval answer: {err}");
+        return None;
       }
-      parse_approval_answer(&input).unwrap_or(ApprovalOutcome::once(false))
+      parse_approval_answer(&input)
     });
 
     // A timed-out read is abandoned, not cancelled: a blocking stdin read cannot be
@@ -656,33 +690,40 @@ impl DualApprovalCallback {
     // would consume the reply. Such callers should use `ApprovalChannel::Session` instead,
     // which keeps the console read under their own control (see `bin/cli`).
     let outcome = match tokio::time::timeout(self.timeout, read).await {
-      Ok(result) => result.unwrap_or(ApprovalOutcome::once(false)),
+      // A line that is not an answer counts as no answer, same as a closed stdin: the
+      // console has no way to ask again, so it is left to the caller's policy.
+      Ok(result) => result.ok().flatten(),
       Err(_) => {
-        eprintln!("\n⏳ 审批超时，默认拒绝");
-        // Never sticky: a timeout is the absence of an answer, and turning that into
-        // standing permission — in either direction — would be inventing an instruction
-        // nobody gave.
-        ApprovalOutcome::once(false)
+        eprintln!("\n⏳ 审批超时");
+        None
       }
     };
 
-    match (outcome.approved, outcome.sticky) {
-      (true, false) => eprintln!("✅ 已批准，继续执行...\n"),
-      (true, true) => eprintln!("✅ 已批准，本会话内不再询问该工具...\n"),
-      (false, false) => eprintln!("❌ 已拒绝，跳过执行\n"),
-      (false, true) => eprintln!("❌ 已拒绝，本会话内将自动拒绝该工具\n"),
+    match outcome
+      .as_ref()
+      .map(|outcome| (outcome.approved, outcome.sticky))
+    {
+      Some((true, false)) => eprintln!("✅ 已批准，继续执行...\n"),
+      Some((true, true)) => eprintln!("✅ 已批准，本会话内不再询问该工具...\n"),
+      Some((false, false)) => eprintln!("❌ 已拒绝，跳过执行\n"),
+      Some((false, true)) => eprintln!("❌ 已拒绝，本会话内将自动拒绝该工具\n"),
+      None => {}
     }
     outcome
   }
 
   /// Publishes a [`PendingApproval`] to the session and waits for any front-end to answer
-  /// it. Denies by default if nobody is listening, if whoever received it dropped the
-  /// decision without answering, or if the timeout expires first.
+  /// it.
+  ///
+  /// `None` when no answer arrived at all — nobody was listening, whoever received it
+  /// dropped the decision, or the timeout expired. Distinguished from `Some(refused)`
+  /// because the absence of an answer is not a decision, and only the caller knows
+  /// whether the question can be asked again later (see [`Self::when_unanswered`]).
   async fn prompt_session(
     sender: &mpsc::UnboundedSender<PendingApproval>,
     tool_call: &ToolCallView<'_>,
     timeout: Duration,
-  ) -> ApprovalOutcome {
+  ) -> Option<ApprovalOutcome> {
     let (decision_tx, decision_rx) = oneshot::channel();
     let request = PendingApproval {
       meta: ApprovalMeta {
@@ -695,25 +736,24 @@ impl DualApprovalCallback {
     };
 
     if sender.send(request).is_err() {
-      tracing::warn!("no front-end is listening for approvals, denying by default");
-      return ApprovalOutcome::once(false);
+      tracing::warn!("no front-end is listening for approvals");
+      return None;
     }
 
     match tokio::time::timeout(timeout, decision_rx).await {
-      Ok(Ok(outcome)) => outcome,
+      Ok(Ok(outcome)) => Some(outcome),
       // Every front-end holding the decision dropped it without answering.
       Ok(Err(_)) => {
-        tracing::warn!("approval was abandoned without a decision, denying by default");
-        ApprovalOutcome::once(false)
+        tracing::warn!("approval was abandoned without a decision");
+        None
       }
       Err(_) => {
         tracing::warn!(
           tool = %tool_call.name,
           timeout_secs = timeout.as_secs(),
-          "nobody approved in time, denying by default"
+          "nobody approved in time"
         );
-        // Not sticky — see `prompt_terminal`'s timeout branch.
-        ApprovalOutcome::once(false)
+        None
       }
     }
   }
@@ -793,6 +833,15 @@ impl BeforeToolCallback for DualApprovalCallback {
       ApprovalChannel::Session(sender) => {
         Self::prompt_session(&sender, &tool_call, self.timeout).await
       }
+    };
+
+    // Nobody answered. Not a decision, so nothing is remembered and nothing is inferred
+    // about what the answer would have been — see `WhenUnanswered`.
+    let Some(outcome) = outcome else {
+      return match self.when_unanswered {
+        WhenUnanswered::Refuse => self.denial(&tool_call, None),
+        WhenUnanswered::Suspend => ToolCallDecision::Suspend,
+      };
     };
 
     if outcome.sticky {
@@ -1892,6 +1941,154 @@ mod tests {
   #[test]
   fn a_reason_does_not_make_an_unknown_verdict_valid() {
     assert_eq!(parse_approval_answer("maybe: whatever"), None);
+  }
+
+  // ---- when nobody answers ----------------------------------------------------------
+
+  /// The default. A caller with nowhere to come back to must end the round with a
+  /// decision rather than leave a turn holding the session lock while nobody is being
+  /// asked anything.
+  #[tokio::test]
+  async fn an_unanswered_prompt_is_refused_by_default() {
+    let approval = approval();
+    let args = json!({ "path": "notes.txt" });
+
+    let decision = call_without_a_front_end(
+      &approval,
+      &conversation("local", "s1"),
+      view("delete_file", &args),
+    )
+    .await;
+
+    assert!(matches!(
+      decision,
+      ToolCallDecision::ShortCircuit(ToolResultStatus::Error, _)
+    ));
+  }
+
+  #[tokio::test]
+  async fn an_unanswered_prompt_can_suspend_instead() {
+    let approval = DualApprovalCallback::new(["delete_file"])
+      .with_timeout(Duration::from_secs(30))
+      .when_unanswered(WhenUnanswered::Suspend);
+    let args = json!({ "path": "notes.txt" });
+
+    let decision = call_without_a_front_end(
+      &approval,
+      &conversation("local", "s1"),
+      view("delete_file", &args),
+    )
+    .await;
+
+    assert!(
+      matches!(decision, ToolCallDecision::Suspend),
+      "with nobody to ask, the question should be kept rather than answered"
+    );
+  }
+
+  /// A timeout under this policy suspends too: waiting out the clock and finding nobody
+  /// there is the same situation as finding nobody there immediately.
+  #[tokio::test]
+  async fn a_timeout_suspends_under_that_policy() {
+    let approval = DualApprovalCallback::new(["delete_file"])
+      .with_timeout(Duration::from_millis(30))
+      .when_unanswered(WhenUnanswered::Suspend);
+    let context = conversation("local", "s1");
+    let args = json!({ "path": "notes.txt" });
+
+    // Received and held, never answered.
+    let (tx, mut rx) = mpsc::unbounded_channel::<PendingApproval>();
+    let hold = async {
+      let pending = rx.recv().await.expect("a prompt should have been raised");
+      tokio::time::sleep(Duration::from_secs(30)).await;
+      drop(pending);
+    };
+    let decision = tokio::select! {
+      result = with_approval_channel(
+        ApprovalChannel::Session(tx),
+        approval.call(&context, view("delete_file", &args)),
+      ) => result,
+      () = hold => panic!("the approval should have timed out first"),
+    };
+
+    assert!(matches!(decision, ToolCallDecision::Suspend));
+  }
+
+  /// An explicit refusal is still a refusal under the suspend policy — the policy only
+  /// governs the *absence* of an answer, and confusing the two would make "no" mean "ask
+  /// me again later".
+  #[tokio::test]
+  async fn an_explicit_refusal_is_not_turned_into_a_suspension() {
+    let approval = DualApprovalCallback::new(["delete_file"])
+      .with_timeout(Duration::from_secs(30))
+      .when_unanswered(WhenUnanswered::Suspend);
+    let context = conversation("local", "s1");
+    let args = json!({ "path": "notes.txt" });
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<PendingApproval>();
+    let call = with_approval_channel(
+      ApprovalChannel::Session(tx),
+      approval.call(&context, view("delete_file", &args)),
+    );
+    let respond = async {
+      let pending = rx.recv().await.expect("a prompt should have been raised");
+      let _ = pending.decision.send(ApprovalOutcome::once(false));
+    };
+    let (decision, ()) = tokio::join!(call, respond);
+
+    assert!(matches!(
+      decision,
+      ToolCallDecision::ShortCircuit(ToolResultStatus::Error, _)
+    ));
+  }
+
+  /// Nor is a suspension remembered. It is not a decision, so recording it would invent
+  /// standing permission — or a standing refusal — that nobody gave.
+  #[tokio::test]
+  async fn a_suspension_is_never_remembered() {
+    let approval = DualApprovalCallback::new(["delete_file"])
+      .with_timeout(Duration::from_secs(30))
+      .when_unanswered(WhenUnanswered::Suspend);
+    let context = conversation("local", "s1");
+    let args = json!({ "path": "notes.txt" });
+
+    for _ in 0..2 {
+      assert!(
+        matches!(
+          call_without_a_front_end(&approval, &context, view("delete_file", &args)).await,
+          ToolCallDecision::Suspend
+        ),
+        "each attempt must ask again rather than reuse the last suspension"
+      );
+    }
+  }
+
+  /// A remembered answer still applies under this policy: it short-circuits before any
+  /// prompt is raised, so there is nothing to go unanswered.
+  #[tokio::test]
+  async fn a_remembered_answer_still_applies_under_the_suspend_policy() {
+    let approval = DualApprovalCallback::new(["delete_file"])
+      .with_timeout(Duration::from_secs(30))
+      .when_unanswered(WhenUnanswered::Suspend);
+    let context = conversation("local", "s1");
+    let args = json!({ "path": "notes.txt" });
+
+    assert!(
+      answer_once(
+        &approval,
+        &context,
+        view("delete_file", &args),
+        ApprovalOutcome::sticky(true)
+      )
+      .await
+    );
+
+    assert!(
+      call_without_a_front_end(&approval, &context, view("delete_file", &args))
+        .await
+        .is_proceed(),
+      "the remembered approval should apply without a prompt to leave unanswered"
+    );
   }
 
   #[test]

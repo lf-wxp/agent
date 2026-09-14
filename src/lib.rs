@@ -21,4 +21,7 @@ pub mod tools;
 pub mod util;
 
 pub use agent::session;
-pub use agent::{Agent, AgentResult, AgentStreamEvent, StructuredAgentResult};
+pub use agent::{
+  Agent, AgentOutcome, AgentResult, AgentRunState, AgentStreamEvent, ResumedDecision,
+  StructuredAgentResult, SuspendedToolCall,
+};
