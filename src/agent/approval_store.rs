@@ -47,6 +47,27 @@ pub struct SuspendedRunView {
   pub events: Vec<Event>,
 }
 
+impl SuspendedRunView {
+  /// Whether this is a run parked on a human, rather than the checkpoint of a round that
+  /// is still in flight.
+  ///
+  /// The store holds both kinds, told apart by [`StopReason`] — they share it so a
+  /// process that dies outright still leaves the turn recoverable (see [`RunCheckpoint`]).
+  /// Only the first kind is something to show as "waiting for approval" or to offer a
+  /// resume for: a [`StopReason::RoundInFlight`] record is written *ahead* of a round, so
+  /// once any left behind by a dead process have been closed out, one can only mean a
+  /// round running right now.
+  ///
+  /// Provided here, on the view every display path already reads, because getting it
+  /// wrong is not obvious from the outside: a checkpoint reported as a suspension puts a
+  /// "Paused, waiting for approval" card — offering to resume or give up — beside the
+  /// live prompt for the very same call, and neither offer can be honoured while the turn
+  /// still holds its lock.
+  pub fn awaits_decision(&self) -> bool {
+    self.reason == StopReason::AwaitingDecision
+  }
+}
+
 /// Where a suspended run is kept while it waits to be answered.///
 /// A trait for the same reason [`crate::agent::session::SessionStore`] is one: the CLI
 /// wants a file on disk, a server would want whatever its other state lives in, and the
@@ -318,6 +339,37 @@ mod tests {
       reason: StopReason::AwaitingDecision,
       context: ExecutionContext::new(),
     }
+  }
+
+  /// A run parked on a human is the kind a display path should show as waiting, and the
+  /// only kind `/resume` can act on.
+  #[tokio::test]
+  async fn a_run_awaiting_a_decision_reads_as_waiting_on_a_human() {
+    let store = FileApprovalStore::new(temp_dir("awaits-decision"));
+    store.put("local", "run-1", &state("delete_file")).await;
+
+    let view = store.peek("local", "run-1").await.expect("stored above");
+
+    assert!(view.awaits_decision());
+  }
+
+  /// A checkpoint must not: it is written *ahead* of a round, so once startup has closed
+  /// out any left by a dead process, one can only mean a round running right now.
+  /// Showing it as a suspension offered a resume and a give-up for a turn still holding
+  /// its lock — neither of which could be honoured.
+  #[tokio::test]
+  async fn a_live_rounds_checkpoint_does_not_read_as_waiting_on_a_human() {
+    let store = FileApprovalStore::new(temp_dir("in-flight"));
+    let mut state = state("delete_file");
+    state.reason = StopReason::RoundInFlight;
+    store.put("local", "run-1", &state).await;
+
+    let view = store.peek("local", "run-1").await.expect("stored above");
+
+    assert!(
+      !view.awaits_decision(),
+      "a checkpoint is not a pending approval"
+    );
   }
 
   #[tokio::test]

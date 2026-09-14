@@ -139,12 +139,30 @@ impl WebState {
   /// first raised: a stored run has no live clock behind it, and reporting the original
   /// instant would have a client render "waiting for 14 hours" as though something were
   /// still counting down. Nothing is — it waits until answered.
+  ///
+  /// # Why a checkpoint does not count
+  ///
+  /// The store holds two kinds of record, told apart by [`StopReason`] (they share it so
+  /// a process that dies outright still leaves the turn recoverable). Only
+  /// [`StopReason::AwaitingDecision`] is a run parked on a human;
+  /// [`StopReason::RoundInFlight`] is written *ahead* of a round that is, right now,
+  /// running — and startup closes out any left by a previous process before this server
+  /// serves anything, so at runtime one can only mean a live round.
+  ///
+  /// Reporting those as suspended put a "Paused, waiting for approval" card, complete
+  /// with `Carry on`/`Give up`, next to the live approval prompt for the very same call
+  /// — on any tab that loaded mid-round. Neither button could do what it offered:
+  /// `/resume` is refused for such a state (see `AgentRunState::unresumable`), and
+  /// `Give up` reached for a lock the running turn was holding.
   async fn suspended_run(&self) -> Option<SuspendedRunView> {
     let now = chrono::Utc::now().timestamp();
     let view = self
       .approvals_store
       .peek(LOCAL_SCOPE, &self.session_id)
       .await?;
+    if !view.awaits_decision() {
+      return None;
+    }
     Some(SuspendedRunView {
       pending: view
         .pending
@@ -395,6 +413,7 @@ pub(crate) async fn chat_handler(
         let discarded = super::discard_suspended_run(
           &state.store,
           &state.approvals_store,
+          &state.approvals,
           &state.turn_lock,
           &state.session_id,
           &state.events,

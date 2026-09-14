@@ -619,6 +619,7 @@ async fn main() -> anyhow::Result<()> {
         let discarded = discard_suspended_run(
           &store,
           &approvals_store,
+          &approvals,
           &turn_lock,
           &session_id,
           &web_events_tx,
@@ -1620,13 +1621,36 @@ fn resume_turn_stream<'a>(
 /// does not replay, so the card would sit there looking unfinished until the page
 /// happened to be reloaded. Filing it covers the opposite case, a tab that arrives
 /// later and reads `GET /api/history`.
+///
+/// # Why the pending prompts are cancelled first
+///
+/// A turn parked on a decision holds `turn_lock` for as long as it waits, so taking that
+/// lock straight away meant `/discard` queued up behind *the very turn it is giving up
+/// on* — for the rest of [`agent::config::approval_timeout`], five minutes by default,
+/// with the front-end showing a "thinking" indicator the whole time because the notice
+/// that takes it down is only sent once this returns.
+///
+/// [`ApprovalRegistry::cancel_all`] is the way out, and it is the same move the signal
+/// handler makes ([`spawn_interrupt_handler`]): dropping the decision senders is what the
+/// waiting side reads as "nobody answered", so the turn suspends and stores itself
+/// through the ordinary route, just sooner than the timeout would have. The lock is then
+/// free, and the suspension this was asked to discard is on disk waiting to be taken —
+/// every driver files what it produced before releasing the lock.
+///
+/// A no-op when nothing is pending, which is the common case: the run was already
+/// suspended and no turn is running at all.
 async fn discard_suspended_run(
   store: &FileSessionStore,
   approvals_store: &FileApprovalStore,
+  approvals: &ApprovalRegistry,
   turn_lock: &AsyncMutex<()>,
   session_id: &str,
   events: &broadcast::Sender<ChatEvent>,
 ) -> bool {
+  // Before the lock, not after — see the docs above. This is what keeps a live turn
+  // from making `/discard` wait out the approval timeout it was invoked to cut short.
+  approvals.cancel_all();
+
   // The same lock a turn takes: this writes the session transcript, so it must not
   // interleave with a turn doing the same.
   let _guard = turn_lock.lock().await;
@@ -1665,6 +1689,11 @@ async fn suspended_run_notice(
   approvals_store
     .peek(LOCAL_SCOPE, session_id)
     .await
+    // Only a run parked on a human blocks a new turn. A `RoundInFlight` record is the
+    // checkpoint of a round that is running right now (startup closes out any left by a
+    // previous process), and reporting that as "waiting for approval" would refuse the
+    // next message while offering a `/resume` that is refused in turn.
+    .filter(agent::agent::SuspendedRunView::awaits_decision)
     .map(|_| {
       "本会话有一轮正在等待审批，需先处理才能开始新对话：\
        /resume 继续（会重新询问），/discard 放弃该轮。"
