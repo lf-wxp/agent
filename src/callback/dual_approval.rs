@@ -48,8 +48,8 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
 use crate::{
   agent::{
-    ContinuityCache, ExecutionContext, ToolResultStatus,
-    callback::{BeforeToolCallback, ToolCallView},
+    ContinuityCache, ExecutionContext,
+    callback::{BeforeToolCallback, ToolCallDecision, ToolCallView},
   },
   config,
 };
@@ -740,11 +740,7 @@ impl DualApprovalCallback {
   /// was observed in practice: the model declined the redirection and said so, naming
   /// prompt injection as the reason. Prefixed, the same text is attributable to the human
   /// and can be acted on.
-  fn denial(
-    &self,
-    tool_call: &ToolCallView<'_>,
-    reason: Option<String>,
-  ) -> Option<(ToolResultStatus, String)> {
+  fn denial(&self, tool_call: &ToolCallView<'_>, reason: Option<String>) -> ToolCallDecision {
     let explanation = reason.or_else(|| {
       self
         .rejection_formatter
@@ -755,7 +751,7 @@ impl DualApprovalCallback {
       Some(reason) => format!("User denied execution of {}: {reason}", tool_call.name),
       None => format!("User denied execution of {}", tool_call.name),
     };
-    Some((ToolResultStatus::Error, content))
+    ToolCallDecision::deny(content)
   }
 }
 
@@ -765,9 +761,9 @@ impl BeforeToolCallback for DualApprovalCallback {
     &self,
     context: &ExecutionContext,
     tool_call: ToolCallView<'_>,
-  ) -> Option<(ToolResultStatus, String)> {
+  ) -> ToolCallDecision {
     if !self.requires_approval(&tool_call) {
-      return None;
+      return ToolCallDecision::Proceed;
     }
 
     // A remembered answer short-circuits before any prompt is raised — which is the
@@ -780,7 +776,7 @@ impl BeforeToolCallback for DualApprovalCallback {
         "applying a remembered approval decision without prompting"
       );
       return if remembered.approved {
-        None
+        ToolCallDecision::Proceed
       } else {
         // Carries the reason forward, so a remembered refusal keeps telling the model
         // what the human originally said rather than degrading to the generic message.
@@ -804,7 +800,7 @@ impl BeforeToolCallback for DualApprovalCallback {
     }
 
     if outcome.approved {
-      None
+      ToolCallDecision::Proceed
     } else {
       self.denial(&tool_call, outcome.reason)
     }
@@ -821,6 +817,7 @@ mod tests {
   use serde_json::{Value, json};
 
   use super::*;
+  use crate::agent::ToolResultStatus;
 
   /// A view whose raw payload is a well-formed (if empty) object, so nothing about it
   /// trips the unreadable-arguments check — what every test that is not specifically
@@ -859,7 +856,7 @@ mod tests {
       }
     };
     let (result, ()) = tokio::join!(call, deny);
-    result.is_some()
+    !matches!(result, ToolCallDecision::Proceed)
   }
 
   /// An [`ApprovalMeta`] for a registry test, where only `id` matters. `requested_at` is
@@ -893,7 +890,7 @@ mod tests {
       approval()
         .call(&context, view("read_file", &args))
         .await
-        .is_none()
+        .is_proceed()
     );
   }
 
@@ -907,7 +904,7 @@ mod tests {
       approval
         .call(&context, view("delete_file", &args))
         .await
-        .is_none()
+        .is_proceed()
     );
   }
 
@@ -1121,7 +1118,10 @@ mod tests {
     };
 
     let (result, ()) = tokio::join!(call_future, respond_future);
-    assert!(result.is_none(), "approved calls are not short-circuited");
+    assert!(
+      matches!(result, ToolCallDecision::Proceed),
+      "approved calls are not short-circuited"
+    );
   }
 
   #[tokio::test]
@@ -1142,7 +1142,10 @@ mod tests {
     };
 
     let (result, ()) = tokio::join!(call_future, respond_future);
-    assert!(matches!(result, Some((ToolResultStatus::Error, _))));
+    assert!(matches!(
+      result,
+      ToolCallDecision::ShortCircuit(ToolResultStatus::Error, _)
+    ));
   }
 
   #[tokio::test]
@@ -1159,7 +1162,10 @@ mod tests {
     )
     .await;
 
-    assert!(matches!(result, Some((ToolResultStatus::Error, _))));
+    assert!(matches!(
+      result,
+      ToolCallDecision::ShortCircuit(ToolResultStatus::Error, _)
+    ));
   }
 
   #[tokio::test]
@@ -1182,7 +1188,10 @@ mod tests {
     };
 
     let (result, ()) = tokio::join!(call_future, drop_future);
-    assert!(matches!(result, Some((ToolResultStatus::Error, _))));
+    assert!(matches!(
+      result,
+      ToolCallDecision::ShortCircuit(ToolResultStatus::Error, _)
+    ));
   }
 
   /// The case that used to wedge the whole session: a front-end receives the prompt,
@@ -1211,7 +1220,10 @@ mod tests {
     };
 
     assert!(
-      matches!(result, Some((ToolResultStatus::Error, _))),
+      matches!(
+        result,
+        ToolCallDecision::ShortCircuit(ToolResultStatus::Error, _)
+      ),
       "an unanswered approval must deny rather than hang"
     );
   }
@@ -1262,7 +1274,10 @@ mod tests {
     };
 
     assert!(
-      matches!(result, Some((ToolResultStatus::Error, _))),
+      matches!(
+        result,
+        ToolCallDecision::ShortCircuit(ToolResultStatus::Error, _)
+      ),
       "a rejection from another view must deny the call"
     );
   }
@@ -1295,17 +1310,19 @@ mod tests {
       let _ = pending.decision.send(outcome);
     };
     let (result, ()) = tokio::join!(call, respond);
-    result.is_none()
+    matches!(result, ToolCallDecision::Proceed)
   }
 
-  /// Attempt a call with no front-end listening. `Some(..)` therefore means "a prompt was
-  /// needed" (and failed closed); `None` means the call never needed one — which is how a
-  /// remembered *approval* is distinguished from a fresh prompt.
+  /// Attempt a call with no front-end listening.
+  ///
+  /// [`ToolCallDecision::Proceed`] therefore means the call never needed a prompt — which
+  /// is how a remembered *approval* is distinguished from a fresh one; anything else means
+  /// a prompt was needed and failed closed for want of anyone to ask.
   async fn call_without_a_front_end(
     approval: &DualApprovalCallback,
     context: &ExecutionContext,
     tool_call: ToolCallView<'_>,
-  ) -> Option<(ToolResultStatus, String)> {
+  ) -> ToolCallDecision {
     let (tx, rx) = mpsc::unbounded_channel::<PendingApproval>();
     drop(rx);
     with_approval_channel(
@@ -1337,7 +1354,7 @@ mod tests {
     assert!(
       call_without_a_front_end(&approval, &context, view("delete_file", &args))
         .await
-        .is_none(),
+        .is_proceed(),
       "a remembered approval must apply without raising a prompt"
     );
   }
@@ -1366,7 +1383,7 @@ mod tests {
     assert!(
       matches!(
         call_without_a_front_end(&approval, &context, view("delete_file", &args)).await,
-        Some((ToolResultStatus::Error, _))
+        ToolCallDecision::ShortCircuit(ToolResultStatus::Error, _)
       ),
       "a remembered rejection must deny without asking"
     );
@@ -1390,9 +1407,9 @@ mod tests {
     );
 
     assert!(
-      call_without_a_front_end(&approval, &context, view("delete_file", &args))
+      !call_without_a_front_end(&approval, &context, view("delete_file", &args))
         .await
-        .is_some(),
+        .is_proceed(),
       "a one-off approval must not carry over to the next call"
     );
   }
@@ -1417,9 +1434,9 @@ mod tests {
     );
 
     assert!(
-      call_without_a_front_end(&approval, &context, view("shell_exec", &args))
+      !call_without_a_front_end(&approval, &context, view("shell_exec", &args))
         .await
-        .is_some(),
+        .is_proceed(),
       "the other tool was never decided and must still be gated"
     );
   }
@@ -1447,13 +1464,13 @@ mod tests {
       ("web", "s1", "the same session id in a different scope"),
     ] {
       assert!(
-        call_without_a_front_end(
+        !call_without_a_front_end(
           &approval,
           &conversation(scope, id),
           view("delete_file", &args)
         )
         .await
-        .is_some(),
+        .is_proceed(),
         "{why} must not inherit the remembered answer"
       );
     }
@@ -1484,7 +1501,7 @@ mod tests {
       assert!(
         call_without_a_front_end(&approval, &context, view(tool, &args))
           .await
-          .is_none(),
+          .is_proceed(),
         "{tool}'s remembered answer should have survived the other's"
       );
     }
@@ -1511,9 +1528,9 @@ mod tests {
     approval.forget_sticky(&context.continuity_key());
 
     assert!(
-      call_without_a_front_end(&approval, &context, view("delete_file", &args))
+      !call_without_a_front_end(&approval, &context, view("delete_file", &args))
         .await
-        .is_some(),
+        .is_proceed(),
       "after forgetting, the tool must be gated again"
     );
   }
@@ -1542,7 +1559,10 @@ mod tests {
       ) => result,
       () = hold => panic!("the approval should have timed out first"),
     };
-    assert!(matches!(timed_out, Some((ToolResultStatus::Error, _))));
+    assert!(matches!(
+      timed_out,
+      ToolCallDecision::ShortCircuit(ToolResultStatus::Error, _)
+    ));
 
     // The next call must still raise a prompt rather than reuse the timeout as a
     // remembered rejection.
@@ -1617,8 +1637,15 @@ mod tests {
       let _ = pending.decision.send(outcome);
     };
     let (result, ()) = tokio::join!(call, respond);
-    match result {
-      Some((ToolResultStatus::Error, content)) => content,
+    denial_content(result)
+  }
+
+  /// The content a refusal recorded, for asserting on what the model is actually told.
+  /// Panics on anything but a refusal, so a test that meant to check a message cannot
+  /// quietly pass against a call that was allowed through.
+  fn denial_content(decision: ToolCallDecision) -> String {
+    match decision {
+      ToolCallDecision::ShortCircuit(ToolResultStatus::Error, content) => content,
       other => panic!("expected a refusal, got {other:?}"),
     }
   }
@@ -1742,11 +1769,8 @@ mod tests {
     .await;
 
     assert_eq!(
-      result,
-      Some((
-        ToolResultStatus::Error,
-        "User denied execution of delete_file: nobody was there to ask".to_owned()
-      ))
+      denial_content(result),
+      "User denied execution of delete_file: nobody was there to ask"
     );
   }
 
@@ -1772,11 +1796,10 @@ mod tests {
 
     // Second call: answered from memory, with no front-end attached at all.
     assert_eq!(
-      call_without_a_front_end(&approval, &context, view("delete_file", &args)).await,
-      Some((
-        ToolResultStatus::Error,
-        "User denied execution of delete_file: production data, never delete".to_owned()
-      )),
+      denial_content(
+        call_without_a_front_end(&approval, &context, view("delete_file", &args)).await
+      ),
+      "User denied execution of delete_file: production data, never delete",
       "the remembered reason must be reported again"
     );
   }

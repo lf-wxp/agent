@@ -397,11 +397,8 @@ impl BeforeToolCallback for DenyEverything {
     &self,
     _context: &ExecutionContext,
     tool_call: ToolCallView<'_>,
-  ) -> Option<(ToolResultStatus, String)> {
-    Some((
-      ToolResultStatus::Error,
-      format!("denied {}", tool_call.name),
-    ))
+  ) -> ToolCallDecision {
+    ToolCallDecision::deny(format!("denied {}", tool_call.name))
   }
 }
 
@@ -449,9 +446,9 @@ impl BeforeToolCallback for CountingBefore {
     &self,
     _context: &ExecutionContext,
     _tool_call: ToolCallView<'_>,
-  ) -> Option<(ToolResultStatus, String)> {
+  ) -> ToolCallDecision {
     self.0.fetch_add(1, Ordering::SeqCst);
-    None
+    ToolCallDecision::Proceed
   }
 }
 
@@ -619,6 +616,244 @@ async fn multiple_after_tool_callbacks_thread_the_result_through_in_order() {
     content, "real result-a-b",
     "each hook must see the previous hook's output, in registration order"
   );
+}
+
+/// Suspends every call it sees, standing in for an approval that needs a human who is
+/// not currently reachable.
+struct SuspendEverything;
+
+#[async_trait::async_trait]
+impl BeforeToolCallback for SuspendEverything {
+  async fn call(
+    &self,
+    _context: &ExecutionContext,
+    _tool_call: ToolCallView<'_>,
+  ) -> ToolCallDecision {
+    ToolCallDecision::Suspend
+  }
+}
+
+/// A second tool, so a round can contain one call that completes and one that suspends.
+struct OtherSpyTool {
+  executed: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl Tool for OtherSpyTool {
+  fn name(&self) -> &str {
+    "other"
+  }
+
+  fn description(&self) -> &str {
+    "records whether it ran"
+  }
+
+  fn parameters(&self) -> Value {
+    json!({"type": "object", "properties": {}})
+  }
+
+  async fn execute(&self, _args_json: &str) -> anyhow::Result<String> {
+    self.executed.store(true, Ordering::SeqCst);
+    Ok("other result".to_owned())
+  }
+}
+
+/// Suspends only the tool it is named after, letting everything else through — the shape
+/// a real approval rule has, and what makes a partially suspended round possible.
+struct SuspendOne(&'static str);
+
+#[async_trait::async_trait]
+impl BeforeToolCallback for SuspendOne {
+  async fn call(
+    &self,
+    _context: &ExecutionContext,
+    tool_call: ToolCallView<'_>,
+  ) -> ToolCallDecision {
+    if tool_call.name == self.0 {
+      ToolCallDecision::Suspend
+    } else {
+      ToolCallDecision::Proceed
+    }
+  }
+}
+
+fn call_named(id: &str, name: &str) -> ChatCompletionMessageToolCalls {
+  ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+    id: id.to_owned(),
+    function: FunctionCall {
+      name: name.to_owned(),
+      arguments: "{}".to_owned(),
+    },
+  })
+}
+
+/// A suspended call must not run, and must not be reported as a result either — it has
+/// not produced one.
+#[tokio::test]
+async fn a_suspended_call_neither_runs_nor_produces_a_result() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let agent =
+    agent_with(spy_registry(&executed)).with_before_tool_callback(Arc::new(SuspendEverything));
+  let mut context = ExecutionContext::new();
+
+  let round = agent.execute_tool_calls(&mut context, &[spy_call()]).await;
+
+  assert!(!executed.load(Ordering::SeqCst), "the tool must not run");
+  assert!(round.completed.is_empty());
+  assert_eq!(round.suspended.len(), 1);
+  assert_eq!(round.suspended[0].tool_call_id, "call_1");
+  assert_eq!(round.suspended[0].name, "spy");
+  assert!(
+    context.events.is_empty(),
+    "a round that produced no results must not record a tool event, or the transcript \
+     would claim a decision that has not been taken"
+  );
+}
+
+/// The case partial completion exists for: calls in a round run concurrently, so one
+/// suspending does not undo the work its siblings already did. Discarding their results
+/// would mean re-running them later and duplicating every side effect.
+#[tokio::test]
+async fn a_partially_suspended_round_keeps_the_results_it_already_has() {
+  let spy_executed = Arc::new(AtomicBool::new(false));
+  let other_executed = Arc::new(AtomicBool::new(false));
+
+  let mut registry = ToolRegistry::empty();
+  registry
+    .add(Arc::new(SpyTool {
+      executed: Arc::clone(&spy_executed),
+    }))
+    .unwrap();
+  registry
+    .add(Arc::new(OtherSpyTool {
+      executed: Arc::clone(&other_executed),
+    }))
+    .unwrap();
+
+  let agent = agent_with(registry).with_before_tool_callback(Arc::new(SuspendOne("spy")));
+  let mut context = ExecutionContext::new();
+
+  let round = agent
+    .execute_tool_calls(
+      &mut context,
+      &[call_named("call_1", "spy"), call_named("call_2", "other")],
+    )
+    .await;
+
+  assert!(
+    !spy_executed.load(Ordering::SeqCst),
+    "the suspended tool must not run"
+  );
+  assert!(
+    other_executed.load(Ordering::SeqCst),
+    "its sibling must still have run"
+  );
+
+  assert_eq!(round.suspended.len(), 1);
+  assert_eq!(round.suspended[0].name, "spy");
+  assert_eq!(round.completed.len(), 1);
+  let ContentItem::ToolResult {
+    tool_call_id, name, ..
+  } = &round.completed[0]
+  else {
+    panic!("expected a tool result");
+  };
+  assert_eq!(tool_call_id, "call_2");
+  assert_eq!(name, "other");
+
+  // Recorded: exactly the one result, so the transcript reflects what happened and
+  // nothing more.
+  let event = context
+    .events
+    .last()
+    .expect("the result should be recorded");
+  assert_eq!(event.content.len(), 1);
+}
+
+/// A suspension stops the before-hook chain where it happens: a later hook must not get
+/// to rule on a call that is already undecided, and the tool must not run either.
+#[tokio::test]
+async fn a_suspension_ends_the_before_hook_chain() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let later_calls = Arc::new(AtomicUsize::new(0));
+  let agent = agent_with(spy_registry(&executed))
+    .with_before_tool_callback(Arc::new(SuspendEverything))
+    .with_before_tool_callback(Arc::new(CountingBefore(Arc::clone(&later_calls))));
+  let mut context = ExecutionContext::new();
+
+  agent.execute_tool_calls(&mut context, &[spy_call()]).await;
+
+  assert_eq!(
+    later_calls.load(Ordering::SeqCst),
+    0,
+    "a hook after the one that suspended must not run"
+  );
+  assert!(!executed.load(Ordering::SeqCst), "the tool must not run");
+}
+
+/// The raw argument string has to survive a suspension verbatim: it is what the tool
+/// will be handed when the call is retried, and what a human was shown when asked about
+/// it. Re-deriving it from a parsed value would hand the tool a different payload than
+/// the one that was approved.
+#[tokio::test]
+async fn a_suspended_call_keeps_its_raw_arguments() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let agent =
+    agent_with(spy_registry(&executed)).with_before_tool_callback(Arc::new(SuspendEverything));
+  let mut context = ExecutionContext::new();
+
+  let raw = r#"{"path": "notes.txt", "n": 1}"#;
+  let call = ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+    id: "call_1".to_owned(),
+    function: FunctionCall {
+      name: "spy".to_owned(),
+      arguments: raw.to_owned(),
+    },
+  });
+
+  let round = agent.execute_tool_calls(&mut context, &[call]).await;
+
+  assert_eq!(round.suspended[0].raw_arguments, raw);
+}
+
+/// An entry point with nowhere to resume to has to close the call out rather than leave
+/// it dangling: `record_tool_calls` has already written the call, and a call with no
+/// matching result is a conversation most providers reject.
+#[tokio::test]
+async fn an_entry_point_that_cannot_resume_records_the_call_as_unanswered() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let agent =
+    agent_with(spy_registry(&executed)).with_before_tool_callback(Arc::new(SuspendEverything));
+  let mut context = ExecutionContext::new();
+
+  let round = agent.execute_tool_calls(&mut context, &[spy_call()]).await;
+  let placeholders = agent.record_unanswered(&mut context, &round.suspended);
+
+  assert_eq!(placeholders.len(), 1);
+  let ContentItem::ToolResult {
+    tool_call_id,
+    status,
+    content,
+    ..
+  } = &placeholders[0]
+  else {
+    panic!("expected a tool result");
+  };
+  assert_eq!(tool_call_id, "call_1");
+  assert_eq!(*status, ToolResultStatus::Error);
+  assert!(
+    content.contains("spy"),
+    "the message should name the tool that was not run: {content}"
+  );
+
+  // Every recorded call now has a result, which is the invariant this exists to restore.
+  let results: Vec<&ContentItem> = context
+    .events
+    .iter()
+    .flat_map(|event| &event.content)
+    .filter(|item| matches!(item, ContentItem::ToolResult { .. }))
+    .collect();
+  assert_eq!(results.len(), 1);
 }
 
 #[test]

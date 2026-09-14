@@ -5,8 +5,8 @@ use serde_json::Value;
 
 use crate::{
   agent::{
-    ExecutionContext, ToolResultStatus,
-    callback::{BeforeToolCallback, ToolCallView},
+    ExecutionContext,
+    callback::{BeforeToolCallback, ToolCallDecision, ToolCallView},
   },
   tools::{file_delete, file_list, file_read, file_upzip, read_image},
 };
@@ -113,7 +113,7 @@ impl BeforeToolCallback for WorkspaceGuardCallback {
     &self,
     _context: &ExecutionContext,
     tool_call: ToolCallView<'_>,
-  ) -> Option<(ToolResultStatus, String)> {
+  ) -> ToolCallDecision {
     for field in Self::guarded_fields(tool_call.name) {
       // A missing or non-string field is left to the tool's own argument parsing to
       // reject; this callback only rules on a path it can actually read.
@@ -127,16 +127,13 @@ impl BeforeToolCallback for WorkspaceGuardCallback {
           %reason,
           "blocked a filesystem call outside the workspace root"
         );
-        return Some((
-          ToolResultStatus::Error,
-          format!(
-            "Denied: {reason}. This tool is restricted to the workspace root; ask for a \
-             path inside it."
-          ),
+        return ToolCallDecision::deny(format!(
+          "Denied: {reason}. This tool is restricted to the workspace root; ask for a \
+           path inside it."
         ));
       }
     }
-    None
+    ToolCallDecision::Proceed
   }
 }
 
@@ -192,6 +189,7 @@ mod tests {
   use serde_json::json;
 
   use super::*;
+  use crate::agent::ToolResultStatus;
   use crate::tools::ToolRegistry;
 
   /// A freshly created directory under the OS temp dir that no other test can collide
@@ -221,12 +219,10 @@ mod tests {
     let context = ExecutionContext::new();
 
     let args = json!({ "file_path": "notes.txt" });
-    assert!(
-      guard
-        .call(&context, view(file_delete::NAME, &args))
-        .await
-        .is_none()
-    );
+    assert!(matches!(
+      guard.call(&context, view(file_delete::NAME, &args)).await,
+      ToolCallDecision::Proceed
+    ));
   }
 
   #[tokio::test]
@@ -237,12 +233,10 @@ mod tests {
 
     let inside = root.join("notes.txt");
     let args = json!({ "file_path": inside.to_string_lossy() });
-    assert!(
-      guard
-        .call(&context, view(file_delete::NAME, &args))
-        .await
-        .is_none()
-    );
+    assert!(matches!(
+      guard.call(&context, view(file_delete::NAME, &args)).await,
+      ToolCallDecision::Proceed
+    ));
   }
 
   #[tokio::test]
@@ -253,7 +247,10 @@ mod tests {
 
     let args = json!({ "file_path": "../../etc/passwd" });
     let result = guard.call(&context, view(file_delete::NAME, &args)).await;
-    assert!(matches!(result, Some((ToolResultStatus::Error, _))));
+    assert!(matches!(
+      result,
+      ToolCallDecision::ShortCircuit(ToolResultStatus::Error, _)
+    ));
   }
 
   #[tokio::test]
@@ -264,7 +261,10 @@ mod tests {
 
     let args = json!({ "file_path": "/etc/passwd" });
     let result = guard.call(&context, view(file_delete::NAME, &args)).await;
-    assert!(matches!(result, Some((ToolResultStatus::Error, _))));
+    assert!(matches!(
+      result,
+      ToolCallDecision::ShortCircuit(ToolResultStatus::Error, _)
+    ));
   }
 
   #[tokio::test]
@@ -275,7 +275,7 @@ mod tests {
 
     let args = json!({ "path": "../outside" });
     let result = guard.call(&context, view(file_list::NAME, &args)).await;
-    assert!(result.is_some());
+    assert!(!result.is_proceed());
   }
 
   #[tokio::test]
@@ -286,7 +286,7 @@ mod tests {
 
     let args = json!({ "zip_path": "archive.zip", "extract_to": "../escape" });
     let result = guard.call(&context, view(file_upzip::NAME, &args)).await;
-    assert!(result.is_some());
+    assert!(!result.is_proceed());
   }
 
   #[tokio::test]
@@ -298,12 +298,10 @@ mod tests {
     // A fresh extraction directory does not exist yet, so this must fall back to
     // lexical `.`/`..` resolution rather than failing outright.
     let args = json!({ "zip_path": "archive.zip", "extract_to": "brand-new-subdir" });
-    assert!(
-      guard
-        .call(&context, view(file_upzip::NAME, &args))
-        .await
-        .is_none()
-    );
+    assert!(matches!(
+      guard.call(&context, view(file_upzip::NAME, &args)).await,
+      ToolCallDecision::Proceed
+    ));
   }
 
   #[tokio::test]
@@ -315,7 +313,10 @@ mod tests {
     let args =
       json!({ "file_path": "../outside.png", "query": "what is this?", "model": "vision" });
     let result = guard.call(&context, view(read_image::NAME, &args)).await;
-    assert!(matches!(result, Some((ToolResultStatus::Error, _))));
+    assert!(matches!(
+      result,
+      ToolCallDecision::ShortCircuit(ToolResultStatus::Error, _)
+    ));
   }
 
   /// Regression guard: every built-in tool that reads/writes a filesystem path (as
@@ -352,12 +353,10 @@ mod tests {
     let context = ExecutionContext::new();
 
     let args = json!({ "operator": "add", "first_number": 1, "second_number": 2 });
-    assert!(
-      guard
-        .call(&context, view("calculator", &args))
-        .await
-        .is_none()
-    );
+    assert!(matches!(
+      guard.call(&context, view("calculator", &args)).await,
+      ToolCallDecision::Proceed
+    ));
   }
 
   #[test]
@@ -384,6 +383,9 @@ mod tests {
 
     let args = json!({ "file_path": "escape/secret.txt" });
     let result = guard.call(&context, view(file_delete::NAME, &args)).await;
-    assert!(matches!(result, Some((ToolResultStatus::Error, _))));
+    assert!(matches!(
+      result,
+      ToolCallDecision::ShortCircuit(ToolResultStatus::Error, _)
+    ));
   }
 }

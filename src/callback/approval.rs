@@ -6,8 +6,8 @@ use std::{
 use tokio::sync::Mutex;
 
 use crate::agent::{
-  ExecutionContext, ToolResultStatus,
-  callback::{BeforeToolCallback, ToolCallView},
+  ExecutionContext,
+  callback::{BeforeToolCallback, ToolCallDecision, ToolCallView},
 };
 
 /// Asks a human on the console before letting any listed tool run; denying records an
@@ -45,9 +45,9 @@ impl BeforeToolCallback for ApprovalCallback {
     &self,
     _context: &ExecutionContext,
     tool_call: ToolCallView<'_>,
-  ) -> Option<(ToolResultStatus, String)> {
+  ) -> ToolCallDecision {
     if !self.dangerous_tools.contains(tool_call.name) {
-      return None;
+      return ToolCallDecision::Proceed;
     }
 
     // Hold the lock across the whole prompt+read so concurrent dangerous calls in the
@@ -78,13 +78,10 @@ impl BeforeToolCallback for ApprovalCallback {
 
     if approved {
       eprintln!("✅ 已批准，继续执行...\n");
-      None
+      ToolCallDecision::Proceed
     } else {
       eprintln!("❌ 已拒绝，跳过执行\n");
-      Some((
-        ToolResultStatus::Error,
-        format!("User denied execution of {}", tool_call.name),
-      ))
+      ToolCallDecision::deny(format!("User denied execution of {}", tool_call.name))
     }
   }
 }
@@ -114,12 +111,10 @@ mod tests {
     let context = ExecutionContext::new();
     let args = json!({ "path": "notes.txt" });
 
-    assert!(
-      approval
-        .call(&context, view("read_file", &args))
-        .await
-        .is_none()
-    );
+    assert!(matches!(
+      approval.call(&context, view("read_file", &args)).await,
+      ToolCallDecision::Proceed
+    ));
   }
 
   #[tokio::test]
@@ -128,12 +123,10 @@ mod tests {
     let context = ExecutionContext::new();
     let args = json!({});
 
-    assert!(
-      approval
-        .call(&context, view("delete_file", &args))
-        .await
-        .is_none()
-    );
+    assert!(matches!(
+      approval.call(&context, view("delete_file", &args)).await,
+      ToolCallDecision::Proceed
+    ));
   }
 
   #[tokio::test]
@@ -144,12 +137,10 @@ mod tests {
     let context = ExecutionContext::new();
     let args = json!({});
 
-    assert!(
-      approval
-        .call(&context, view("delete_file", &args))
-        .await
-        .is_none()
-    );
+    assert!(matches!(
+      approval.call(&context, view("delete_file", &args)).await,
+      ToolCallDecision::Proceed
+    ));
   }
 
   #[tokio::test]
@@ -158,12 +149,10 @@ mod tests {
     let context = ExecutionContext::new();
     let args = json!({});
 
-    assert!(
-      approval
-        .call(&context, view("Delete_File", &args))
-        .await
-        .is_none()
-    );
+    assert!(matches!(
+      approval.call(&context, view("Delete_File", &args)).await,
+      ToolCallDecision::Proceed
+    ));
   }
 
   #[tokio::test]
@@ -176,17 +165,17 @@ mod tests {
     let context = ExecutionContext::new();
     let args = json!({});
 
-    assert!(
+    assert!(matches!(
       from_str_slices
         .call(&context, view("read_file", &args))
-        .await
-        .is_none()
-    );
-    assert!(
+        .await,
+      ToolCallDecision::Proceed
+    ));
+    assert!(matches!(
       from_owned_strings
         .call(&context, view("read_file", &args))
-        .await
-        .is_none()
-    );
+        .await,
+      ToolCallDecision::Proceed
+    ));
   }
 }

@@ -249,7 +249,10 @@ impl Agent {
         ));
       }
 
-      self.execute_tool_calls(&mut context, &tool_calls).await;
+      let round = self.execute_tool_calls(&mut context, &tool_calls).await;
+      if !round.suspended.is_empty() {
+        self.record_unanswered(&mut context, &round.suspended);
+      }
       context.increment_step();
     }
   }
@@ -368,7 +371,10 @@ impl Agent {
           tracing::warn!("model requested tools after they were disabled");
         } else {
           self.record_tool_calls(&mut context, &tool_calls);
-          self.execute_tool_calls(&mut context, &tool_calls).await;
+          let round = self.execute_tool_calls(&mut context, &tool_calls).await;
+          if !round.suspended.is_empty() {
+            self.record_unanswered(&mut context, &round.suspended);
+          }
           context.increment_step();
           continue;
         }

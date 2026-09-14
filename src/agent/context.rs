@@ -1,10 +1,11 @@
 use std::{borrow::Cow, collections::VecDeque};
 
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::event::Event;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
   pub prompt_tokens: u32,
   pub completion_tokens: u32,
@@ -96,7 +97,14 @@ impl From<Conversation> for Vec<Event> {
   }
 }
 
-#[derive(Debug)]
+/// Everything one in-progress run consists of, as data.
+///
+/// Serializable on purpose, and that is a design statement rather than a convenience:
+/// what a run "is" at any moment is its transcript plus a little bookkeeping, never a
+/// suspended call stack. That is what makes a run interruptible — see
+/// [`crate::agent::runtime::AgentRunState`], which persists one of these so a turn
+/// stopped waiting on a human can be resumed in another process.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ExecutionContext {
   /// Identifies this one run. A fresh value per
   /// [`crate::agent::Agent::run_continuing`] call, including successive turns of the same
@@ -310,6 +318,60 @@ mod tests {
     assert_eq!(usage.prompt_tokens, u32::MAX);
     assert_eq!(usage.completion_tokens, u32::MAX);
     assert_eq!(usage.total_tokens, u32::MAX);
+  }
+
+  /// The premise behind resuming an interrupted run: a run in progress is data, so it
+  /// survives a round trip through storage with nothing lost. Every field is checked
+  /// rather than a sample, since one silently dropped on the way out (a mid-run
+  /// `current_step`, say) would resume as a subtly different run instead of failing.
+  #[test]
+  fn an_in_progress_context_round_trips_through_json() {
+    use crate::agent::ContentItem;
+
+    let mut context = ExecutionContext::new();
+    context.conversation_id = Some("session-7".to_owned());
+    context.conversation_scope = Some("local".to_owned());
+    context.current_step = 3;
+    context.usage.add(11, 22, 33);
+    context.add_event(Event::new(
+      "exec-1",
+      "user",
+      vec![ContentItem::Message {
+        role: "user".to_owned(),
+        content: "hi".to_owned(),
+      }],
+    ));
+
+    let json = serde_json::to_string(&context).unwrap();
+    let back: ExecutionContext = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.execution_id, context.execution_id);
+    assert_eq!(back.conversation_id.as_deref(), Some("session-7"));
+    assert_eq!(back.conversation_scope.as_deref(), Some("local"));
+    assert_eq!(back.current_step, 3);
+    assert_eq!(back.usage.prompt_tokens, 11);
+    assert_eq!(back.usage.completion_tokens, 22);
+    assert_eq!(back.usage.total_tokens, 33);
+    assert_eq!(back.events.len(), 1);
+    assert_eq!(
+      back.continuity_key(),
+      context.continuity_key(),
+      "the key hook state is bucketed under has to survive, or a resumed run would \
+       read someone else's accumulated state"
+    );
+  }
+
+  /// A finished run carries its answer. Losing it on the way through storage would turn
+  /// a completed run into one that looks like it still has work to do.
+  #[test]
+  fn a_final_result_survives_serialization() {
+    let mut context = ExecutionContext::new();
+    context.final_result = Some("42".to_owned());
+
+    let json = serde_json::to_string(&context).unwrap();
+    let back: ExecutionContext = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.final_result.as_deref(), Some("42"));
   }
 
   #[test]

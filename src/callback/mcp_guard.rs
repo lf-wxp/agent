@@ -30,8 +30,8 @@ use serde_json::Value;
 
 use crate::{
   agent::{
-    ExecutionContext, ToolResultStatus,
-    callback::{BeforeToolCallback, ToolCallView},
+    ExecutionContext,
+    callback::{BeforeToolCallback, ToolCallDecision, ToolCallView},
   },
   callback::path_guard::resolve_best_effort,
   tools::mcp::client,
@@ -105,9 +105,9 @@ impl BeforeToolCallback for McpGuardCallback {
     &self,
     _context: &ExecutionContext,
     tool_call: ToolCallView<'_>,
-  ) -> Option<(ToolResultStatus, String)> {
+  ) -> ToolCallDecision {
     if !client::is_mcp_tool_name(tool_call.name) {
-      return None;
+      return ToolCallDecision::Proceed;
     }
 
     let mut candidates = Vec::new();
@@ -120,16 +120,13 @@ impl BeforeToolCallback for McpGuardCallback {
           %reason,
           "blocked an MCP tool call touching a sensitive credential path"
         );
-        return Some((
-          ToolResultStatus::Error,
-          format!(
-            "Denied: {reason}. MCP tools are not allowed to reference credential/config \
-             paths under the home directory."
-          ),
+        return ToolCallDecision::deny(format!(
+          "Denied: {reason}. MCP tools are not allowed to reference credential/config \
+           paths under the home directory."
         ));
       }
     }
-    None
+    ToolCallDecision::Proceed
   }
 }
 
@@ -212,6 +209,7 @@ mod tests {
   use serde_json::json;
 
   use super::*;
+  use crate::agent::ToolResultStatus;
 
   /// A freshly created directory under the OS temp dir, used as a fake `$HOME` so tests
   /// never touch the real one. Not cleaned up afterwards, same tradeoff as
@@ -256,12 +254,10 @@ mod tests {
 
     // No `__` in the name: this callback leaves it entirely to
     // `WorkspaceGuardCallback`/the tool's own validation.
-    assert!(
-      guard
-        .call(&context, view("delete_file", &args))
-        .await
-        .is_none()
-    );
+    assert!(matches!(
+      guard.call(&context, view("delete_file", &args)).await,
+      ToolCallDecision::Proceed
+    ));
   }
 
   #[tokio::test]
@@ -273,7 +269,10 @@ mod tests {
 
     let args = json!({ "path": "~/.ssh/id_rsa" });
     let result = guard.call(&context, view("demo__read_file", &args)).await;
-    assert!(matches!(result, Some((ToolResultStatus::Error, _))));
+    assert!(matches!(
+      result,
+      ToolCallDecision::ShortCircuit(ToolResultStatus::Error, _)
+    ));
   }
 
   #[tokio::test]
@@ -285,7 +284,10 @@ mod tests {
 
     let args = json!({ "path": home.join(".aws/credentials").to_string_lossy() });
     let result = guard.call(&context, view("demo__read_file", &args)).await;
-    assert!(matches!(result, Some((ToolResultStatus::Error, _))));
+    assert!(matches!(
+      result,
+      ToolCallDecision::ShortCircuit(ToolResultStatus::Error, _)
+    ));
   }
 
   #[tokio::test]
@@ -297,7 +299,10 @@ mod tests {
 
     let args = json!({ "paths": ["notes.txt", "~/.ssh/id_rsa"] });
     let result = guard.call(&context, view("demo__read_many", &args)).await;
-    assert!(matches!(result, Some((ToolResultStatus::Error, _))));
+    assert!(matches!(
+      result,
+      ToolCallDecision::ShortCircuit(ToolResultStatus::Error, _)
+    ));
   }
 
   #[tokio::test]
@@ -308,12 +313,10 @@ mod tests {
     let context = ExecutionContext::new();
 
     let args = json!({ "path": "notes.txt" });
-    assert!(
-      guard
-        .call(&context, view("demo__read_file", &args))
-        .await
-        .is_none()
-    );
+    assert!(matches!(
+      guard.call(&context, view("demo__read_file", &args)).await,
+      ToolCallDecision::Proceed
+    ));
   }
 
   #[tokio::test]
@@ -326,12 +329,10 @@ mod tests {
     // A web-search-style query: has a `/` in it, is not remotely a path, and — being
     // relative-looking — is never even resolved against `home` in the first place.
     let args = json!({ "query": "rust async/await tutorial" });
-    assert!(
-      guard
-        .call(&context, view("demo__web_search", &args))
-        .await
-        .is_none()
-    );
+    assert!(matches!(
+      guard.call(&context, view("demo__web_search", &args)).await,
+      ToolCallDecision::Proceed
+    ));
   }
 
   #[tokio::test]
@@ -342,11 +343,9 @@ mod tests {
     let context = ExecutionContext::new();
 
     let args = json!({ "path": home.join("Documents/report.pdf").to_string_lossy() });
-    assert!(
-      guard
-        .call(&context, view("demo__read_file", &args))
-        .await
-        .is_none()
-    );
+    assert!(matches!(
+      guard.call(&context, view("demo__read_file", &args)).await,
+      ToolCallDecision::Proceed
+    ));
   }
 }

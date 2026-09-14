@@ -210,7 +210,9 @@ mod tests {
   #[tokio::test]
   async fn reset_forgets_remembered_approval_decisions() {
     use agent::{
-      agent::{BeforeToolCallback, ExecutionContext, ToolCallView, ToolResultStatus},
+      agent::{
+        BeforeToolCallback, ExecutionContext, ToolCallDecision, ToolCallView, ToolResultStatus,
+      },
       callback::dual_approval::{ApprovalChannel, ApprovalOutcome, with_approval_channel},
     };
 
@@ -242,13 +244,13 @@ mod tests {
       let _ = pending.decision.send(ApprovalOutcome::sticky(true));
     };
     let (result, ()) = tokio::join!(first, answer);
-    assert!(result.is_none(), "the sticky answer approved this call");
+    assert!(result.is_proceed(), "the sticky answer approved this call");
 
     // With it remembered, a second call needs no prompt — no channel is attached, so if
     // one were raised this would fall back to a terminal prompt and hang rather than
     // return.
     assert!(
-      approvals.call(&context, call()).await.is_none(),
+      approvals.call(&context, call()).await.is_proceed(),
       "the remembered answer should apply without asking again"
     );
 
@@ -264,7 +266,10 @@ mod tests {
     )
     .await;
     assert!(
-      matches!(after_reset, Some((ToolResultStatus::Error, _))),
+      matches!(
+        after_reset,
+        ToolCallDecision::ShortCircuit(ToolResultStatus::Error, _)
+      ),
       "after a reset the tool must be gated again, not silently allowed"
     );
   }

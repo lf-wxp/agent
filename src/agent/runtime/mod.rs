@@ -48,7 +48,9 @@ use serde_json::Value;
 
 use crate::{
   agent::{
-    callback::{AfterToolCallback, BeforeLlmCallback, BeforeToolCallback, ToolCallView},
+    callback::{
+      AfterToolCallback, BeforeLlmCallback, BeforeToolCallback, ToolCallDecision, ToolCallView,
+    },
     llm_request::LlmRequest,
   },
   callback::context_optimizer::ContextOptimizer,
@@ -67,6 +69,7 @@ use crate::{
 use super::{
   context::{Conversation, ExecutionContext},
   event::{ContentItem, Event, ToolResultStatus},
+  fingerprint::RunFingerprint,
 };
 
 pub use structured::StructuredAgentResult;
@@ -122,6 +125,39 @@ pub enum AgentStreamEvent {
     /// See [`AgentResult::budget_exhausted`].
     budget_exhausted: bool,
   },
+}
+
+/// One tool call that was stopped before it ran, awaiting a decision that could not be
+/// made in the moment (see [`ToolCallDecision::Suspend`]).
+///
+/// Serializable, and holding the raw argument string rather than a parsed
+/// [`Value`]: this is what a resumed run re-executes from, and the raw form is both what
+/// the tool is actually handed and what a human was shown when asked to approve it.
+/// Re-serializing a parsed value would hand the tool a textually different payload than
+/// the one that was approved, and would erase the difference between "the model sent
+/// `null`" and "the model's payload did not parse" — a distinction the approval path
+/// relies on (see [`crate::callback::dual_approval`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SuspendedToolCall {
+  pub tool_call_id: String,
+  pub name: String,
+  pub raw_arguments: String,
+}
+
+/// What one round of tool execution produced.
+///
+/// Split into two lists because a round is no longer all-or-nothing: calls in a round run
+/// concurrently, so a decision to suspend one of them arrives while its siblings are
+/// still in flight — and those siblings have already started doing whatever they do.
+/// Discarding their results to report the suspension would mean re-running them later,
+/// duplicating every side effect they had; reporting only the results and dropping the
+/// suspension would silently execute a call nobody approved.
+#[derive(Debug, Default)]
+pub struct ToolRoundOutcome {
+  /// [`ContentItem::ToolResult`] for every call that reached a conclusion, in call order.
+  pub completed: Vec<ContentItem>,
+  /// Calls that were suspended, in call order. Empty in the ordinary case.
+  pub suspended: Vec<SuspendedToolCall>,
 }
 
 /// Drives a model to a final answer, executing tool calls as it requests them.
@@ -190,6 +226,20 @@ impl Agent {
   pub fn with_max_steps(mut self, max_steps: u32) -> Self {
     self.max_steps = max_steps;
     self
+  }
+
+  /// This agent's identity, for checking whether a run suspended earlier can still be
+  /// resumed by it. See [`RunFingerprint`].
+  ///
+  /// Derived rather than stored: the fields it covers are fixed for the agent's lifetime,
+  /// so there is no state to keep in sync — and a cached copy is exactly the thing that
+  /// would go stale and start approving resumes it should refuse.
+  pub fn fingerprint(&self) -> RunFingerprint {
+    RunFingerprint::new(
+      &self.model,
+      self.instructions.as_deref(),
+      self.toolbox.names(),
+    )
   }
 
   /// Register a hook invoked before each tool call ([`Self::execute_tool_calls`]).
@@ -384,7 +434,10 @@ impl Agent {
       }
 
       self.record_tool_calls(&mut context, &tool_calls);
-      self.execute_tool_calls(&mut context, &tool_calls).await;
+      let round = self.execute_tool_calls(&mut context, &tool_calls).await;
+      if !round.suspended.is_empty() {
+        self.record_unanswered(&mut context, &round.suspended);
+      }
       context.increment_step();
     }
   }
@@ -512,7 +565,13 @@ impl Agent {
         let started_items = self.record_tool_calls(&mut context, &tool_calls);
         yield Ok(AgentStreamEvent::ToolCallsStarted(started_items));
 
-        let finished_items = self.execute_tool_calls(&mut context, &tool_calls).await;
+        let round = self.execute_tool_calls(&mut context, &tool_calls).await;
+        let mut finished_items = round.completed;
+        // This entry point cannot suspend: its caller receives a stream, not a resumable
+        // handle. See `record_unanswered`.
+        if !round.suspended.is_empty() {
+          finished_items.extend(self.record_unanswered(&mut context, &round.suspended));
+        }
         yield Ok(AgentStreamEvent::ToolCallsFinished(finished_items));
 
         context.increment_step();
@@ -720,28 +779,31 @@ impl Agent {
   /// state to serialize access to.
   ///
   /// [`Self::with_before_tool_callback`] hooks run first, in registration order, and the
-  /// first one to short-circuit (e.g. a permission check that denies the call) stops the
-  /// chain right there, before the real tool ever runs; [`Self::with_after_tool_callback`]
-  /// hooks run last, each seeing the result left by the one before it, and may rewrite it
-  /// (e.g. redact sensitive content, then compress what is left) before it is recorded.
-  /// All of them are read-only borrows of `context`, so they do not conflict with running
-  /// the calls concurrently.
+  /// first one that does not return [`ToolCallDecision::Proceed`] ends the chain right
+  /// there, before the real tool runs; [`Self::with_after_tool_callback`] hooks run last,
+  /// each seeing the result left by the one before it, and may rewrite it (e.g. redact
+  /// sensitive content, then compress what is left) before it is recorded. All of them are
+  /// read-only borrows of `context`, so they do not conflict with running the calls
+  /// concurrently.
   ///
-  /// Returns the same [`ContentItem::ToolResult`] items added to the transcript, so a
-  /// caller that also wants to forward them live (see
+  /// Returns both halves of the round — see [`ToolRoundOutcome`] for why a round is not
+  /// all-or-nothing. The completed results are the same items added to the transcript, so
+  /// a caller that also wants to forward them live (see
   /// [`AgentStreamEvent::ToolCallsFinished`]) does not have to reach back into
   /// `context.events` to find them.
   async fn execute_tool_calls(
     &self,
     context: &mut ExecutionContext,
     tool_calls: &[ChatCompletionMessageToolCalls],
-  ) -> Vec<ContentItem> {
+  ) -> ToolRoundOutcome {
     // Reborrowed immutably: every concurrent call below may read `context` (e.g. to make
     // an allow/deny decision), while the mutable borrow needed to record the resulting
     // event is only taken back once all of them have resolved, below.
     let context_ref: &ExecutionContext = &*context;
 
-    let result_items = join_all(tool_calls.iter().filter_map(|tool_call| {
+    // Every call resolves to either a result or a suspension; `join_all` keeps them in
+    // call order, which both lists below inherit.
+    let settled = join_all(tool_calls.iter().filter_map(|tool_call| {
       let ChatCompletionMessageToolCalls::Function(function_call) = tool_call else {
         return None;
       };
@@ -756,11 +818,10 @@ impl Agent {
           "executing tool"
         );
 
-        // Run every before-hook in registration order; the first to short-circuit wins
-        // and the rest (including the real tool) are skipped. The callback decides the
-        // status itself: a short-circuit is not always a denial (e.g. a cache hit
-        // substituting a real result is `Success`), so it is not this call site's place
-        // to guess.
+        // Run every before-hook in registration order; the first not to let the call
+        // through ends the chain. A short-circuit picks its own status, since it is not
+        // always a denial (e.g. a cache hit substituting a real result is `Success`), so
+        // it is not this call site's place to guess.
         for before in &self.before_tool_callbacks {
           // Both forms are handed over: parsed for callbacks that inspect a field, raw
           // for those that show the call to a human, since a payload that fails to parse
@@ -772,18 +833,32 @@ impl Agent {
             arguments: &parsed_arguments,
             raw_arguments: arguments,
           };
-          if let Some((status, content)) = before.call(context_ref, view).await {
-            tracing::debug!(
-              tool = %function_name,
-              status = ?status,
-              "tool call short-circuited by before-tool callback"
-            );
-            return ContentItem::ToolResult {
-              tool_call_id: function_call.id.clone(),
-              name: function_name.clone(),
-              status,
-              content,
-            };
+          match before.call(context_ref, view).await {
+            ToolCallDecision::Proceed => {}
+            ToolCallDecision::ShortCircuit(status, content) => {
+              tracing::debug!(
+                tool = %function_name,
+                status = ?status,
+                "tool call short-circuited by before-tool callback"
+              );
+              return Err(ContentItem::ToolResult {
+                tool_call_id: function_call.id.clone(),
+                name: function_name.clone(),
+                status,
+                content,
+              });
+            }
+            ToolCallDecision::Suspend => {
+              tracing::debug!(
+                tool = %function_name,
+                "tool call suspended by before-tool callback, awaiting a decision"
+              );
+              return Ok(SuspendedToolCall {
+                tool_call_id: function_call.id.clone(),
+                name: function_name.clone(),
+                raw_arguments: arguments.clone(),
+              });
+            }
           }
         }
 
@@ -829,22 +904,90 @@ impl Agent {
           }
         }
 
-        ContentItem::ToolResult {
+        Err(ContentItem::ToolResult {
           tool_call_id: function_call.id.clone(),
           name: function_name.clone(),
           status,
           content,
-        }
+        })
       })
     }))
     .await;
 
+    // `Err` is the ordinary case here, not a failure: the two variants only distinguish
+    // "produced a result" from "did not run", and `Result` is the shape `partition` reads.
+    let (suspended, completed): (Vec<_>, Vec<_>) = settled.into_iter().partition(Result::is_ok);
+    let suspended: Vec<SuspendedToolCall> = suspended.into_iter().map(Result::unwrap).collect();
+    let completed: Vec<ContentItem> = completed
+      .into_iter()
+      .map(|item| item.expect_err("partitioned as Err above"))
+      .collect();
+
+    // Only the results are recorded. A suspended call already has its
+    // `ContentItem::ToolCall` in the transcript from `record_tool_calls`, and must not
+    // also get a result: it has not produced one, and inventing one here would make the
+    // decision look already taken to anything reading the transcript back.
+    if !completed.is_empty() {
+      context.add_event(Event::new(
+        context.execution_id.clone(),
+        "tool",
+        completed.clone(),
+      ));
+    }
+
+    ToolRoundOutcome {
+      completed,
+      suspended,
+    }
+  }
+
+  /// Record a placeholder result for every call in `suspended`, for an entry point with
+  /// nowhere to resume to.
+  ///
+  /// A one-shot [`Self::run`], or a structured run, has no session behind it and no way
+  /// to hand a pending question to a caller who could come back with an answer — so the
+  /// only honest thing to report is that the call did not happen. Returns the placeholder
+  /// items so a streaming caller can forward them alongside the real results.
+  ///
+  /// Leaving the calls unanswered instead is not an option: a
+  /// [`ContentItem::ToolCall`] with no matching [`ContentItem::ToolResult`] is a
+  /// conversation most providers reject outright, and `record_tool_calls` has already
+  /// written the call into the transcript by this point. The transcript is briefly in
+  /// exactly that invalid state while the decision is outstanding, which is tolerable
+  /// only because it is never sent or persisted from there — see
+  /// [`crate::callback::context_optimizer::safety`] for the same invariant enforced from
+  /// the other direction.
+  fn record_unanswered(
+    &self,
+    context: &mut ExecutionContext,
+    suspended: &[SuspendedToolCall],
+  ) -> Vec<ContentItem> {
+    let items: Vec<ContentItem> = suspended
+      .iter()
+      .map(|call| {
+        tracing::warn!(
+          tool = %call.name,
+          "a tool call needed a decision this run cannot obtain; recording it as unanswered"
+        );
+        ContentItem::ToolResult {
+          tool_call_id: call.tool_call_id.clone(),
+          name: call.name.clone(),
+          status: ToolResultStatus::Error,
+          content: format!(
+            "Tool execution stopped: {} needs approval, which this run has no way to \
+             ask for.",
+            call.name
+          ),
+        }
+      })
+      .collect();
+
     context.add_event(Event::new(
       context.execution_id.clone(),
       "tool",
-      result_items.clone(),
+      items.clone(),
     ));
-    result_items
+    items
   }
 
   /// Render a prepared [`LlmRequest`] into the message shape the API expects.
