@@ -25,7 +25,7 @@
 | 💬 **交互式 CLI** | `cargo run --bin cli`：多轮聊天 + 永不过期的会话持久化（`--list`/`--rm` 管理）+ 自动接入 `mcp.json` 的 MCP 工具 + `--no-stream` 切换非流式 + `--workspace` 钉定目录并沙箱化内置文件工具（`WorkspaceGuardCallback`）+ 默认 vi 键位的行编辑器（`--no-vi-mode` 切回 Emacs 键位） |
 | ⌨️ **斜杠命令菜单** | 输入 `/` 即弹出可用命令列表供选择（`Tab` 重开、`↑`/`↓` 选择、`Enter` 确认），终端与网页共用同一份命令表（[`shared::commands`](crates/shared/src/commands.rs)），无需记忆命令名 |
 | 🌐 **本地 Web UI** | `--mode web`/`--mode both`：在同一进程里额外起一个绑定 `127.0.0.1` 的 Web 前端（[Leptos](crates/web-ui)），与终端共享同一份 `Agent`/会话状态，SSE 实时展示 token 流 + 工具调用过程时间线 + 高危操作审批弹窗，详见下方「Web UI」小节 |
-| 🙋 **高危操作审批** | `delete_file` 等默认需人工确认，终端 `y`/`n` 或浏览器按钮均可决策（[`DualApprovalCallback`](src/callback/dual_approval.rs)），取决于触发该轮对话的是终端还是浏览器 |
+| 🙋 **高危操作审批** | `delete_file` 等默认需人工确认。审批属于**会话**而非发起端：终端与所有浏览器标签页同时看到同一条待审，任一处应答即生效（[`DualApprovalCallback`](src/callback/dual_approval.rs)）。支持按参数动态判定是否需审批、"本会话总是允许/拒绝"的记忆、附带拒绝理由，以及超时自动拒绝（一切等待皆有上界） |
 | 🔍 **搜索结果压缩** | `web_search` 结果自动分块 + 向量检索压缩后再写入历史（[`SearchCompressorCallback`](src/callback/search_compressor.rs)），避免长文本占满上下文 |
 | 🧠 **`Agent` 运行时** | 完整事件记录（`ExecutionContext`）+ 无状态多轮续接（`run_continuing`）+ 流式输出（`run_stream`，含工具调用过程事件），每轮请求副本按 token 预算自动裁剪（`context.events` 保持完整） |
 | 💾 **会话持久化** | 落盘的 `FileSessionStore`（按 `(scope, sessionId)` 存 JSON 文件），CLI 与 Web UI 共用，`SessionStore` trait 可替换为其他后端 |
@@ -33,7 +33,7 @@
 | 🏢 **多租户（库内）** | `Provider` 封装每租户凭据 + 并发限流，互不干扰（见 [`examples/multi_tenant.rs`](examples/multi_tenant.rs)） |
 | 📚 **向量检索** | 文本分块 / embedding / 余弦相似度检索，适配 RAG 场景 |
 | 📊 **基准评测** | 内置 GAIA 数据集评测，量化模型 + 工具组合效果 |
-| ✅ **工程质量** | 无 `.unwrap()` 生产路径、零硬编码密钥、418 个测试、clippy 全绿（原生 + wasm） |
+| ✅ **工程质量** | 无 `.unwrap()` 生产路径、零硬编码密钥、453 个测试、clippy 全绿（原生 + wasm） |
 
 ## 🚀 快速开始
 
@@ -86,7 +86,11 @@ cargo run --bin cli -- --mode web --web-port 4000  # 只起 Web UI，不进入�
 
 匹配规则：大小写不敏感、容忍首尾空格，但**不接受参数**——因此 `exit the loop early, please` 这类恰好以命令词开头的话仍会正常发给模型。
 
+`/reset` 清掉的不只是对话历史，还包括本会话内"总是允许/拒绝某工具"的记忆（见上方「高危操作审批」）。
+
 命令的执行结果以 `SystemNotice` 事件广播给**所有**前端（[`cli::commands::execute`](src/bin/cli/commands.rs)），并且会连同触发它的那行输入一起广播。所以在终端敲 `/help`，已打开的网页里也会同时出现这次提问和对应的回答，反之亦然——不会出现「只看到答案、不知道问题」的孤立卡片。
+
+> 有待处理的审批时，终端的 `You>` 会优先把 `y`/`n`/`a`/`d`（可带 `: 理由`）读作对该审批的应答，而不是一条新消息；输入别的内容会被拦下并重述问题——放它过去只会开启一轮立刻卡在轮次锁上的新对话，回复无处可去、待审也仍然悬着。
 
 ### `/` 斜杠命令菜单
 
@@ -128,7 +132,34 @@ MCP Server 本身仍然需要被信任（其 `command`/`args`/`env` 会作为子
 
 工具集：默认内置工具（`calculator`、`web_search`、文件系统工具等）之外，若 `mcp.json`（`MCP_CONFIG_PATH`，默认路径 `mcp.json`）存在，会自动连接其中每个已启用的 MCP Server 并把发现的工具一并注册（见 [`ToolRegistry::with_mcp`](src/tools/registry.rs)）；退出聊天时会优雅关闭这些连接。`--tools` 会切换到显式的内置工具子集，此时不加载 MCP（MCP 工具的名字要连接后才知道，无法提前按名选择）。
 
-`delete_file` 默认被视为高危操作：调用前会等待人工确认（[`DualApprovalCallback`](src/callback/dual_approval.rs)）——触发这轮对话的是终端就在终端打印参数等 `y`/`n`，是浏览器发起的（`--mode web`/`both`）就在网页上弹出批准/拒绝按钮，拒绝时模型会收到一条错误结果并继续对话而不会中断整轮运行。用 `--dangerous-tools` 指定另一份需确认的工具名单（逗号分隔，可以是内置工具或 `<server>__<tool>` 形式的 MCP 工具），或用 `--no-approval` 完全关闭确认、放行所有工具调用。
+`delete_file` 默认被视为高危操作，调用前会等待人工确认（[`DualApprovalCallback`](src/callback/dual_approval.rs)）。用 `--dangerous-tools` 指定另一份需确认的工具名单（逗号分隔，可以是内置工具或 `<server>__<tool>` 形式的 MCP 工具），或用 `--no-approval` 完全关闭确认、放行所有工具调用。
+
+审批的几个要点：
+
+- **审批属于会话，不属于发起端**。终端和每个打开的浏览器标签页会同时收到同一条待审，**任一处应答即生效**，先答者决定。所以浏览器发起的那轮对话，可以在终端的 `You>` 提示符处直接敲 `y` 回答；终端发起的那轮，也可以在网页上点按钮。
+- **一切等待都有上界，且失败即拒绝**。无人应答（超时，默认 300 秒，见 `AGENT_APPROVAL_TIMEOUT_SECS`）、没有任何前端在监听、收到待审的界面直接关掉——这三种情况统一按"拒绝"处理。这不只是保守：一轮对话会持有该会话的轮次锁直到结束，一条永远没人回答的待审会把所有界面一起卡死。
+- **应答的四种作用域**。终端输入 `y`（本次允许）/ `n`（本次拒绝）/ `a`（本会话内该工具总是允许）/ `d`（本会话内该工具总是拒绝），网页上是对应的四个按钮。"总是"的记忆按会话隔离，`/reset` 与 `--fresh` 会一并清除——"忘掉这段对话"必须也忘掉其中给出的长期授权。
+- **可以附带拒绝理由**。终端写成 `n: 这些日志还要用于排查`（半角/全角冒号均可），网页上有一个可选输入框。理由会替代默认文案作为工具结果交给模型，让它知道**该改做什么**，而不只是"这条不行"。理由始终以 `User denied execution of <tool>: <理由>` 的形式记录——前缀不是装饰，它把这段文字标注为**运行者本人的决定**；缺了它，对齐良好的模型会（正确地）把理由当成经工具输出夹带的注入指令而拒绝配合。
+- **拒绝不会中断整轮对话**。模型收到一条错误结果后继续往下推理，可以据此改用别的做法。
+
+需要按参数决定是否审批时（例如"删 `/tmp` 下的不问，删别处要问"），库内用 [`ApprovalRule::when`](src/callback/dual_approval.rs)：
+
+```rust
+use agent::callback::dual_approval::{ApprovalRule, DualApprovalCallback};
+
+let approval = DualApprovalCallback::new(Vec::<String>::new())
+  .with_rule(
+    "delete_file",
+    ApprovalRule::when(|call| {
+      // 返回 true 才需要人工确认
+      !call.arguments["path"].as_str().is_some_and(|p| p.starts_with("/tmp/"))
+    }),
+  )
+  // 没有逐条填写理由时的兜底说明
+  .with_rejection_formatter(|call| format!("{} 在该工作区被禁用", call.name));
+```
+
+参数读不出来时（为空、JSON 解析失败、不是对象、含 `NaN`/`Infinity`）**不会询问谓词，直接要求人工确认**。这是必需而非保守：谓词的典型写法是"路径不在 `/tmp` 下就要审批"，畸形载荷让它查找的每个字段都缺失，于是最省事的绕过方式就成了发一个坏 JSON。
 
 `web_search` 的结果默认会被压缩：过长的网页原文会先分块，再按本轮查询做向量检索，只保留最相关的片段写入会话历史（[`SearchCompressorCallback`](src/callback/search_compressor.rs)），避免长文本占满后续每一轮的上下文；压缩失败（如向量检索所需的 embedding 服务不可用）会静默回退为不压缩，不影响本轮对话。用 `--no-search-compression` 关闭，保留原始结果（便于调试模型实际看到的内容)。
 
@@ -186,7 +217,9 @@ cargo make web            # 产物输出到 crates/web-ui/dist
 >
 > **修改 `crates/shared` 或 `crates/web-ui` 后必须重新构建**，否则浏览器加载的是旧 wasm：前后端共用的 `ChatEvent` 一旦新增变体，旧产物会在反序列化时静默丢弃该事件（表现为「某个功能没反应，控制台却很干净」）。现在这种情况会在浏览器控制台打出一条明确的错误，提示页面比服务端旧。`cargo test` 不覆盖 wasm，发现不了这类问题。
 
-`cli` 的 Web 服务器会把这个 `dist/` 目录当静态资源伺服（`AGENT_CLI_WEB_DIST_DIR` 可覆盖路径）；开发前端时也可以单独 `trunk serve` 起热重载的开发服务器，接口请求转发到 `cli` 的 `/api/*` 路由。页面加载后会先拉取 `GET /api/history` 展示已有会话，随后打开一条持久的 `GET /api/stream` 长连接（浏览器原生 `EventSource`），终端和浏览器发起的每一轮对话都会广播到这条连接上——因此终端里打的字也会实时出现在网页里，反过来也一样；`POST /api/chat` 只负责提交这一轮的输入本身。展示内容包括 token 流、工具调用/结果时间线，遇到高危操作会弹出确认卡片，点击后调用 `POST /api/approve/{id}` 提交决策，决策结果也会广播给所有打开的标签页。
+`cli` 的 Web 服务器会把这个 `dist/` 目录当静态资源伺服（`AGENT_CLI_WEB_DIST_DIR` 可覆盖路径）；开发前端时也可以单独 `trunk serve` 起热重载的开发服务器，接口请求转发到 `cli` 的 `/api/*` 路由。页面加载后会先拉取 `GET /api/history` 展示已有会话、再拉一次 `GET /api/approvals` 补上此刻仍在等待的审批，随后打开一条持久的 `GET /api/stream` 长连接（浏览器原生 `EventSource`），终端和浏览器发起的每一轮对话都会广播到这条连接上——因此终端里打的字也会实时出现在网页里，反过来也一样；`POST /api/chat` 只负责提交这一轮的输入本身。展示内容包括 token 流、工具调用/结果时间线，遇到高危操作会弹出确认卡片，点击后调用 `POST /api/approve/{id}` 提交决策，决策结果也会广播给所有打开的标签页。
+
+> `GET /api/approvals` 这一步不是冗余的：`GET /api/stream` 背后的广播只推给"当时已经在监听"的订阅者且不重放，而审批**有意不写进对话历史**（它是对某次调用的闸门，不是对话的一部分）。少了它，在一轮对话正卡在审批上时刷新页面，这个标签页就再也看不到、也无法应答那条正阻塞着它的待审，只能干等超时——而共享同一份审批表的终端此时仍然答得了。
 
 ### 界面截图
 
@@ -320,6 +353,7 @@ agent.run_continuing(
 | `AGENT_CLI_SESSION_DIR` | `.agent/sessions` | CLI 会话落盘目录 |
 | `AGENT_CLI_WEB_PORT` | `4173` | `--mode web`/`both` 本地 Web 服务器端口（始终绑定 `127.0.0.1`） |
 | `AGENT_CLI_WEB_DIST_DIR` | `crates/web-ui/dist` | Web UI 静态资源目录（`trunk build` 产物） |
+| `AGENT_APPROVAL_TIMEOUT_SECS` | `300` | 高危操作审批等待人工决策的上限，超时按拒绝处理 |
 | `TAVILY_API_KEY` | - | `web_search` 工具密钥 |
 | `RUST_LOG` | `info` | 日志级别 |
 
@@ -393,6 +427,8 @@ cargo make                  # = cargo make ci：fmt 检查 + clippy（原生 + w
 <summary>点击展开后续规划</summary>
 
 - **Web UI 细节打磨**：审批卡片支持展示同一轮里多个待决策工具调用的关联关系、按 `session_id` 细粒度加锁（目前单会话全局一把锁）
+- **审批的持久化与恢复**：目前审批状态只存在于进程内存，进程退出即丢失（未决的那轮对话也不会落盘）。规划中的做法是把它作为旁路实体持久化、并让一轮对话可从"等待审批"处恢复，详见 [`docs/approval-hitl-plan.md`](docs/approval-hitl-plan.md) 的阶段三
+- **审批时改写参数**（`edit`）：允许人工修正模型给出的参数后再放行，而不只是批准/拒绝二选一（同上文档阶段四）
 - **协议与可扩展性**：`Tool` trait 与 `async-openai` 解耦、类型化错误（`thiserror`）
 - **架构边界**：`gaia` 拆为独立 crate
 
