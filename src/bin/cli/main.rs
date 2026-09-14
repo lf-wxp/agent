@@ -138,7 +138,7 @@ use std::{
 };
 
 use agent::{
-  Agent, AgentOutcome, AgentRunState, AgentStreamEvent,
+  Agent, AgentOutcome, AgentRunState, AgentStreamEvent, RunCheckpoint, StopReason,
   agent::{ApprovalStore, BeforeToolCallback, Conversation, Event, FileApprovalStore},
   callback::{
     dual_approval::{
@@ -381,6 +381,11 @@ async fn main() -> anyhow::Result<()> {
     agent.with_after_tool_callback(Arc::new(SearchCompressorCallback))
   };
 
+  // Write-ahead, so a turn survives the process being killed rather than only being
+  // signalled. The same store the suspensions go to — a checkpoint and a suspension are
+  // the same record at different moments, told apart by `StopReason`.
+  let agent = agent.with_checkpoint(Arc::clone(&approvals_store) as Arc<dyn RunCheckpoint>);
+
   // `Arc` from here on: shared as-is (not cloned into independent copies) between the
   // terminal loop below and the web server (`--mode web`/`both`, see [`mod@web`]) — one
   // `Agent`, one on-disk history, one lock guarding it, no matter how many front-ends
@@ -522,6 +527,14 @@ async fn main() -> anyhow::Result<()> {
     },
     command_set::hint()
   );
+
+  // Before the suspension notice below: a crashed round is not a pending approval, and
+  // reporting it as one would offer a `/resume` that cannot work.
+  recover_interrupted_round(&store, &approvals_store, &session_id).await;
+
+  // Installed before the first turn can start, since the window it protects opens the
+  // moment one does. See `spawn_interrupt_handler`.
+  spawn_interrupt_handler(Arc::clone(&approvals), Arc::clone(&turn_lock));
 
   // A suspended run is invisible otherwise: it produced no answer and, deliberately,
   // left nothing in the session history. Announcing it here is what makes "come back
@@ -695,6 +708,7 @@ async fn main() -> anyhow::Result<()> {
       let result = run_turn(
         &agent,
         &store,
+        &approvals_store,
         &turn_lock,
         &session_id,
         input,
@@ -720,11 +734,12 @@ async fn main() -> anyhow::Result<()> {
           });
         }
         AgentOutcome::Suspended(state) => {
-          let pending = record_suspension(&approvals_store, &session_id, &state).await;
+          // Already stored by `run_turn`, under its own lock; only the announcement is
+          // left to do here.
           let _ = web_events_tx.send(ChatEvent::TurnSuspended {
             turn,
             run: session_id.clone(),
-            pending,
+            pending: pending_views(&state),
           });
         }
       }
@@ -749,6 +764,132 @@ async fn main() -> anyhow::Result<()> {
 
   println!("Bye!");
   Ok(())
+}
+
+/// How long to let an interrupted turn wind down before exiting anyway.
+///
+/// Generous because the thing being waited for is a lock release, not work: the state
+/// is written before the lock is dropped, so this expiring means something unrelated is
+/// slow, not that anything is being lost.
+const INTERRUPT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A shutdown signal this process winds down for, rather than dying on.
+struct ShutdownSignal {
+  /// What to call it when telling the user what happened.
+  name: &'static str,
+  /// `128 + signum`, the convention for "killed by this signal".
+  exit_code: i32,
+}
+
+/// Wait for whichever shutdown signal arrives first.
+///
+/// Three rather than just `Ctrl-C`, because all three leave a turn mid-approval in the
+/// same state and all three are catchable: `SIGHUP` is what closing a terminal window
+/// sends, and `SIGTERM` is what `kill` and an orderly system shutdown send. Handling
+/// only `Ctrl-C` would cover the deliberate case and none of the incidental ones.
+///
+/// A signal whose handler cannot be installed keeps its default disposition — the
+/// process dies on it, as it did before — rather than preventing this from waiting on
+/// the others.
+#[cfg(unix)]
+async fn shutdown_signal() -> ShutdownSignal {
+  use tokio::signal::unix::{Signal, SignalKind, signal};
+
+  async fn recv(handler: &mut Option<Signal>) -> Option<()> {
+    match handler {
+      Some(handler) => handler.recv().await,
+      // Never resolves: `select!` disables a branch whose pattern does not match, so
+      // returning `None` here would disable it immediately instead of leaving it idle.
+      None => std::future::pending().await,
+    }
+  }
+
+  let mut hangup = signal(SignalKind::hangup()).ok();
+  let mut terminate = signal(SignalKind::terminate()).ok();
+
+  tokio::select! {
+    _ = tokio::signal::ctrl_c() => ShutdownSignal { name: "中断", exit_code: 130 },
+    Some(()) = recv(&mut hangup) => ShutdownSignal { name: "挂断", exit_code: 129 },
+    Some(()) = recv(&mut terminate) => ShutdownSignal { name: "终止", exit_code: 143 },
+  }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> ShutdownSignal {
+  let _ = tokio::signal::ctrl_c().await;
+  ShutdownSignal {
+    name: "中断",
+    exit_code: 130,
+  }
+}
+
+/// Make an interrupted turn keep its pending approval instead of losing it.
+///
+/// Without this, stopping a turn that is waiting on a decision takes the whole turn with
+/// it — the user's question included. The suspension that makes a turn recoverable is
+/// only built when the *timeout* fires, and a process that goes away before then never
+/// reaches that point, so nothing is on disk and the next launch shows no sign that
+/// anything was ever pending.
+///
+/// The fix needs no new persistence path, because "interrupted" and "timed out" are the
+/// same event as far as an approval is concerned: nobody answered. Dropping the decision
+/// senders ([`ApprovalRegistry::cancel_all`]) is what the waiting side already reads
+/// that way, so the turn suspends and stores itself through the ordinary route, just
+/// sooner than the timeout would have.
+///
+/// This is also the only way to say "I'll deal with it later" without sitting out the
+/// full [`agent::config::approval_timeout`].
+///
+/// # What this cannot cover
+///
+/// Only signals the process can catch. `SIGKILL`, a panic inside the turn, and losing
+/// power all destroy the turn's [`agent::agent::ExecutionContext`] where it lives — on
+/// the running task's own stack — so there is nothing left for a handler to save, no
+/// matter when it runs. Surviving those needs the state written *before* the wait
+/// begins; see `Agent::with_checkpoint`.
+///
+/// # Why it exits rather than returning to the prompt
+///
+/// The signal is a request to stop, and honouring half of it — winding down the turn but
+/// staying — would be a surprise. Nothing is lost by leaving: `/resume` picks the turn
+/// back up on the next launch, which is the whole point of storing it.
+///
+/// With nothing pending there is nothing to wind down, so this exits immediately, which
+/// is what the default disposition would have done. Note that a `Ctrl-C` typed at the
+/// `You>` prompt never arrives here at all: `reedline` holds the terminal in raw mode,
+/// where it is an ordinary keystroke rather than a signal (see [`read_line`]).
+fn spawn_interrupt_handler(approvals: Arc<ApprovalRegistry>, turn_lock: Arc<AsyncMutex<()>>) {
+  tokio::spawn(async move {
+    let signal = shutdown_signal().await;
+
+    let pending = approvals.cancel_all();
+    if !pending.is_empty() {
+      term_write(&format!(
+        "\n\n⏸  收到{}信号：已暂停 {} 个待审批的操作并保存本轮，下次启动可用 /resume 继续。\n",
+        signal.name,
+        pending.len()
+      ));
+      // Acquiring the turn's own lock is how this waits for it: every driver writes
+      // what it produced *before* releasing that lock (see `run_turn`), so getting it
+      // means the suspension is on disk. The timeout is a backstop, not a race — the
+      // write happens well before the lock is dropped.
+      //
+      // A second signal cuts the wait short: someone signalling twice wants out now,
+      // and the first one has already had its chance to wind down cleanly.
+      tokio::select! {
+        result = tokio::time::timeout(INTERRUPT_GRACE, turn_lock.lock()) => {
+          if result.is_err() {
+            tracing::warn!("the interrupted turn did not wind down in time; exiting anyway");
+          }
+        }
+        _ = shutdown_signal() => {
+          tracing::warn!("signalled twice; exiting without waiting for the turn");
+        }
+      }
+    }
+
+    std::process::exit(signal.exit_code);
+  });
 }
 
 /// What a terminal turn is starting from.
@@ -796,7 +937,11 @@ async fn drive_terminal_turn(
   // Both shapes of turn are driven identically from here on — same approval plumbing,
   // same console prompt, same broadcast. Resuming differs only in where the transcript
   // comes from, which is settled before the first event is yielded.
-  let stream: Pin<Box<dyn Stream<Item = anyhow::Result<AgentStreamEvent>> + '_>> = match input {
+  //
+  // Already `Pin<Box<..>>`, which is itself a `Stream` — so no `pin_mut!`, and the
+  // binding stays something this function can drop. That matters below: the stream owns
+  // the turn's lock guard, so dropping it is what releases the session.
+  let mut stream: Pin<Box<dyn Stream<Item = anyhow::Result<AgentStreamEvent>> + '_>> = match input {
     TurnInput::Fresh(text) => Box::pin(run_turn_stream(
       agent, store, turn_lock, session_id, text, channel,
     )),
@@ -810,7 +955,6 @@ async fn drive_terminal_turn(
       events,
     )),
   };
-  futures::pin_mut!(stream);
 
   let mut raised = Vec::new();
   let mut failure = None;
@@ -904,10 +1048,20 @@ async fn drive_terminal_turn(
 
   approvals.discard(&raised);
 
+  // Dropped before the wait below, not at the end of the function: the stream owns this
+  // turn's lock guard, and the wait can last as long as it takes someone to press a key
+  // — which they may never do. Releasing here means the session is free as soon as the
+  // turn is actually over, rather than as soon as this terminal is tidy.
+  //
+  // That distinction is what makes `Ctrl-C` exit promptly: the interrupt handler waits
+  // on this very lock to know the suspension reached disk, and would otherwise be
+  // waiting on a keystroke from someone who has already asked to leave.
+  drop(stream);
+
   // A console read can still be outstanding here: another view answered the prompt first,
-  // or it timed out and the turn carried on without it. Either way the answer no longer
-  // matters — but the read itself cannot be cancelled, because a blocking stdin read stays
-  // parked until a line actually arrives.
+  // the turn was suspended around it, or it was interrupted. Either way the answer no
+  // longer matters — but the read itself cannot be cancelled, because a blocking stdin
+  // read stays parked until a line actually arrives.
   //
   // So it has to be waited out rather than abandoned. Handing the terminal back to
   // `reedline` while this reader is still on stdin means two readers competing for it:
@@ -916,7 +1070,7 @@ async fn drive_terminal_turn(
   // read within a normal duration". Blocking here until the line lands keeps stdin
   // single-reader at all times, which is what makes returning to the prompt safe.
   if let Some((_, handle)) = asking.take() {
-    term_write("\n(该审批已由其他界面处理，按回车返回输入)\n");
+    term_write("\n(该审批已结束，按回车返回输入)\n");
     let _ = handle.await;
   }
 
@@ -1228,9 +1382,18 @@ fn run_turn_stream<'a>(
 /// Non-streaming counterpart of [`run_turn_stream`]: the same load/run/save sequence and
 /// the same `turn_lock`/`channel` contract, but waits for the whole turn to finish
 /// instead of forwarding tokens as they arrive.
+/// Non-streaming counterpart of [`run_turn_stream`]: the same load/run/save sequence and
+/// the same `turn_lock`/`channel` contract, but waits for the whole turn to finish
+/// instead of forwarding tokens as they arrive.
+///
+/// Persists a suspension itself rather than leaving it to the caller, so that — like the
+/// transcript of a finished turn — it lands while `turn_lock` is still held. That is
+/// what makes "the lock is free again" mean "whatever this turn produced is on disk",
+/// which [`spawn_interrupt_handler`] relies on to know when it is safe to exit.
 async fn run_turn(
   agent: &Agent,
   store: &FileSessionStore,
+  approvals_store: &FileApprovalStore,
   turn_lock: &AsyncMutex<()>,
   session_id: &str,
   input: &str,
@@ -1247,16 +1410,19 @@ async fn run_turn(
     ),
   )
   .await?;
-  // A suspension is stored by the caller instead (see `record_suspension`): it has the
-  // approval store, and it is the one that has to announce the result either way.
-  if let AgentOutcome::Done(result) = &outcome {
-    record_turn(
-      store,
-      session_id,
-      result.context.events.clone(),
-      result.budget_exhausted,
-    )
-    .await;
+  match &outcome {
+    AgentOutcome::Done(result) => {
+      record_turn(
+        store,
+        session_id,
+        result.context.events.clone(),
+        result.budget_exhausted,
+      )
+      .await;
+    }
+    AgentOutcome::Suspended(state) => {
+      approvals_store.put(LOCAL_SCOPE, session_id, state).await;
+    }
   }
   Ok(outcome)
 }
@@ -1300,6 +1466,20 @@ async fn record_suspension(
   state: &AgentRunState,
 ) -> Vec<PendingApprovalView> {
   approvals_store.put(LOCAL_SCOPE, session_id, state).await;
+  pending_views(state)
+}
+
+/// Describe what a suspended run is waiting on, for a front-end to render.
+///
+/// Split from [`record_suspension`] because the two happen at different moments on the
+/// non-streaming path: storing has to finish while the turn still holds its lock (see
+/// [`run_turn`]), whereas the description is only needed once the caller is ready to
+/// broadcast it.
+///
+/// `requested_at` is stamped now rather than when the prompt was first raised: a stored
+/// run has no clock running behind it, and reporting the original instant would have a
+/// client render "waiting for 14 hours" as though something were still counting down.
+fn pending_views(state: &AgentRunState) -> Vec<PendingApprovalView> {
   let requested_at = chrono::Utc::now().timestamp();
   state
     .suspended
@@ -1429,6 +1609,52 @@ async fn suspended_run_notice(
        /resume 继续（会重新询问），/discard 放弃该轮。"
         .to_owned()
     })
+}
+
+/// Repair a turn the previous process died in the middle of, if there was one.
+///
+/// A checkpoint left behind means the process stopped existing during a round (see
+/// [`RunCheckpoint`]) — killed, panicked, or the machine went down. Unlike a suspension,
+/// it cannot be resumed: the round's calls run concurrently, so some may have taken
+/// effect before the process went, and which ones is unknowable. Re-running them would
+/// repeat those side effects.
+///
+/// So it is closed out instead: every call in that round gets a result saying it was
+/// interrupted and its outcome is unknown, the repaired transcript is filed as history,
+/// and the conversation carries on from there. The user's question survives, which is
+/// the part that was previously lost outright.
+///
+/// Done at startup rather than offered as a choice, because there is no choice to
+/// make — nothing can resume it, and leaving it would block the session against new
+/// turns (see [`suspended_run_notice`]).
+async fn recover_interrupted_round(
+  store: &FileSessionStore,
+  approvals_store: &FileApprovalStore,
+  session_id: &str,
+) {
+  let Some(run) = approvals_store.peek(LOCAL_SCOPE, session_id).await else {
+    return;
+  };
+  if run.reason != StopReason::RoundInFlight {
+    return; // An ordinary suspension: resumable, and announced separately.
+  }
+
+  let Some(state) = approvals_store.take(LOCAL_SCOPE, session_id).await else {
+    return;
+  };
+  let tools: Vec<&str> = state
+    .suspended
+    .iter()
+    .map(|call| call.name.as_str())
+    .collect();
+  println!(
+    "⚠️  上次运行在执行工具时被强制中断（{}）。\n\
+     这些调用是否已生效无法确定，已如实记录到历史中，可以直接继续对话。\n",
+    tools.join(", ")
+  );
+
+  let context = state.abandon();
+  record_turn(store, session_id, context.events, false).await;
 }
 
 /// Tell the person at the terminal that this session has a run waiting on them.

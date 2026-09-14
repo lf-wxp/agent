@@ -104,7 +104,12 @@ impl From<Conversation> for Vec<Event> {
 /// suspended call stack. That is what makes a run interruptible — see
 /// [`crate::agent::runtime::AgentRunState`], which persists one of these so a turn
 /// stopped waiting on a human can be resumed in another process.
-#[derive(Debug, Serialize, Deserialize)]
+/// `Clone` because a checkpoint has to snapshot the transcript mid-round without
+/// disturbing the run producing it (see [`crate::agent::runtime::RunCheckpoint`]).
+/// Cloning is a deep copy of the whole event list, so it belongs on that path and not
+/// in the per-round request path, which deliberately borrows instead (see
+/// [`crate::agent::LlmRequest`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionContext {
   /// Identifies this one run. A fresh value per
   /// [`crate::agent::Agent::run_continuing`] call, including successive turns of the same

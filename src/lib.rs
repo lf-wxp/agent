@@ -23,5 +23,5 @@ pub mod util;
 pub use agent::session;
 pub use agent::{
   Agent, AgentOutcome, AgentResult, AgentRunState, AgentStreamEvent, ResumedDecision,
-  StructuredAgentResult, SuspendedToolCall,
+  RunCheckpoint, StopReason, StructuredAgentResult, SuspendedToolCall,
 };

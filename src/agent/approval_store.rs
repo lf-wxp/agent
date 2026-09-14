@@ -22,8 +22,8 @@ use std::path::PathBuf;
 use base64::Engine;
 
 use crate::agent::{
-  Event,
-  runtime::{AgentRunState, SuspendedToolCall},
+  Event, ExecutionContext,
+  runtime::{AgentRunState, RunCheckpoint, StopReason, SuspendedToolCall},
 };
 
 /// A stored run as seen by a display path: what it is waiting on, and what led up to it.
@@ -33,6 +33,9 @@ use crate::agent::{
 pub struct SuspendedRunView {
   /// Always non-empty: a run is only stored because a round could not finish.
   pub pending: Vec<SuspendedToolCall>,
+  /// Whether [`Self::pending`] is known not to have run. Decides whether this run can
+  /// be resumed at all — see [`StopReason`].
+  pub reason: StopReason,
   /// The turn as it stood when it stopped, including the message that started it.
   ///
   /// This is the part a session store cannot supply — a suspended turn is deliberately
@@ -44,8 +47,7 @@ pub struct SuspendedRunView {
   pub events: Vec<Event>,
 }
 
-/// Where a suspended run is kept while it waits to be answered.
-///
+/// Where a suspended run is kept while it waits to be answered.///
 /// A trait for the same reason [`crate::agent::session::SessionStore`] is one: the CLI
 /// wants a file on disk, a server would want whatever its other state lives in, and the
 /// runtime should need neither. Keyed by `(scope, run_id)` to match the session store's
@@ -153,6 +155,43 @@ impl FileApprovalStore {
   async fn restrict_dir_permissions(&self) {}
 }
 
+/// Writing a checkpoint is the same operation as storing a suspension — same key, same
+/// file — because the two are the same thing at different moments: one is written
+/// speculatively before a round, the other definitively after it, and the second
+/// replaces the first. What tells them apart on the way back out is
+/// [`AgentRunState::reason`], not where they live.
+///
+/// Keyed off the context's own conversation, so one store serves every session a
+/// process is running. A run with no conversation id has nowhere to be filed and is
+/// skipped — it is a one-shot run, with no later launch to recover it.
+#[async_trait::async_trait]
+impl RunCheckpoint for FileApprovalStore {
+  async fn save(&self, state: &AgentRunState) {
+    let Some((scope, run_id)) = checkpoint_key(state.context()) else {
+      return;
+    };
+    self.put(&scope, &run_id, state).await;
+  }
+
+  async fn clear(&self, context: &ExecutionContext) {
+    let Some((scope, run_id)) = checkpoint_key(context) else {
+      return;
+    };
+    self.remove(&scope, &run_id).await;
+  }
+}
+
+/// The `(scope, run_id)` a context's checkpoint belongs under, matching how the CLI
+/// keys its sessions. `None` for a run with no conversation identity.
+fn checkpoint_key(context: &ExecutionContext) -> Option<(String, String)> {
+  let run_id = context.conversation_id.clone()?;
+  let scope = context
+    .conversation_scope
+    .clone()
+    .unwrap_or_else(|| "local".to_owned());
+  Some((scope, run_id))
+}
+
 #[async_trait::async_trait]
 impl ApprovalStore for FileApprovalStore {
   async fn put(&self, scope: &str, run_id: &str, state: &AgentRunState) {
@@ -217,6 +256,7 @@ impl ApprovalStore for FileApprovalStore {
     let state: AgentRunState = serde_json::from_slice(&bytes).ok()?;
     Some(SuspendedRunView {
       pending: state.suspended,
+      reason: state.reason,
       events: state.context.events,
     })
   }
@@ -255,7 +295,9 @@ impl ApprovalStore for FileApprovalStore {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::agent::{ExecutionContext, SuspendedToolCall, fingerprint::RunFingerprint};
+  use crate::agent::{
+    ExecutionContext, StopReason, SuspendedToolCall, fingerprint::RunFingerprint,
+  };
 
   fn temp_dir(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -273,6 +315,7 @@ mod tests {
         raw_arguments: r#"{"path":"a.txt"}"#.to_owned(),
       }],
       budget_exhausted: false,
+      reason: StopReason::AwaitingDecision,
       context: ExecutionContext::new(),
     }
   }

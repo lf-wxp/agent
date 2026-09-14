@@ -7,7 +7,7 @@ pub mod llm_request;
 pub mod runtime;
 pub mod session;
 
-pub use approval_store::{ApprovalStore, FileApprovalStore};
+pub use approval_store::{ApprovalStore, FileApprovalStore, SuspendedRunView};
 pub use callback::{
   AfterToolCallback, BeforeLlmCallback, BeforeToolCallback, ToolCallDecision, ToolCallView,
 };
@@ -19,6 +19,6 @@ pub use fingerprint::RunFingerprint;
 pub use llm_request::LlmRequest;
 pub use runtime::{
   Agent, AgentOutcome, AgentResult, AgentRunState, AgentStreamEvent, ResumedDecision,
-  StructuredAgentResult, SuspendedToolCall,
+  RunCheckpoint, StopReason, StructuredAgentResult, SuspendedToolCall,
 };
 pub use session::{FileSessionStore, SessionStore};

@@ -1037,6 +1037,7 @@ async fn abandoning_a_suspended_run_closes_out_every_call() {
     fingerprint: agent.fingerprint(),
     suspended: round.suspended,
     budget_exhausted: false,
+    reason: StopReason::AwaitingDecision,
     context,
   };
 
@@ -1143,6 +1144,7 @@ async fn resuming_with_a_changed_agent_is_refused() {
       raw_arguments: "{}".to_owned(),
     }],
     budget_exhausted: false,
+    reason: StopReason::AwaitingDecision,
     context: ExecutionContext::new(),
   };
 
@@ -1186,6 +1188,7 @@ fn a_suspended_state_round_trips_through_json() {
       raw_arguments: r#"{"n":1}"#.to_owned(),
     }],
     budget_exhausted: true,
+    reason: StopReason::AwaitingDecision,
     context,
   };
 
@@ -1316,6 +1319,7 @@ async fn a_partly_answered_resume_reports_the_completed_half_first() {
       },
     ],
     budget_exhausted: false,
+    reason: StopReason::AwaitingDecision,
     context: ExecutionContext::new(),
   };
 
@@ -1388,6 +1392,7 @@ fn suspended_state(agent: &Agent, tool_call_id: &str) -> AgentRunState {
       raw_arguments: "{}".to_owned(),
     }],
     budget_exhausted: false,
+    reason: StopReason::AwaitingDecision,
     context: ExecutionContext::new(),
   }
 }
@@ -1464,6 +1469,99 @@ fn accompanying_text_and_its_calls_build_into_one_assistant_message() {
     Some(1),
     "and carry the call alongside it"
   );
+}
+
+// ---- surviving a process that does not get to clean up ---------------------------
+
+/// What a crash recovery records has to match what actually happened. A round that was
+/// in flight may have taken effect; saying it "was waiting for approval" — the wording
+/// for a call that provably did not run — would have the model confidently retry
+/// something that already happened.
+#[test]
+fn an_interrupted_round_is_closed_out_as_unknown_not_as_unapproved() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let agent = agent_with(spy_registry(&executed));
+
+  let state = AgentRunState {
+    fingerprint: agent.fingerprint(),
+    suspended: vec![SuspendedToolCall {
+      tool_call_id: "call_1".to_owned(),
+      name: "spy".to_owned(),
+      raw_arguments: "{}".to_owned(),
+    }],
+    budget_exhausted: false,
+    reason: StopReason::RoundInFlight,
+    context: ExecutionContext::new(),
+  };
+
+  let context = state.abandon();
+  let ContentItem::ToolResult { content, .. } = &context.events[0].content[0] else {
+    panic!("expected a tool result");
+  };
+
+  assert!(
+    content.contains("interrupted") && content.contains("unknown"),
+    "an interrupted call's outcome is unknown, and the result has to say so: {content}"
+  );
+  assert!(
+    !content.contains("approval"),
+    "it must not claim the call was refused, which would be a different fact: {content}"
+  );
+}
+
+/// The other wording is still used where it is true.
+#[test]
+fn an_unanswered_call_still_says_it_was_never_approved() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let agent = agent_with(spy_registry(&executed));
+  let state = suspended_state(&agent, "call_1");
+
+  let context = state.abandon();
+  let ContentItem::ToolResult { content, .. } = &context.events[0].content[0] else {
+    panic!("expected a tool result");
+  };
+
+  assert!(content.contains("approval"), "got: {content}");
+}
+
+/// A state written before `reason` existed was, by construction, an ordinary
+/// suspension — nothing wrote the other kind. Loading it as anything else would make a
+/// resumable run look unrecoverable.
+#[test]
+fn a_state_without_a_reason_loads_as_awaiting_a_decision() {
+  let json = serde_json::json!({
+    "fingerprint": {
+      "state_version": 1,
+      "model": "gpt-test",
+      "instructions_digest": "0",
+      "tools": ["spy"],
+    },
+    "suspended": [{
+      "tool_call_id": "call_1",
+      "name": "spy",
+      "raw_arguments": "{}",
+    }],
+    "budget_exhausted": false,
+    "context": ExecutionContext::new(),
+  });
+
+  let state: AgentRunState = serde_json::from_value(json).expect("an older state should load");
+
+  assert_eq!(state.reason, StopReason::AwaitingDecision);
+}
+
+/// The discriminator has to survive the round trip, since it is what decides whether a
+/// recovered run may be resumed at all.
+#[test]
+fn the_stop_reason_round_trips_through_json() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let agent = agent_with(spy_registry(&executed));
+  let mut state = suspended_state(&agent, "call_1");
+  state.reason = StopReason::RoundInFlight;
+
+  let back: AgentRunState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+
+  assert_eq!(back.reason, StopReason::RoundInFlight);
 }
 
 #[test]

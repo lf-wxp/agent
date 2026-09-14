@@ -199,6 +199,64 @@ pub enum ResumedDecision {
   Refused(String),
 }
 
+/// Why a run stopped, and therefore what may safely be done with it.
+///
+/// The distinction is about the *calls*, not the reason itself: one kind is known not to
+/// have run, the other is unknown. Conflating them would mean either re-running side
+/// effects that already happened or discarding a decision that is still pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum StopReason {
+  /// A hook could not decide these calls, so **none of them ran** — that is guaranteed
+  /// by where [`ToolCallDecision::Suspend`] sits in the chain, before the tool. Asking
+  /// again and running them is safe.
+  #[default]
+  AwaitingDecision,
+  /// The round was still in flight when this was written, so whether any given call ran
+  /// is **unknown**. Written ahead of the round by [`RunCheckpoint`] so that a process
+  /// which dies outright still leaves the turn recoverable.
+  ///
+  /// Must not be resumed by re-running: a sibling that completed before the crash would
+  /// have its side effects repeated. See [`AgentRunState::abandon`], which closes such
+  /// calls out as interrupted instead.
+  RoundInFlight,
+}
+
+/// Somewhere to park a turn's state while a round is in flight, so a process that dies
+/// outright does not take the turn with it.
+///
+/// # Why a signal handler is not enough
+///
+/// An interrupted process can suspend its turn gracefully, because the turn is still
+/// running and its state still exists. `SIGKILL`, a panic, and losing power do not offer
+/// that: the [`ExecutionContext`] lives on the running task's own stack, and when the
+/// task goes, so does it. Nothing that runs *after* the fact can save it.
+///
+/// So the state has to be written *before* the wait, which is what this is for. The cost
+/// is one small write per tool round — negligible beside the model call that produced
+/// the round, and beside the minutes an approval may sit waiting.
+///
+/// # What a recovered checkpoint means
+///
+/// Not "resume these calls". A round's calls run concurrently, so at the moment this is
+/// written none of them have run, but by the time the process dies some may have — and
+/// which ones is unknowable, since results only reach the transcript once the whole
+/// round settles. That is why the state is marked [`StopReason::RoundInFlight`] and must
+/// be closed out with [`AgentRunState::abandon`] rather than resumed: repeating a
+/// side effect is worse than reporting an unknown one.
+#[async_trait::async_trait]
+pub trait RunCheckpoint: Send + Sync {
+  /// A round is about to run; `state` is everything needed to recover the turn if this
+  /// process never gets to report otherwise.
+  async fn save(&self, state: &AgentRunState);
+
+  /// The round finished, so nothing is in flight any more. Called on every exit from a
+  /// round — including a suspension, whose own record replaces this one.
+  ///
+  /// Takes the context so an implementation storing several runs can tell which to
+  /// clear; see [`ExecutionContext::conversation_id`].
+  async fn clear(&self, context: &ExecutionContext);
+}
+
 /// A run that stopped to ask a human, in a form that outlives the process it started in.
 ///
 /// # The context inside is deliberately mid-turn
@@ -221,6 +279,13 @@ pub struct AgentRunState {
   /// See [`AgentResult::budget_exhausted`]. Carried across the suspension so a run
   /// resumed after its budget ran out still reports having been cut short.
   pub budget_exhausted: bool,
+  /// Whether the pending calls are known not to have run. See [`StopReason`].
+  ///
+  /// `serde(default)` so a state written before this field existed still loads, as
+  /// [`StopReason::AwaitingDecision`] — which is what every such state was, since
+  /// nothing wrote the other kind.
+  #[serde(default)]
+  pub reason: StopReason,
   /// Not `pub`: the two supported ways to get an owned context out of here repair it
   /// first ([`Agent::resume`], [`Self::abandon`]), and handing it over raw would make it
   /// easy to file a mid-turn transcript as history. `pub(crate)` rather than private so
@@ -229,13 +294,18 @@ pub struct AgentRunState {
 }
 
 impl AgentRunState {
-  /// Give up on the pending decisions and return the transcript, repaired.
+  /// Give up on the pending calls and return the transcript, repaired.
   ///
   /// For a caller that has decided not to wait any longer — the human is gone, the
-  /// approval expired, the operator cancelled it. Every suspended call gets a result
-  /// saying it was never answered, which is both true and what makes the transcript
-  /// sendable again, so the conversation can carry on from here in a later turn instead
-  /// of being stuck.
+  /// approval expired, the operator cancelled it — and the only way forward for a run
+  /// that cannot be resumed at all ([`StopReason::RoundInFlight`]). Every pending call
+  /// gets a result, which is both true and what makes the transcript sendable again, so
+  /// the conversation can carry on from here instead of being stuck.
+  ///
+  /// What the result *says* follows [`Self::reason`], and the difference matters to the
+  /// model: a call that was never approved definitely did not run, while one
+  /// interrupted mid-round may well have. Telling it the first when the second is true
+  /// would have it confidently retry something that already happened.
   pub fn abandon(mut self) -> ExecutionContext {
     let items: Vec<ContentItem> = self
       .suspended
@@ -244,10 +314,18 @@ impl AgentRunState {
         tool_call_id: call.tool_call_id.clone(),
         name: call.name.clone(),
         status: ToolResultStatus::Error,
-        content: format!(
-          "Tool execution stopped: {} was waiting for approval that never arrived.",
-          call.name
-        ),
+        content: match self.reason {
+          StopReason::AwaitingDecision => format!(
+            "Tool execution stopped: {} was waiting for approval that never arrived.",
+            call.name
+          ),
+          StopReason::RoundInFlight => format!(
+            "Tool execution was interrupted: the process stopped while {} was running, \
+             so whether it took effect is unknown. Check the current state before \
+             trying again.",
+            call.name
+          ),
+        },
       })
       .collect();
     self
@@ -319,6 +397,11 @@ pub struct Agent {
   /// [`ContextOptimizer`] — the history token budget belongs to that callback, not
   /// to `Agent`.
   before_llm_callbacks: Vec<Arc<dyn BeforeLlmCallback>>,
+  /// Where to park a round's state while it runs, when the caller wants a turn to
+  /// survive the process dying outright. `None` means no write-ahead: an interrupted
+  /// run can still be suspended gracefully, but a killed one is lost. See
+  /// [`RunCheckpoint`].
+  checkpoint: Option<Arc<dyn RunCheckpoint>>,
 }
 
 impl Agent {
@@ -353,6 +436,62 @@ impl Agent {
       before_llm_callbacks: vec![Arc::new(
         ContextOptimizer::new(config::max_history_tokens()),
       )],
+      checkpoint: None,
+    }
+  }
+
+  /// Park each round's state in `checkpoint` while it runs, so a turn survives the
+  /// process being killed rather than only being interrupted. See [`RunCheckpoint`] for
+  /// why a signal handler cannot cover that case and what a recovered checkpoint may be
+  /// used for.
+  #[must_use]
+  pub fn with_checkpoint(mut self, checkpoint: Arc<dyn RunCheckpoint>) -> Self {
+    self.checkpoint = Some(checkpoint);
+    self
+  }
+
+  /// Write the state a recovery would need if this process stopped existing during the
+  /// round about to run. A no-op without [`Self::with_checkpoint`].
+  async fn checkpoint_round(
+    &self,
+    context: &ExecutionContext,
+    tool_calls: &[ChatCompletionMessageToolCalls],
+    budget_exhausted: bool,
+  ) {
+    let Some(checkpoint) = &self.checkpoint else {
+      return;
+    };
+    // Every call in the round, because at this moment none has run and there is no
+    // later chance to narrow it down — see `RunCheckpoint`'s note on concurrency.
+    let suspended: Vec<SuspendedToolCall> = tool_calls
+      .iter()
+      .filter_map(|call| {
+        let ChatCompletionMessageToolCalls::Function(function_call) = call else {
+          return None;
+        };
+        Some(SuspendedToolCall {
+          tool_call_id: function_call.id.clone(),
+          name: function_call.function.name.clone(),
+          raw_arguments: function_call.function.arguments.clone(),
+        })
+      })
+      .collect();
+
+    checkpoint
+      .save(&AgentRunState {
+        fingerprint: self.fingerprint(),
+        suspended,
+        budget_exhausted,
+        reason: StopReason::RoundInFlight,
+        context: context.clone(),
+      })
+      .await;
+  }
+
+  /// Mark the round as no longer in flight. A no-op without [`Self::with_checkpoint`].
+  async fn clear_checkpoint(&self, context: &ExecutionContext) {
+    if let Some(checkpoint) = &self.checkpoint {
+      checkpoint.clear(context).await;
     }
   }
 
@@ -634,6 +773,7 @@ impl Agent {
         fingerprint: self.fingerprint(),
         suspended: round.suspended,
         budget_exhausted,
+        reason: StopReason::AwaitingDecision,
         context,
       }));
     }
@@ -712,19 +852,28 @@ impl Agent {
         self.record_assistant_text(&mut context, text);
       }
       self.record_tool_calls(&mut context, &tool_calls);
+      // Written before the round rather than after it: a process that dies during the
+      // round — most likely while an approval sits waiting — gets no later chance.
+      self
+        .checkpoint_round(&context, &tool_calls, budget_exhausted)
+        .await;
       let round = self
         .execute_tool_calls(&mut context, &tool_calls, &HashMap::new())
         .await;
 
       if !round.suspended.is_empty() {
+        // The suspension replaces the checkpoint: same store, and it says something
+        // stronger (these calls are known not to have run).
         return Ok(AgentOutcome::Suspended(AgentRunState {
           fingerprint: self.fingerprint(),
           suspended: round.suspended,
           budget_exhausted,
+          reason: StopReason::AwaitingDecision,
           context,
         }));
       }
 
+      self.clear_checkpoint(&context).await;
       context.increment_step();
     }
   }
@@ -871,6 +1020,13 @@ impl Agent {
       // results — see `drive`'s docs for why that invariant lives in the control flow.
       if !pending.is_empty() {
         let calls = rebuild_tool_calls(&pending);
+        // Checkpointed like any other round, and this one especially needs it: the
+        // caller took the stored state out to get here (see `ApprovalStore::take`), so
+        // without a fresh write there is nothing on disk at all while these calls are
+        // being re-asked.
+        self
+          .checkpoint_round(&context, &calls, carried_budget_exhausted)
+          .await;
         let round = self.execute_tool_calls(&mut context, &calls, &decisions).await;
         let mut finished_items = round.completed;
 
@@ -884,6 +1040,7 @@ impl Agent {
                 fingerprint: self.fingerprint(),
                 suspended: round.suspended,
                 budget_exhausted: carried_budget_exhausted,
+                reason: StopReason::AwaitingDecision,
                 context,
               }));
               return;
@@ -894,6 +1051,7 @@ impl Agent {
           }
         }
 
+        self.clear_checkpoint(&context).await;
         yield Ok(AgentStreamEvent::ToolCallsFinished(finished_items));
         context.increment_step();
       }
@@ -990,6 +1148,10 @@ impl Agent {
 
         self.record_assistant_text(&mut context, &assistant_text);
         let started_items = self.record_tool_calls(&mut context, &tool_calls);
+        // See the plain driver: ahead of the round, for the same reason.
+        self
+          .checkpoint_round(&context, &tool_calls, budget_exhausted)
+          .await;
         yield Ok(AgentStreamEvent::ToolCallsStarted(started_items));
 
         let round = self
@@ -1010,6 +1172,7 @@ impl Agent {
                 fingerprint: self.fingerprint(),
                 suspended: round.suspended,
                 budget_exhausted,
+                reason: StopReason::AwaitingDecision,
                 context,
               }));
               return;
@@ -1022,6 +1185,7 @@ impl Agent {
           }
         }
 
+        self.clear_checkpoint(&context).await;
         yield Ok(AgentStreamEvent::ToolCallsFinished(finished_items));
         context.increment_step();
       }

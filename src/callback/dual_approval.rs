@@ -227,6 +227,23 @@ impl ApprovalRegistry {
     }
   }
 
+  /// Stop waiting on every outstanding prompt, returning the ids that were waiting.
+  ///
+  /// Unlike [`Self::discard`], this is called while the turn is *still running*, and
+  /// that is the point: dropping a decision sender is exactly what the waiting side
+  /// reads as "nobody answered" (see [`DualApprovalCallback::prompt_session`]), so this
+  /// brings forward what the timeout would eventually have done. Under the default
+  /// [`WhenUnanswered::Suspend`] the calls suspend and the turn is stored, rather than
+  /// being decided on the human's behalf.
+  ///
+  /// For an interrupt: `Ctrl-C` at an approval prompt means "not now", and the honest
+  /// reading of that is the same as never answering — not a refusal.
+  pub fn cancel_all(&self) -> Vec<String> {
+    let mut pending = self.lock();
+    // Draining drops each sender, which is what wakes the waiting side.
+    pending.drain().map(|(id, _)| id).collect()
+  }
+
   /// Whether `id` is still awaiting a decision. Lets a front-end skip prompting for
   /// something another view already answered.
   pub fn is_pending(&self, id: &str) -> bool {
@@ -2123,6 +2140,109 @@ mod tests {
         .is_proceed(),
       "the remembered approval should apply without a prompt to leave unanswered"
     );
+  }
+
+  // ---- cancelling a live prompt ------------------------------------------------------
+
+  /// The basis of the interrupt fix: cancelling has to reach the *waiting* side, not
+  /// just tidy the map. A `Ctrl-C` that only cleared the registry would leave the turn
+  /// blocked until the timeout, which is the state it was trying to escape.
+  #[tokio::test]
+  async fn cancelling_wakes_the_waiting_side_as_unanswered() {
+    let approval =
+      DualApprovalCallback::new(["delete_file"]).with_timeout(Duration::from_secs(600));
+    let context = conversation("local", "s1");
+    let args = json!({ "path": "notes.txt" });
+    let approvals = Arc::new(ApprovalRegistry::default());
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<PendingApproval>();
+    let register = {
+      let approvals = Arc::clone(&approvals);
+      async move {
+        let pending = rx.recv().await.expect("a prompt should have been raised");
+        approvals.register(pending.meta, pending.decision);
+        // Standing in for the interrupt.
+        approvals.cancel_all()
+      }
+    };
+
+    // A 600s timeout: were cancelling not reaching the waiting side, this would hang
+    // rather than fail, so finishing at all is the assertion.
+    let (decision, cancelled) = tokio::join!(
+      with_approval_channel(
+        ApprovalChannel::Session(tx),
+        approval.call(&context, view("delete_file", &args)),
+      ),
+      register
+    );
+
+    assert_eq!(cancelled.len(), 1);
+    assert!(
+      matches!(decision, ToolCallDecision::Suspend),
+      "cancelling is the absence of an answer, so the call suspends rather than being \
+       refused on the human's behalf"
+    );
+  }
+
+  /// And it must not be remembered: an interrupt says nothing about what the answer
+  /// would have been, so the next call has to ask again.
+  #[tokio::test]
+  async fn cancelling_is_never_remembered() {
+    let approval =
+      DualApprovalCallback::new(["delete_file"]).with_timeout(Duration::from_secs(600));
+    let context = conversation("local", "s1");
+    let args = json!({ "path": "notes.txt" });
+    let approvals = Arc::new(ApprovalRegistry::default());
+
+    for _ in 0..2 {
+      let (tx, mut rx) = mpsc::unbounded_channel::<PendingApproval>();
+      let register = {
+        let approvals = Arc::clone(&approvals);
+        async move {
+          let pending = rx.recv().await.expect("a prompt should have been raised");
+          approvals.register(pending.meta, pending.decision);
+          approvals.cancel_all()
+        }
+      };
+      let (decision, _) = tokio::join!(
+        with_approval_channel(
+          ApprovalChannel::Session(tx),
+          approval.call(&context, view("delete_file", &args)),
+        ),
+        register
+      );
+      assert!(
+        matches!(decision, ToolCallDecision::Suspend),
+        "each attempt must raise its own prompt rather than reuse a cancellation"
+      );
+    }
+  }
+
+  /// Cancelling with nothing outstanding is how the handler tells "wind a turn down"
+  /// from "just stop the program".
+  #[test]
+  fn cancelling_nothing_reports_nothing() {
+    let approvals = ApprovalRegistry::default();
+    assert!(approvals.cancel_all().is_empty());
+  }
+
+  /// Every outstanding prompt is cancelled, not just one: a round's calls run
+  /// concurrently, so several can be waiting, and leaving any of them would keep the
+  /// turn — and the process — from winding down.
+  #[test]
+  fn cancelling_clears_every_outstanding_prompt() {
+    let approvals = ApprovalRegistry::default();
+    for id in ["call_1", "call_2", "call_3"] {
+      let (tx, _rx) = oneshot::channel();
+      approvals.register(meta(id), tx);
+    }
+
+    let mut cancelled = approvals.cancel_all();
+    cancelled.sort();
+
+    assert_eq!(cancelled, vec!["call_1", "call_2", "call_3"]);
+    assert!(approvals.pending_snapshot().is_empty());
+    assert!(approvals.any_pending().is_none());
   }
 
   #[test]
