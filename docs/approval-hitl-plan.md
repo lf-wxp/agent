@@ -1,6 +1,6 @@
 # 工具审批（HITL）能力增强与持久化方案
 
-> 状态：**设计阶段，尚未实现**。第 6 节是实施步骤清单，完成时逐项标 ✅ 并补「修复/实现记录」小节，风格对齐 `web-ui-plan.md`。
+> 状态：**阶段一～三已实现**（见第 8–18 节的实现与验证记录）；阶段四的 `edit` 经核实后决定推迟，理由见第 13 节。第 6 节是实施步骤清单，已完成项标 ✅，风格对齐 `web-ui-plan.md`。
 >
 > 本文档记录设计结论与取舍理由。如实现与本文档有偏差，应先更新本文档再改代码。
 
@@ -436,7 +436,7 @@ OpenAI 文档明确建议：长时间挂起的审批要在序列化 state 旁存
 - `src/callback/dual_approval.rs`：拆出 `ApprovalMeta { id, tool, raw_arguments, requested_at }`，`PendingApproval` 变为 `{ meta, decision }`。`ApprovalRegistry` 的 map 值改为 `(ApprovalMeta, oneshot::Sender<bool>)`，`register(meta, decision)` 一个参数完成登记。
 - 新增 `pending_snapshot() -> Vec<ApprovalMeta>`，按 `requested_at` 升序、id 兜底。`any_pending()` 同步改为返回**最早**的一条（原先是 `HashMap` 迭代顺序），与 snapshot 共用 `compare_by_age`——两个读取口必须同序，否则终端会显示一条、应答另一条。
 - `crates/shared`：新增 `PendingApprovalView`。刻意与 native 的 `PendingApproval` 区分命名，后者持有 agent 正阻塞其上的决策通道，既不可序列化也在进程外无意义。
-- `src/bin/cli/web.rs`：新增 `GET /api/approvals`（走同一个 `guard_loopback_host`）。三条驱动路径（`web::drive_turn`、`drive_terminal_turn`、`publish_approvals`）统一调整为**先 register 再广播**，否则收到事件立刻查询的视图可能看到空列表。
+- `src/bin/cli/web.rs`：新增 `GET /api/approvals`（走同一个 `guard_loopback_host`）。三条驱动路径（`web::drive_turn`、`drive_terminal_turn`、`publish_approvals`）统一调整为**先 register 再广播**，否则收到事件立刻查询的视图可能看到空列表。（审核发现 `drive_terminal_turn` 实际漏了这一条，两句之间虽无 `await`、但多线程 runtime 下窗口仍存在，已补齐。）
 - `crates/web-ui`：新增 `load_pending_approvals`，与 `load_history` **在同一个 task 内串行**执行——审批按定义比整段 transcript 更新，两个独立 task 的完成顺序不定，会把审批卡片渲染到历史上方。
 - 新增 `ChatState::push_approval`，按 `tool_id` 去重。这是让快照拉取与实时流能并存的关键：同一条审批可能从两个路径抵达，谁先到取决于请求时序，任一方都不能假定自己是首次引入。
 
@@ -480,6 +480,8 @@ OpenAI 文档明确建议：长时间挂起的审批要在序列化 state 旁存
 2. `continuity_key` 的构造逻辑从 `ExecutionContext` 方法里抽出为 `pub fn continuity_key_for(scope, id)`，方法改为调用它。原因：reset 发生在两个 turn **之间**，此时没有 context，却必须定位到 turn 们用过的那个 key。在调用点重新拼一遍会把 NUL 连接规则放到两处，一旦漂移就是「本该被清除的状态活过了 reset」——这种 bug 不会报错，只会静默地把标准权限带过用户画的边界。
 
 `clear_session` 从 `main.rs` 移到 `commands.rs` 并由 `/reset` 与 `--fresh` 共用，签名含 `Option<&DualApprovalCallback>`（`None` 表示无任何 gated 工具）。
+
+**后续收口**：阶段三加入挂起的 run 之后，「清除挂起 run」这一步一度被复制在三个调用点（`--fresh`、终端 `/reset`、Web `/reset`）。这与上面第 2 条抽出 `continuity_key_for` 的理由是同一个，所以也已收进 `clear_session`：会话之外还存活的东西有两样（粘性决策、挂起的 run），两样都属于「忘记这段对话」的语义，不该由每个前端各自记得。漏掉任一处都是静默失败——用户要求忘记的东西继续生效。
 
 ### 9.4 交互扩展
 
@@ -802,16 +804,21 @@ turn 结束时 registry 条目被 `discard`，但卡片还在。更严重的是�
 
 | 退出方式 | turn 状态 | 可用机制 |
 |---|---|---|
-| `Ctrl-C` / `SIGHUP`（关窗口）/ `SIGTERM`（`kill`） | 还活着 | 信号处理 → 优雅挂起 |
+| `Ctrl-C` / `SIGHUP`（关窗口）/ `SIGTERM`（`kill`），**且有待决审批** | 还活着 | 信号处理 → 优雅挂起 |
+| 同上，但**无待决审批** | 还活着，但没有可挂起的问题 | 立即退出；该轮若已开始工具调用则靠写前日志兜住，否则丢失 |
 | `SIGKILL` / panic / 断电 | 已消失 | **只能靠写前日志** |
 
-第二类无解于信号处理：`ExecutionContext` 就活在那个 async 任务自己的栈上，任务没了它就没了，**事后运行的任何代码都救不回来**。这一点值得单独记下来，因为它决定了不能只做信号处理就收工。
+第二行是刻意的：挂起的语义是「有一个待回答的问题」，没有问题时构造一份挂起等于发明一个没人提出的审批。代价见 15.7 最后一条。
+
+第三类无解于信号处理：`ExecutionContext` 就活在那个 async 任务自己的栈上，任务没了它就没了，**事后运行的任何代码都救不回来**。这一点值得单独记下来，因为它决定了不能只做信号处理就收工。
 
 ### 15.3 机制一：信号 → 优雅挂起
 
 `ApprovalRegistry::cancel_all()` 丢弃所有决策发送端。等待侧读到发送端关闭，本来就理解为「无人应答」——与超时**完全同一条路径**。所以不需要新的持久化逻辑，只是把超时会做的事提前触发。
 
 三个信号都处理，而不只是 `Ctrl-C`：`SIGHUP` 是关闭终端窗口发的，`SIGTERM` 是 `kill` 和系统关机发的，三者留下的现场完全一样。退出码 `128+signum`。连按两次信号跳过等待直接退出——按第二次的人就是想立刻走。
+
+**没有待决审批时它是空操作**，进程立即退出（与默认处置行为一致）。此时若该轮已经开始某个工具轮次，写前日志已在盘上，下次启动会收尾为「是否生效未知」；若连第一轮工具调用都还没发出，则该轮丢失——见 15.7。
 
 副产品：`Ctrl-C` 成了「这个审批我待会儿再说」的快捷方式，不用干等满 300 秒。
 
@@ -859,9 +866,19 @@ turn 结束时 registry 条目被 `discard`，但卡片还在。更严重的是�
 
 ### 15.7 仍然覆盖不到的
 
+- **无待决审批时收到信号**：进程立即退出，不构造挂起（15.3）。该轮若已发出过工具调用，写前日志会把它收尾为「未知」；若模型还没请求任何工具，这一轮连同用户的提问一起丢失。做法上可以在 `seed_context` 之后就写一次 checkpoint 来覆盖，代价是每轮多一次写且多一类「什么都没发生」的恢复记录——目前判断不值得。
 - **写盘本身被打断**：临时文件 + 原子 rename 保证要么旧要么新，不会半截。但 rename 之后、轮次结束之前断电，会留下一个 `RoundInFlight` 记录——收尾为「未知」，是正确的保守答案。
 - **轮次完成与清除 checkpoint 之间崩溃**：会把已完成的调用标成「未知」。「未知」永远不是错的，只是偏保守。
 - ~~**`--mode web` 下的信号**：Web 服务器任务与终端共享同一个处理器，行为一致。~~ **这句话是错的**，见 17。
+
+### 15.8 后续修复：两条 checkpoint 生命周期漏洞
+
+审核时发现两处 checkpoint 的生命周期与本节的约定不符，均已修复：
+
+- **`run_continuing` 挂起后不清除 checkpoint。** `drive` 挂起时刻意保留 checkpoint，前提是「接到挂起的人会用自己的记录替换它」。但 `run_continuing` 不走这条路——它当场 `record_unanswered` 收尾并继续。于是盘上留下一条描述**已正常收尾**轮次的 `RoundInFlight`，下次启动 `recover_interrupted_round` 会把它当真崩溃，往 transcript 里写入「是否生效未知」——正是 16.1 反复强调要避免的错误归因。CLI 不受影响（走 `run_continuing_resumable`），命中条件是库消费者同时用 `with_checkpoint` + `run_continuing`。
+- **非流式 `resume` 不为重试轮写 checkpoint。** `resume_stream` 写了并注明了理由（15.5：`take` 已移除盘上状态，重新询问期间崩溃就彻底丢失），`drive_from_round` 漏了。两个入口的数据安全性因此取决于前端选了哪一个。
+
+两者都补上了对应的 `checkpoint_round` / `clear_checkpoint`。新增测试钉住「resume 先落盘再重试」与「被拒的 resume 不碰 checkpoint」——后者是因为 `take` 之后状态只存在于调用栈上，此时写 checkpoint 会把一次拒绝变成对它本要保护的那份状态的改写。
 
 ## 16. `/discard` 之后 web 只剩一张孤立的 tool call
 
