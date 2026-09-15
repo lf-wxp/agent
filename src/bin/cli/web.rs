@@ -434,17 +434,11 @@ pub(crate) async fn chat_handler(
           MessageOrigin::Web,
           &state.store,
           state.approval_callback.as_deref(),
+          &state.approvals_store,
           &state.session_id,
           &state.events,
         )
         .await;
-        // A reset clears the suspended run with it: see the terminal loop's equivalent.
-        if matches!(command, shared::commands::Command::Reset) {
-          state
-            .approvals_store
-            .remove(super::LOCAL_SCOPE, &state.session_id)
-            .await;
-        }
       }
     }
 

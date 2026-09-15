@@ -415,11 +415,15 @@ async fn main() -> anyhow::Result<()> {
   let web_events_tx = web::new_event_channel();
 
   if args.contains_key("fresh") {
-    commands::clear_session(&store, approval_callback.as_deref(), &session_id).await;
-    // Same reasoning as `/reset`: the suspended run holds this conversation mid-turn,
-    // so clearing the history has to clear it too or the session could be resumed back
-    // into what was just cleared.
-    approvals_store.remove(LOCAL_SCOPE, &session_id).await;
+    // Clears the remembered approval decisions and the suspended run along with the
+    // history — see `commands::clear_session` for why all three belong together.
+    commands::clear_session(
+      &store,
+      approval_callback.as_deref(),
+      &approvals_store,
+      &session_id,
+    )
+    .await;
     println!("Cleared history for session `{session_id}`.\n");
   }
 
@@ -641,16 +645,11 @@ async fn main() -> anyhow::Result<()> {
           MessageOrigin::Terminal,
           &store,
           approval_callback.as_deref(),
+          &approvals_store,
           &session_id,
           &web_events_tx,
         )
         .await;
-        // A reset clears the suspended run along with the history it belongs to: the
-        // run holds that same conversation mid-turn, so keeping it would let a cleared
-        // session be resumed straight back into what was just cleared.
-        if matches!(command, command_set::Command::Reset) {
-          approvals_store.remove(LOCAL_SCOPE, &session_id).await;
-        }
         continue;
       }
       None => {}
@@ -1008,15 +1007,18 @@ async fn drive_terminal_turn(
           continue;
         };
         raised.push(meta.id.clone());
-        let _ = events.send(ChatEvent::ApprovalRequired {
+        let announcement = ChatEvent::ApprovalRequired {
           id: meta.id.clone(),
           tool: meta.tool.clone(),
           arguments: meta.raw_arguments.clone(),
-        });
-        // Registered before being queued: registration is what makes the prompt
-        // answerable from any view (and visible to `GET /api/approvals`), whereas the
-        // queue below only decides whose turn it is to read an answer off this console.
+        };
+        // Registered before the announcement goes out, matching the other two drivers:
+        // registration is what makes the prompt answerable from any view and visible to
+        // `GET /api/approvals`, so a tab that reacts to the event by immediately querying
+        // that endpoint must not be able to see an empty list. The queue below only
+        // decides whose turn it is to read an answer off this console, so it can wait.
         approvals.register(meta.clone(), decision);
+        let _ = events.send(announcement);
         queued.push_back(meta);
       }
       answered = async {

@@ -7,7 +7,7 @@
 //! them, which needs a session store and the broadcast channel.
 
 use agent::{
-  agent::continuity_key_for,
+  agent::{ApprovalStore, FileApprovalStore, continuity_key_for},
   callback::dual_approval::DualApprovalCallback,
   session::{FileSessionStore, SessionStore},
 };
@@ -19,23 +19,36 @@ use tokio::sync::broadcast;
 
 /// Forget everything a session accumulated outside its transcript.
 ///
-/// Clearing the stored history is not by itself a reset: a remembered "always allow" for
-/// a destructive tool lives in the approval callback, not in the transcript, and leaving
-/// it in place would carry the single riskiest piece of session state across exactly the
-/// boundary the user asked to draw. Shared by `/reset` and `--fresh`, which mean the same
-/// thing.
+/// Clearing the stored history is not by itself a reset. Two other things belong to the
+/// same conversation and would otherwise outlive it:
+///
+/// - A remembered "always allow" for a destructive tool, which lives in the approval
+///   callback. Leaving it in place would carry the single riskiest piece of session state
+///   across exactly the boundary the user asked to draw.
+/// - A suspended run, which holds this conversation *mid-turn*. Leaving it would let a
+///   cleared session be resumed straight back into what was just cleared.
+///
+/// Both are done here rather than at the call sites. They were duplicated across the
+/// three of them (`--fresh`, the terminal's `/reset`, the browser's `/reset`), which is
+/// the shape of bug where one copy gets a fix and the others do not — and for state whose
+/// whole purpose is to gate destructive operations, the failure is silent: something the
+/// user asked to forget simply keeps applying.
+///
+/// Shared by `/reset` and `--fresh`, which mean the same thing.
 ///
 /// `approvals` is `None` when nothing is gated (`--no-approval`, or an empty
 /// `--dangerous-tools`), in which case there is no remembered decision to forget.
 pub async fn clear_session(
   store: &FileSessionStore,
   approvals: Option<&DualApprovalCallback>,
+  approvals_store: &FileApprovalStore,
   session_id: &str,
 ) {
   store.save(super::LOCAL_SCOPE, session_id, Vec::new()).await;
   if let Some(approvals) = approvals {
     approvals.forget_sticky(&continuity_key_for(Some(super::LOCAL_SCOPE), session_id));
   }
+  approvals_store.remove(super::LOCAL_SCOPE, session_id).await;
 }
 
 /// Carry out `command` and broadcast everything a front-end needs in order to render it:
@@ -57,12 +70,18 @@ pub async fn clear_session(
 ///
 /// [`Command::Exit`] is included for the sake of a front-end that cannot honor it, which
 /// gets told so; the terminal acts on it directly instead of calling this.
+// Eight parameters, seven of which are the pieces of session state a command may need to
+// act on — the same list `web::WebState::new` carries for the same reason. A parameter
+// struct would move the list one level out and add a type whose only job is to be
+// destructured here, while the call sites (one per front-end) would still name all eight.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute(
   command: Command,
   input: &str,
   origin: MessageOrigin,
   store: &FileSessionStore,
   approvals: Option<&DualApprovalCallback>,
+  approvals_store: &FileApprovalStore,
   session_id: &str,
   events: &broadcast::Sender<ChatEvent>,
 ) {
@@ -76,7 +95,7 @@ pub async fn execute(
   let notice = match command {
     Command::Help => help_text(web),
     Command::Reset => {
-      clear_session(store, approvals, session_id).await;
+      clear_session(store, approvals, approvals_store, session_id).await;
       format!("已清空会话 `{session_id}` 的历史记录。")
     }
     // Nothing for a browser tab to exit: the process belongs to whoever launched it, and
@@ -108,6 +127,13 @@ mod tests {
     )
   }
 
+  fn test_approvals_store() -> FileApprovalStore {
+    FileApprovalStore::new(std::env::temp_dir().join(format!(
+      "agent-cli-commands-approvals-{}",
+      uuid::Uuid::new_v4()
+    )))
+  }
+
   fn sample_history() -> Vec<agent::agent::Event> {
     vec![agent::agent::Event::new(
       "exec",
@@ -127,7 +153,18 @@ mod tests {
   async fn run(command: Command, origin: MessageOrigin) -> Vec<ChatEvent> {
     let (tx, mut rx) = broadcast::channel(8);
     let store = test_store();
-    execute(command, "  /cmd  ", origin, &store, None, "s1", &tx).await;
+    let approvals_store = test_approvals_store();
+    execute(
+      command,
+      "  /cmd  ",
+      origin,
+      &store,
+      None,
+      &approvals_store,
+      "s1",
+      &tx,
+    )
+    .await;
     drop(tx);
 
     let mut events = Vec::new();
@@ -191,6 +228,7 @@ mod tests {
   async fn reset_clears_the_stored_history() {
     let (tx, _rx) = broadcast::channel(8);
     let store = test_store();
+    let approvals_store = test_approvals_store();
     store
       .save(super::super::LOCAL_SCOPE, "s1", sample_history())
       .await;
@@ -201,6 +239,7 @@ mod tests {
       MessageOrigin::Web,
       &store,
       None,
+      &approvals_store,
       "s1",
       &tx,
     )
@@ -211,6 +250,62 @@ mod tests {
         .history(super::super::LOCAL_SCOPE, "s1")
         .await
         .is_empty()
+    );
+  }
+
+  /// A reset has to drop the suspended run as well. The stored run holds this very
+  /// conversation mid-turn, so keeping it would leave `/resume` able to carry the session
+  /// straight back into the history that was just cleared — and, worse, to re-raise an
+  /// approval for a turn the user has already walked away from.
+  ///
+  /// Asserted on `clear_session` rather than on one front-end's `/reset`, because that is
+  /// the point of it living there: all three entry points get this from one place.
+  #[tokio::test]
+  async fn reset_drops_a_suspended_run_along_with_the_history() {
+    use agent::{
+      AgentRunState,
+      agent::{ExecutionContext, RunFingerprint},
+    };
+
+    let store = test_store();
+    let approvals_store = test_approvals_store();
+
+    // Built from its serialized shape rather than as a struct literal:
+    // `AgentRunState::context` is deliberately not public, so that a mid-turn transcript
+    // cannot be handed straight to a model or filed as history. JSON is the supported way
+    // in from outside the crate — it is how a stored run gets loaded in the first place.
+    let state: AgentRunState = serde_json::from_value(serde_json::json!({
+      "fingerprint": RunFingerprint::new("gpt-test", None, ["delete_file"]),
+      "suspended": [{
+        "tool_call_id": "call_1",
+        "name": "delete_file",
+        "raw_arguments": r#"{"path":"a.txt"}"#,
+      }],
+      "budget_exhausted": false,
+      "reason": "AwaitingDecision",
+      "context": ExecutionContext::new(),
+    }))
+    .expect("this is the on-disk shape of a suspended run");
+
+    approvals_store
+      .put(super::super::LOCAL_SCOPE, "s1", &state)
+      .await;
+    assert!(
+      approvals_store
+        .peek(super::super::LOCAL_SCOPE, "s1")
+        .await
+        .is_some(),
+      "the run should be stored before the reset"
+    );
+
+    clear_session(&store, None, &approvals_store, "s1").await;
+
+    assert!(
+      approvals_store
+        .peek(super::super::LOCAL_SCOPE, "s1")
+        .await
+        .is_none(),
+      "a cleared session must not leave a resumable run behind"
     );
   }
 
@@ -262,7 +357,7 @@ mod tests {
       "the remembered answer should apply without asking again"
     );
 
-    clear_session(&store, Some(&approvals), "s1").await;
+    clear_session(&store, Some(&approvals), &test_approvals_store(), "s1").await;
 
     // Forgotten: nothing is remembered, so the call is gated again rather than silently
     // proceeding. With no front-end listening it suspends rather than refusing — the
