@@ -1564,6 +1564,92 @@ fn the_stop_reason_round_trips_through_json() {
   assert_eq!(back.reason, StopReason::RoundInFlight);
 }
 
+/// Records what a run asked its checkpoint to do, so a test can assert the write-ahead
+/// happened rather than inferring it from a file on disk.
+#[derive(Default)]
+struct SpyCheckpoint {
+  saved: Mutex<Vec<StopReason>>,
+  cleared: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl RunCheckpoint for SpyCheckpoint {
+  async fn save(&self, state: &AgentRunState) {
+    self
+      .saved
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .push(state.reason);
+  }
+
+  async fn clear(&self, _context: &ExecutionContext) {
+    self.cleared.fetch_add(1, Ordering::SeqCst);
+  }
+}
+
+impl SpyCheckpoint {
+  fn saved(&self) -> Vec<StopReason> {
+    self
+      .saved
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .clone()
+  }
+}
+
+/// A resumed round has to be checkpointed like any other, and this one matters most: the
+/// caller took the stored state out of the store to get here, so between that `take` and
+/// this write there is nothing on disk at all. A process dying in that window would lose
+/// the pending question outright — strictly worse than never having stored it.
+///
+/// The non-streaming `resume` used to skip this while `resume_stream` did it, so the loss
+/// depended only on which entry point a front-end happened to use.
+#[tokio::test]
+async fn resuming_checkpoints_the_round_it_re_attempts() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let checkpoint = Arc::new(SpyCheckpoint::default());
+  // Suspends again, so the resume returns before issuing any model request — the
+  // checkpoint write is the only thing under test here.
+  let agent = agent_with(spy_registry(&executed))
+    .with_before_tool_callback(Arc::new(SuspendEverything))
+    .with_checkpoint(Arc::clone(&checkpoint) as Arc<dyn RunCheckpoint>);
+  let state = suspended_state(&agent, "call_1");
+
+  let outcome = agent
+    .resume(state, &HashMap::new())
+    .await
+    .expect("an unanswered resume suspends again rather than failing");
+
+  assert!(matches!(outcome, AgentOutcome::Suspended(_)));
+  assert_eq!(
+    checkpoint.saved(),
+    vec![StopReason::RoundInFlight],
+    "the re-attempted round must be parked on disk before it runs, marked as in flight"
+  );
+  assert!(!executed.load(Ordering::SeqCst), "the tool must not run");
+}
+
+/// A refused resume must not touch the checkpoint: the state it was handed is still the
+/// authoritative record, and writing over it — in either direction — would turn a
+/// refusal into a mutation of the very run the refusal exists to protect.
+#[tokio::test]
+async fn a_refused_resume_leaves_the_checkpoint_alone() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let checkpoint = Arc::new(SpyCheckpoint::default());
+  let agent = agent_with(spy_registry(&executed))
+    .with_checkpoint(Arc::clone(&checkpoint) as Arc<dyn RunCheckpoint>);
+  let mut state = suspended_state(&agent, "call_1");
+  state.reason = StopReason::RoundInFlight;
+
+  assert!(
+    agent.resume(state, &HashMap::new()).await.is_err(),
+    "an interrupted round cannot be resumed"
+  );
+
+  assert!(checkpoint.saved().is_empty());
+  assert_eq!(checkpoint.cleared.load(Ordering::SeqCst), 0);
+}
+
 /// The invariant the whole checkpoint mechanism protects: an interrupted round's calls
 /// may already have taken effect, so re-running the batch could repeat a side effect.
 /// Enforced on the agent, not just in whichever front-end happens to store the run.

@@ -754,6 +754,17 @@ impl Agent {
           let suspended = state.suspended.clone();
           let mut context = state.context;
           self.record_unanswered(&mut context, &suspended);
+          // `drive` deliberately leaves the checkpoint in place when it suspends, on the
+          // basis that whoever receives the suspension will replace it with a record of
+          // its own. This entry point does not — it closes the calls out here and carries
+          // on — so it has to clear the checkpoint itself.
+          //
+          // Skipping this leaves a `RoundInFlight` record describing a round that
+          // finished normally. Nothing notices until the next launch, when recovery reads
+          // it as a crash and writes "whether it took effect is unknown" into the
+          // transcript for calls that in fact resolved — inventing exactly the kind of
+          // false attribution the `StopReason` split exists to prevent.
+          self.clear_checkpoint(&context).await;
           // The round is over now that every call has a result, which is what
           // `increment_step` accounts for; `drive` leaves it alone precisely because a
           // suspended round is not finished.
@@ -844,6 +855,14 @@ impl Agent {
     budget_exhausted: bool,
   ) -> anyhow::Result<AgentOutcome> {
     let calls = rebuild_tool_calls(pending);
+    // Checkpointed like any other round, and this one needs it most: the caller took the
+    // stored state out in order to get here (see [`crate::agent::ApprovalStore::take`]),
+    // so until this write lands there is nothing on disk at all while these calls are
+    // being re-asked. Dying in that window would lose the pending question outright —
+    // worse than never having stored it. The streaming counterpart does the same.
+    self
+      .checkpoint_round(&context, &calls, budget_exhausted)
+      .await;
     let round = self
       .execute_tool_calls(&mut context, &calls, decisions)
       .await;
@@ -859,6 +878,7 @@ impl Agent {
     }
 
     // Every call in the round now has a result, so the round is spent.
+    self.clear_checkpoint(&context).await;
     context.increment_step();
     self.drive(context).await
   }
