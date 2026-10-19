@@ -39,8 +39,7 @@ use async_openai::types::chat::{
   ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
   ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
   ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
-  ChatCompletionRequestUserMessageArgs, ChatCompletionResponseStream, ChatCompletionStreamOptions,
-  CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+  ChatCompletionRequestUserMessageArgs, ChatCompletionStreamOptions, CreateChatCompletionResponse,
   CreateChatCompletionStreamResponse, FunctionCall,
 };
 use async_stream::stream;
@@ -58,9 +57,11 @@ use crate::{
   callback::context_optimizer::ContextOptimizer,
   config,
   llm::{
-    client::{DEFAULT_MAX_TOKENS, first_choice, request_builder},
+    backend::{ChatChunkStream, ChatResponse},
+    client::{RequestDraft, WireMessages, first_choice, request_builder},
     provider::Provider,
     retry::{is_transient, with_retry},
+    settings::ModelSettings,
     tool_calls::ToolCallAccumulator,
     tool_loop::disable_tools,
   },
@@ -82,7 +83,11 @@ pub use structured::StructuredAgentResult;
 const TOOL_LOG_PREVIEW_CHARS: usize = 500;
 
 /// Outcome of [`Agent::run`].
+///
+/// `#[non_exhaustive]`: it only ever comes out of a run, and a field added later (as
+/// `reasoning` was) should not break code that reads one.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct AgentResult {
   pub output: String,
   pub context: ExecutionContext,
@@ -90,6 +95,14 @@ pub struct AgentResult {
   /// disabled, i.e. built from partial information. Mirrors
   /// [`crate::llm::tool_loop::Completion::budget_exhausted`].
   pub budget_exhausted: bool,
+  /// The chain of thought behind [`Self::output`] — the final round's only — when the
+  /// model reasons and its provider returns it (see [`crate::llm::backend`]).
+  ///
+  /// Not part of [`Self::context`] by default: most providers do not want it back, so
+  /// it stays out of the transcript and out of the next request. Where one does (see
+  /// [`ModelSettings::replay_reasoning`]), it is recorded there as
+  /// [`ContentItem::Reasoning`] as well.
+  pub reasoning: Option<String>,
 }
 
 /// One increment produced by [`Agent::run_stream`] / [`Agent::run_continuing_stream`].
@@ -106,6 +119,12 @@ pub struct AgentResult {
 pub enum AgentStreamEvent {
   /// A chunk of assistant text, forwarded as soon as the model emits it.
   Token(String),
+  /// A chunk of the model's chain of thought, forwarded as soon as it arrives — ahead of
+  /// the [`Self::Token`]s (or tool calls) of the same round. Only produced for a model
+  /// that reasons and a provider that streams it. Like [`AgentResult::reasoning`], it is
+  /// recorded into the transcript (as [`ContentItem::Reasoning`]) only when
+  /// [`ModelSettings::replay_reasoning`] is on.
+  Reasoning(String),
   /// The model requested these tool calls and they are about to run, forwarded just
   /// before [`Agent::execute_tool_calls`] starts them. Every item is a
   /// [`ContentItem::ToolCall`] — one per call in this round, in the order the model
@@ -526,6 +545,8 @@ pub struct Agent {
   tool_timeout: Duration,
   /// Calls of one round executing at once; see [`Self::with_tool_concurrency`].
   tool_concurrency: usize,
+  /// How the model is asked to answer; see [`Self::with_model_settings`].
+  settings: ModelSettings,
 }
 
 impl Agent {
@@ -563,7 +584,33 @@ impl Agent {
       checkpoint: None,
       tool_timeout: config::tool_timeout(),
       tool_concurrency: config::tool_max_concurrency(),
+      settings: ModelSettings::from_config(),
     }
+  }
+
+  /// Output cap, sampling and reasoning effort for every request this agent sends.
+  /// Defaults to [`ModelSettings::from_config`] (`LLM_MAX_TOKENS`, `LLM_TEMPERATURE`,
+  /// `LLM_TOP_P`, `LLM_REASONING_EFFORT`, `LLM_TOKEN_LIMIT_FIELD`).
+  ///
+  /// The structured routes ([`Self::run_structured`]) raise the output cap further where
+  /// they need room for a reasoning model's chain of thought, but never lower it.
+  ///
+  /// Not part of [`Self::fingerprint`]: a run suspended under one temperature can be
+  /// resumed under another without the transcript meaning anything different.
+  ///
+  /// [`ModelSettings::replay_reasoning`] is the one setting that changes the transcript:
+  /// on, each assistant message's chain of thought is recorded beside it and sent back
+  /// with it on every later request (what DeepSeek's thinking mode requires whenever
+  /// tools are offered); off, none of that happens.
+  #[must_use]
+  pub fn with_model_settings(mut self, settings: ModelSettings) -> Self {
+    self.settings = settings;
+    self
+  }
+
+  /// The settings requests are sent with; see [`Self::with_model_settings`].
+  pub fn model_settings(&self) -> &ModelSettings {
+    &self.settings
   }
 
   /// How long one tool call may run before it is abandoned and reported to the model as
@@ -978,11 +1025,11 @@ impl Agent {
       let (tools_allowed, budget_exhausted) = self.round_budget(&context);
 
       let llm_request = self.prepare_llm_request(&context).await;
-      let messages = self.build_messages(llm_request)?;
+      let wire = self.build_messages(llm_request)?;
       let mut builder = request_builder(
         &self.model,
-        messages,
-        DEFAULT_MAX_TOKENS,
+        wire,
+        &self.settings,
         self.toolbox.definitions(),
       );
       if !tools_allowed {
@@ -990,7 +1037,11 @@ impl Agent {
       }
 
       let token = context.cancellation.clone();
-      let Some(response) = self.complete_unless_cancelled(&builder, &token).await? else {
+      let Some(ChatResponse {
+        response,
+        reasoning,
+      }) = self.complete_unless_cancelled(&builder, &token).await?
+      else {
         return Err(Cancelled::new(context).into());
       };
       self.record_usage(&mut context, &response);
@@ -1001,11 +1052,13 @@ impl Agent {
         let content = message
           .content
           .ok_or_else(|| anyhow::anyhow!("No content in final response"))?;
+        self.record_reasoning(&mut context, reasoning.as_deref());
         self.record_final_answer(&mut context, &content);
         return Ok(AgentOutcome::Done(AgentResult {
           output: content,
           context,
           budget_exhausted,
+          reasoning,
         }));
       };
 
@@ -1014,13 +1067,27 @@ impl Agent {
       if !tools_allowed {
         tracing::warn!("model requested tools after they were disabled");
         let content = message.content.unwrap_or_default();
+        self.record_reasoning(&mut context, reasoning.as_deref());
         self.record_final_answer(&mut context, &content);
         return Ok(AgentOutcome::Done(AgentResult {
           output: content,
           context,
           budget_exhausted: true,
+          reasoning,
         }));
       }
+
+      // A tool round's reasoning has nowhere to go in a non-streaming result, which
+      // reports the final answer's only. It is recorded for replay when the provider
+      // wants it back; otherwise only its size is logged, since the text can carry user
+      // data and the log is not where it belongs.
+      if let Some(reasoning) = &reasoning {
+        tracing::debug!(
+          reasoning_chars = reasoning.chars().count(),
+          "reasoning behind a tool round"
+        );
+      }
+      self.record_reasoning(&mut context, reasoning.as_deref());
 
       // Anything the model said alongside these calls, before the calls themselves so
       // the two end up on one assistant message. See `record_assistant_text`.
@@ -1241,11 +1308,11 @@ impl Agent {
         let budget_exhausted = round_budget_exhausted || carried_budget_exhausted;
 
         let llm_request = self.prepare_llm_request(&context).await;
-        let messages = self.build_messages(llm_request)?;
+        let wire = self.build_messages(llm_request)?;
         let mut builder = request_builder(
           &self.model,
-          messages,
-          DEFAULT_MAX_TOKENS,
+          wire,
+          &self.settings,
           self.toolbox.definitions(),
         );
         if !tools_allowed {
@@ -1268,6 +1335,9 @@ impl Agent {
         // Forwarded token by token as it arrives; also kept so the final answer (or the
         // fallback content once tools are disabled) can be recorded as one piece.
         let mut assistant_text = String::new();
+        // The chain of thought of this round, assembled from its deltas for
+        // `record_reasoning`. Forwarded as it arrives either way.
+        let mut reasoning_text = String::new();
 
         loop {
           // Raced chunk by chunk, so a cancelled run stops mid-answer rather than only
@@ -1289,10 +1359,20 @@ impl Agent {
             // Abort instead of continuing: after a transport error the remaining
             // fragments would assemble into a truncated tool call.
             Err(err) => {
-              yield Err(err.into());
+              yield Err(err);
               return;
             }
           };
+
+          // Reasoning streams ahead of the answer; forwarded the same way, and recorded
+          // once the round is over, if the provider wants it back.
+          if let Some(reasoning) = chunk.reasoning {
+            if self.settings.replay_reasoning {
+              reasoning_text.push_str(&reasoning);
+            }
+            yield Ok(AgentStreamEvent::Reasoning(reasoning));
+          }
+          let chunk = chunk.chunk;
 
           // Before the `choices` guard below, not after: the chunk carrying usage is
           // precisely the one with an empty `choices` array (see `request_builder`'s
@@ -1320,6 +1400,7 @@ impl Agent {
 
         // No tool calls means the model produced its final answer.
         if accumulator.is_empty() {
+          self.record_reasoning(&mut context, Some(&reasoning_text));
           self.record_final_answer(&mut context, &assistant_text);
           yield Ok(AgentStreamEvent::Done {
             output: assistant_text,
@@ -1333,6 +1414,7 @@ impl Agent {
         // caller has already seen whatever text came back as `Token`s.
         if !tools_allowed {
           tracing::warn!("model requested tools after they were disabled");
+          self.record_reasoning(&mut context, Some(&reasoning_text));
           self.record_final_answer(&mut context, &assistant_text);
           yield Ok(AgentStreamEvent::Done {
             output: assistant_text,
@@ -1350,6 +1432,7 @@ impl Agent {
           }
         };
 
+        self.record_reasoning(&mut context, Some(&reasoning_text));
         self.record_assistant_text(&mut context, &assistant_text);
         let started_items = self.record_tool_calls(&mut context, &tool_calls);
         // See the plain driver: ahead of the round, for the same reason.
@@ -1402,28 +1485,17 @@ impl Agent {
   /// route in [`structured`] — goes through this one call site instead of repeating the
   /// "acquire a permit, build the request, retry on failure" boilerplate; a fix made here
   /// (e.g. a different retry policy) applies to all of them at once. `builder` is taken by
-  /// reference and rebuilt (`builder.build()`) on every attempt, since a retried request
-  /// must be constructed fresh each time rather than reusing a value already consumed.
+  /// reference and rebuilt ([`RequestDraft::chat_request`]) on every attempt, since a
+  /// retried request must be constructed fresh each time rather than reusing a value
+  /// already consumed.
   ///
   /// [`is_transient`] decides what is worth another attempt. A rejected key, an unknown
   /// model or a request the provider considers malformed fails *identically* every time,
   /// so retrying one only spends the attempt budget and delays the real error reaching
   /// the caller by the whole backoff curve.
-  async fn complete(
-    &self,
-    builder: &CreateChatCompletionRequestArgs,
-  ) -> anyhow::Result<CreateChatCompletionResponse> {
+  async fn complete(&self, builder: &RequestDraft) -> anyhow::Result<ChatResponse> {
     with_retry(
-      || async {
-        let _permit = self.provider.acquire().await?;
-        let response = self
-          .provider
-          .client()
-          .chat()
-          .create(builder.build()?)
-          .await?;
-        anyhow::Ok(response)
-      },
+      || async { self.provider.chat(builder.chat_request()?).await },
       is_transient,
     )
     .await
@@ -1434,9 +1506,9 @@ impl Agent {
   /// `biased` so an already-cancelled token wins without the request ever being sent.
   async fn complete_unless_cancelled(
     &self,
-    builder: &CreateChatCompletionRequestArgs,
+    builder: &RequestDraft,
     token: &CancellationToken,
-  ) -> anyhow::Result<Option<CreateChatCompletionResponse>> {
+  ) -> anyhow::Result<Option<ChatResponse>> {
     tokio::select! {
       biased;
       () = token.cancelled() => Ok(None),
@@ -1455,10 +1527,7 @@ impl Agent {
   /// Providers that do not implement `stream_options` ignore the field and simply never
   /// send a usage chunk — the same as before it was asked for, so this cannot make a
   /// working provider stop working.
-  async fn complete_stream(
-    &self,
-    builder: &CreateChatCompletionRequestArgs,
-  ) -> anyhow::Result<ChatCompletionResponseStream> {
+  async fn complete_stream(&self, builder: &RequestDraft) -> anyhow::Result<ChatChunkStream> {
     let mut builder = builder.clone();
     builder.stream_options(ChatCompletionStreamOptions {
       include_usage: Some(true),
@@ -1466,16 +1535,7 @@ impl Agent {
     });
 
     with_retry(
-      || async {
-        let _permit = self.provider.acquire().await?;
-        let stream = self
-          .provider
-          .client()
-          .chat()
-          .create_stream(builder.build()?)
-          .await?;
-        anyhow::Ok(stream)
-      },
+      || async { self.provider.chat_stream(builder.chat_request()?).await },
       is_transient,
     )
     .await
@@ -1508,6 +1568,29 @@ impl Agent {
       vec![ContentItem::Message {
         role: "user".to_owned(),
         content: user_input.to_owned(),
+      }],
+    ));
+  }
+
+  /// Record the chain of thought behind the assistant message about to be recorded, so
+  /// that [`Self::build_messages`] can send it back with that message.
+  ///
+  /// A no-op unless [`ModelSettings::replay_reasoning`] is on: most providers do not want
+  /// reasoning back, and a transcript that holds it anyway grows by the size of every
+  /// chain of thought and spends token budget on text nobody sends. Called *before* the
+  /// message it belongs to is recorded — [`ContentItem::Reasoning`] precedes its message.
+  fn record_reasoning(&self, context: &mut ExecutionContext, reasoning: Option<&str>) {
+    if !self.settings.replay_reasoning {
+      return;
+    }
+    let Some(text) = reasoning.filter(|text| !text.trim().is_empty()) else {
+      return;
+    };
+    context.add_event(Event::new(
+      context.execution_id.clone(),
+      "agent",
+      vec![ContentItem::Reasoning {
+        text: text.to_owned(),
       }],
     ));
   }
@@ -2016,40 +2099,54 @@ impl Agent {
   /// already a per-round copy of the transcript (see [`Self::prepare_llm_request`]), so
   /// on a long run with bulky tool output that second copy is pure waste, and it is
   /// paid on every round.
-  fn build_messages(
-    &self,
-    request: LlmRequest,
-  ) -> anyhow::Result<Vec<ChatCompletionRequestMessage>> {
+  ///
+  /// A [`ContentItem::Reasoning`] belongs to the assistant message that follows it, and
+  /// is attached to that message — but only when [`ModelSettings::replay_reasoning`] is
+  /// on. One that has no assistant message after it (its message was trimmed away, or
+  /// the transcript ends there) is dropped rather than handed to the wrong one.
+  fn build_messages(&self, request: LlmRequest) -> anyhow::Result<WireMessages> {
     let LlmRequest {
       instructions,
       contents,
     } = request;
-    let mut messages = Vec::with_capacity(instructions.len() + contents.len());
+    let mut wire = WireMessages {
+      messages: Vec::with_capacity(instructions.len() + contents.len()),
+      reasoning: Vec::new(),
+    };
+    let replay = self.settings.replay_reasoning;
+    let mut pending_reasoning: Option<String> = None;
 
     for instruction in instructions {
-      messages.push(
+      wire.push(
         ChatCompletionRequestSystemMessageArgs::default()
           .content(instruction)
-          .build()?
-          .into(),
+          .build()?,
       );
     }
 
     for item in contents {
       match item {
+        ContentItem::Reasoning { text } => {
+          pending_reasoning = replay.then_some(text);
+        }
         ContentItem::Message { role, content } => {
-          let message: ChatCompletionRequestMessage = if role == "user" {
-            ChatCompletionRequestUserMessageArgs::default()
-              .content(content)
-              .build()?
-              .into()
+          if role == "user" {
+            pending_reasoning = None;
+            wire.push(
+              ChatCompletionRequestUserMessageArgs::default()
+                .content(content)
+                .build()?,
+            );
           } else {
-            ChatCompletionRequestAssistantMessageArgs::default()
-              .content(content)
-              .build()?
-              .into()
-          };
-          messages.push(message);
+            wire.push(
+              ChatCompletionRequestAssistantMessageArgs::default()
+                .content(content)
+                .build()?,
+            );
+            if let Some(text) = pending_reasoning.take() {
+              wire.attach_reasoning_to_last(text);
+            }
+          }
         }
         ContentItem::ToolCall {
           tool_call_id,
@@ -2064,15 +2161,20 @@ impl Agent {
             },
           });
 
-          if let Some(ChatCompletionRequestMessage::Assistant(last)) = messages.last_mut() {
+          if let Some(ChatCompletionRequestMessage::Assistant(last)) = wire.messages.last_mut() {
             last.tool_calls.get_or_insert_with(Vec::new).push(tool_call);
+            // The message this joins already took its own reasoning (it precedes the
+            // text); a second one here has no message of its own to go with.
+            pending_reasoning = None;
           } else {
-            messages.push(
+            wire.push(
               ChatCompletionRequestAssistantMessageArgs::default()
                 .tool_calls(vec![tool_call])
-                .build()?
-                .into(),
+                .build()?,
             );
+            if let Some(text) = pending_reasoning.take() {
+              wire.attach_reasoning_to_last(text);
+            }
           }
         }
         ContentItem::ToolResult {
@@ -2080,18 +2182,18 @@ impl Agent {
           content,
           ..
         } => {
-          messages.push(
+          pending_reasoning = None;
+          wire.push(
             ChatCompletionRequestToolMessageArgs::default()
               .tool_call_id(tool_call_id)
               .content(content)
-              .build()?
-              .into(),
+              .build()?,
           );
         }
       }
     }
 
-    Ok(messages)
+    Ok(wire)
   }
 }
 
@@ -2108,3 +2210,8 @@ fn tool_rounds_remaining(current_step: u32, max_steps: u32) -> bool {
 /// its tests together no longer fit comfortably in one file to read through.
 #[cfg(test)]
 mod tests;
+
+/// End-to-end runs against a scripted in-process [`crate::llm::backend::ChatBackend`]:
+/// reasoning and model settings, which need a model that actually answers.
+#[cfg(test)]
+mod model_tests;

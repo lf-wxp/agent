@@ -735,13 +735,16 @@ fn to_history_entry(event: Event) -> HistoryEntry {
     content: event
       .content
       .into_iter()
-      .map(to_history_content_item)
+      .filter_map(to_history_content_item)
       .collect(),
   }
 }
 
-fn to_history_content_item(item: ContentItem) -> HistoryContentItem {
-  match item {
+/// `None` for a [`ContentItem::Reasoning`]: like [`AgentStreamEvent::Reasoning`], it is not
+/// shown in either front-end yet (there is no `HistoryContentItem` for it), and the
+/// transcript only holds it when `LLM_REPLAY_REASONING` is on.
+fn to_history_content_item(item: ContentItem) -> Option<HistoryContentItem> {
+  Some(match item {
     ContentItem::Message { role, content } => HistoryContentItem::Message { role, content },
     ContentItem::ToolCall {
       tool_call_id,
@@ -763,10 +766,12 @@ fn to_history_content_item(item: ContentItem) -> HistoryContentItem {
       status: to_tool_status(status),
       content,
     },
-  }
+    ContentItem::Reasoning { .. } => return None,
+  })
 }
 
 /// Every [`AgentStreamEvent`] variant maps to exactly one [`ChatEvent`], except
+/// [`AgentStreamEvent::Reasoning`], which maps to none (see its arm), and
 /// [`AgentStreamEvent::ToolCallsStarted`]/[`AgentStreamEvent::ToolCallsFinished`], whose
 /// [`ContentItem`]s are always [`ContentItem::ToolCall`]/[`ContentItem::ToolResult`] by
 /// construction (see `Agent::record_tool_calls`/`Agent::execute_tool_calls`) — returning
@@ -785,6 +790,10 @@ fn to_history_content_item(item: ContentItem) -> HistoryContentItem {
 pub(crate) fn to_chat_events(event: &AgentStreamEvent, turn: &str) -> Vec<ChatEvent> {
   match event {
     AgentStreamEvent::Token(text) => vec![ChatEvent::Token { text: text.clone() }],
+    // Not shown in either front-end yet: there is no `ChatEvent` for it, and adding one
+    // means a front-end rebuild for every open tab (see `crates/shared`). Dropping it
+    // here loses nothing persistent — reasoning is never part of the transcript.
+    AgentStreamEvent::Reasoning(_) => Vec::new(),
     AgentStreamEvent::ToolCallsStarted(items) => vec![ChatEvent::ToolCallsStarted {
       calls: items
         .iter()

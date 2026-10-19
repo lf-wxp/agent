@@ -212,6 +212,7 @@ fn describe(item: &ContentItem) -> String {
     ContentItem::ToolResult { name, content, .. } => {
       format!("[tool result] {name} -> {}", preview(content))
     }
+    ContentItem::Reasoning { text } => format!("[reasoning] {}", preview(text)),
   }
 }
 

@@ -69,8 +69,8 @@ use std::{
 };
 
 use async_openai::types::chat::{
-  ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-  CreateChatCompletionRequestArgs,
+  ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
+  ChatCompletionRequestUserMessageArgs,
 };
 
 use crate::{
@@ -79,8 +79,10 @@ use crate::{
   },
   callback::context_optimizer::safety::find_safe_start,
   llm::{
+    client::request_builder,
     provider::Provider,
     retry::{is_transient, with_retry},
+    settings::ModelSettings,
   },
 };
 
@@ -376,25 +378,31 @@ impl Summarization {
       }
     );
 
+    // The configured settings are written for the agent's model, which this call may not
+    // share a taste in sampling with — but the field that carries the output cap has to
+    // match what the provider accepts (`LLM_TOKEN_LIMIT_FIELD`), or every summary is
+    // rejected and compaction quietly stops working. So: the cap's field, this stage's
+    // own cap, and nothing else.
+    let settings = ModelSettings {
+      max_tokens: SUMMARY_MAX_TOKENS,
+      ..ModelSettings::from_config().cap_only()
+    };
+
     let response = with_retry(
       || async {
-        let request = CreateChatCompletionRequestArgs::default()
-          .model(self.model.clone())
-          .messages(vec![
-            ChatCompletionRequestSystemMessageArgs::default()
-              .content(SUMMARIZATION_SYSTEM_PROMPT)
-              .build()?
-              .into(),
-            ChatCompletionRequestUserMessageArgs::default()
-              .content(material.as_str())
-              .build()?
-              .into(),
-          ])
-          .max_tokens(SUMMARY_MAX_TOKENS)
-          .build()?;
+        let messages: Vec<ChatCompletionRequestMessage> = vec![
+          ChatCompletionRequestSystemMessageArgs::default()
+            .content(SUMMARIZATION_SYSTEM_PROMPT)
+            .build()?
+            .into(),
+          ChatCompletionRequestUserMessageArgs::default()
+            .content(material.as_str())
+            .build()?
+            .into(),
+        ];
+        let builder = request_builder(&self.model, messages, &settings, &[]);
 
-        let _permit = self.provider.acquire().await?;
-        let response = self.provider.client().chat().create(request).await?;
+        let response = self.provider.chat(builder.chat_request()?).await?.response;
         anyhow::Ok(response)
       },
       is_transient,
@@ -459,6 +467,10 @@ fn head_fingerprint(contents: &[ContentItem]) -> u64 {
       tool_call_id.hash(&mut hasher);
       name.hash(&mut hasher);
     }
+    Some(ContentItem::Reasoning { text }) => {
+      4u8.hash(&mut hasher);
+      text.hash(&mut hasher);
+    }
     None => 3u8.hash(&mut hasher),
   }
   hasher.finish()
@@ -472,18 +484,21 @@ fn head_fingerprint(contents: &[ContentItem]) -> u64 {
 fn format_history(items: &[ContentItem]) -> String {
   items
     .iter()
-    .map(|item| match item {
+    .filter_map(|item| match item {
       ContentItem::Message { role, content } => {
         let preview: String = content.chars().take(MESSAGE_PREVIEW_CHARS).collect();
-        format!("[{role}]: {preview}")
+        Some(format!("[{role}]: {preview}"))
       }
       ContentItem::ToolCall {
         name, arguments, ..
-      } => format!("[tool call]: {name}({arguments})"),
+      } => Some(format!("[tool call]: {name}({arguments})")),
       ContentItem::ToolResult { name, content, .. } => {
         let preview: String = content.chars().take(TOOL_RESULT_PREVIEW_CHARS).collect();
-        format!("[tool result]: {name} -> {preview}")
+        Some(format!("[tool result]: {name} -> {preview}"))
       }
+      // A chain of thought is not part of the conversation to recap: it is bulky, and the
+      // recap replaces it (and the messages it belongs to) in the request anyway.
+      ContentItem::Reasoning { .. } => None,
     })
     .collect::<Vec<_>>()
     .join("\n")

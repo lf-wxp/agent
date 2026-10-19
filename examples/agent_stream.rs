@@ -36,6 +36,8 @@ async fn main() -> anyhow::Result<()> {
     match event? {
       // Printed without a newline: chunks are meant to be concatenated as they arrive.
       AgentStreamEvent::Token(text) => print!("{text}"),
+      // Only reasoning models stream these, ahead of the answer; dimmed to tell them apart.
+      AgentStreamEvent::Reasoning(text) => print!("\x1b[2m{text}\x1b[0m"),
       AgentStreamEvent::ToolCallsStarted(calls) => {
         for call in &calls {
           if let agent::agent::ContentItem::ToolCall {

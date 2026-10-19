@@ -1,7 +1,7 @@
 [package]
 edition = "2024"
 name = "agent"
-version = "0.2.0"
+version = "0.3.0"
 
 # This crate is both a regular Cargo package (native, tokio/axum-based) and the root of a
 # workspace whose other members target `wasm32-unknown-unknown` (the Leptos web UI, see
@@ -16,7 +16,14 @@ resolver = "2"
 
 [dependencies]
 anyhow = "1.0.104"
-async-openai = { version = "0.42.2", features = ["chat-completion", "embedding"] }
+# `byot` adds raw-JSON variants of the chat calls (`create_byot` / `create_stream_byot`),
+# which is how `llm::backend` reads the non-standard `reasoning_content` field that the
+# typed responses have no slot for, and writes it back on replayed assistant messages.
+# Caveat: the feature is crate-wide, and with it on the *typed* `chat().create()` /
+# `create_stream()` no longer check or set `stream` themselves (`async-openai` compiles
+# that out). Nothing here calls them: `OpenAiCompatible` is the one place that talks to
+# the client, and sets `stream` itself. Keep it that way.
+async-openai = { version = "0.42.2", features = ["byot", "chat-completion", "embedding"] }
 async-stream = "0.3.6"
 async-trait = "0.1.92"
 axum = "0.8.9"

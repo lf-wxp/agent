@@ -15,6 +15,17 @@ pub enum ContentItem {
     arguments: Value,
   },
 
+  /// The chain of thought behind the assistant message that follows it.
+  ///
+  /// Recorded only when [`crate::llm::settings::ModelSettings::replay_reasoning`] is on,
+  /// so the default transcript is unchanged. Providers that require it back (DeepSeek's
+  /// thinking mode does, whenever the request carries tools) get it as
+  /// `reasoning_content` on that assistant message; see
+  /// [`crate::agent::Agent::with_model_settings`]. It belongs to the *next* item, so
+  /// anything that cuts a transcript apart has to keep the two together.
+  #[serde(rename = "reasoning")]
+  Reasoning { text: String },
+
   #[serde(rename = "tool_result")]
   ToolResult {
     tool_call_id: String,

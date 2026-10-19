@@ -64,6 +64,7 @@ fn item_text(bpe: &CoreBPE, item: &ContentItem) -> usize {
       name, arguments, ..
     } => bpe.encode_ordinary(name).len() + bpe.encode_ordinary(&arguments.to_string()).len(),
     ContentItem::ToolResult { content, .. } => bpe.encode_ordinary(content).len(),
+    ContentItem::Reasoning { text } => bpe.encode_ordinary(text).len(),
   }
 }
 
@@ -93,6 +94,7 @@ pub fn item_cost_upper_bound(item: &ContentItem) -> usize {
       name, arguments, ..
     } => name.len() + json_len(arguments),
     ContentItem::ToolResult { content, .. } => content.len(),
+    ContentItem::Reasoning { text } => text.len(),
   };
   PER_MESSAGE_OVERHEAD + text
 }

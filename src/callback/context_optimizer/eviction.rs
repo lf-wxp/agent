@@ -28,12 +28,18 @@ use crate::{
 /// providers as a result kept without its call, and pinning a call would force its result
 /// to be pinned too — silently expanding the head far beyond what was asked for. Stopping
 /// short is the honest choice; in practice the head is the opening user message, so this
-/// never triggers.
+/// never triggers. A [`ContentItem::Reasoning`] is treated the same way, for the same
+/// reason: it belongs to the message after it, which would be left outside the head.
 fn safe_head_end(contents: &[ContentItem], keep_head: usize) -> usize {
   let limit = keep_head.min(contents.len());
   contents[..limit]
     .iter()
-    .position(|item| matches!(item, ContentItem::ToolCall { .. }))
+    .position(|item| {
+      matches!(
+        item,
+        ContentItem::ToolCall { .. } | ContentItem::Reasoning { .. }
+      )
+    })
     .unwrap_or(limit)
 }
 
@@ -279,7 +285,7 @@ mod tests {
           seen.contains(&tool_call_id.as_str()),
           "tool result {tool_call_id} was orphaned from its call"
         ),
-        ContentItem::Message { .. } => {}
+        ContentItem::Message { .. } | ContentItem::Reasoning { .. } => {}
       }
     }
 
@@ -461,9 +467,56 @@ mod tests {
           seen.contains(&tool_call_id.as_str()),
           "tool result {tool_call_id} was orphaned"
         ),
-        ContentItem::Message { .. } => {}
+        ContentItem::Message { .. } | ContentItem::Reasoning { .. } => {}
       }
     }
+  }
+
+  fn reasoning(text: &str) -> ContentItem {
+    ContentItem::Reasoning {
+      text: text.to_owned(),
+    }
+  }
+
+  /// With reasoning replayed, a tool round is `[Reasoning, ToolCall, ToolResult]`; the
+  /// surviving tail must never begin with a reasoning whose message was dropped, nor
+  /// start on a message whose reasoning was.
+  #[test]
+  fn reasoning_stays_with_the_message_it_precedes() {
+    let mut contents = vec![user_msg("the original task")];
+    for i in 0..30 {
+      contents.push(reasoning(&format!("thinking {i}")));
+      contents.extend(tool_pair(&format!("call_{i}"), &"result ".repeat(300)));
+    }
+
+    evict_middle(&mut contents, 3_000, 1, 2);
+
+    for (at, item) in contents.iter().enumerate() {
+      match item {
+        ContentItem::Reasoning { .. } => assert!(
+          matches!(contents.get(at + 1), Some(ContentItem::ToolCall { .. })),
+          "a reasoning was left without its message at {at}"
+        ),
+        ContentItem::ToolCall { .. } => assert!(
+          at == 0 || matches!(contents[at - 1], ContentItem::Reasoning { .. }),
+          "a message lost its reasoning at {at}"
+        ),
+        _ => {}
+      }
+    }
+    assert!(contents.len() < 61, "something should have been evicted");
+  }
+
+  /// A pinned head is cut short rather than separate a reasoning from its message.
+  #[test]
+  fn the_head_stops_before_a_reasoning() {
+    let contents = vec![
+      user_msg("task"),
+      reasoning("thinking"),
+      assistant_msg("done"),
+    ];
+    assert_eq!(safe_head_end(&contents, 2), 1);
+    assert_eq!(safe_head_end(&contents, 1), 1);
   }
 
   #[test]

@@ -14,7 +14,8 @@ use std::collections::HashMap;
 
 use crate::agent::ContentItem;
 
-/// Move `start` earlier until nothing in `contents[start..]` is an orphaned tool result.
+/// Move `start` earlier until nothing in `contents[start..]` is an orphaned tool result,
+/// and no [`ContentItem::Reasoning`] is cut off from the message it precedes.
 ///
 /// Returns the earliest index at or before `start` from which the conversation can be
 /// kept without separating any tool result from its call. When a result's call cannot be
@@ -56,6 +57,16 @@ pub fn find_safe_start(contents: &[ContentItem], start: usize) -> usize {
     {
       safe = call_at;
     }
+  }
+
+  // A chain of thought belongs to the message after it, and a provider that wants it
+  // back (see `ModelSettings::replay_reasoning`) rejects an assistant message that
+  // arrives without it. So a cut may not fall between the two. Done after the pass
+  // above, since that pass can land `safe` on a call whose reasoning sits just before it;
+  // and it only ever keeps more, never a result whose call is missing, because what it
+  // pulls in is reasoning alone.
+  while safe > 0 && matches!(contents[safe - 1], ContentItem::Reasoning { .. }) {
+    safe -= 1;
   }
 
   safe
@@ -113,6 +124,29 @@ mod tests {
     // Cutting at 2 would keep `result(a)` while dropping `call(a)`.
     let contents = vec![msg("hi"), call("a"), result("a")];
     assert_eq!(find_safe_start(&contents, 2), 1);
+  }
+
+  fn thought(text: &str) -> ContentItem {
+    ContentItem::Reasoning {
+      text: text.to_owned(),
+    }
+  }
+
+  /// A cut right after a reasoning would keep the message and drop its chain of thought.
+  #[test]
+  fn does_not_cut_between_a_reasoning_and_its_message() {
+    let contents = vec![msg("hi"), thought("hmm"), call("a"), result("a")];
+    assert_eq!(
+      find_safe_start(&contents, 2),
+      1,
+      "the reasoning comes along"
+    );
+    assert_eq!(find_safe_start(&contents, 1), 1, "already before it");
+    assert_eq!(
+      find_safe_start(&contents, 3),
+      1,
+      "result -> call -> reasoning"
+    );
   }
 
   #[test]

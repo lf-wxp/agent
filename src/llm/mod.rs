@@ -1,8 +1,10 @@
+pub mod backend;
 pub mod client;
 pub mod complete;
 pub mod provider;
 pub mod retry;
 pub mod schema;
+pub mod settings;
 pub mod stream;
 pub mod structured;
 pub mod tool_calls;

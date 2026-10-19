@@ -338,7 +338,7 @@ async fn all_three_stages_together_reach_the_budget() {
         seen.contains(tool_call_id),
         "tool result {tool_call_id} was orphaned"
       ),
-      ContentItem::Message { .. } => {}
+      ContentItem::Message { .. } | ContentItem::Reasoning { .. } => {}
     }
   }
 }

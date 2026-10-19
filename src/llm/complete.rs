@@ -1,7 +1,8 @@
 use crate::{
   llm::{
-    client::{DEFAULT_MAX_TOKENS, build_messages, ensure_valid_params},
+    client::{build_messages, ensure_valid_params},
     provider::Provider,
+    settings::ModelSettings,
     tool_loop,
   },
   tools::ToolRegistry,
@@ -14,7 +15,8 @@ use crate::{
 /// the caller needs to react to it programmatically.
 ///
 /// `provider` selects which tenant's credentials and concurrency budget the request is
-/// charged against; pass [`Provider::shared`] for the single-tenant default.
+/// charged against; pass [`Provider::shared`] for the single-tenant default. Requests use
+/// the configured [`ModelSettings::from_config`].
 pub async fn chat_complete(
   provider: &Provider,
   model: &str,
@@ -29,7 +31,7 @@ pub async fn chat_complete(
     model,
     build_messages(system, prompt)?,
     registry,
-    DEFAULT_MAX_TOKENS,
+    &ModelSettings::from_config(),
     None,
   )
   .await?;

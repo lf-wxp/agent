@@ -16,6 +16,7 @@ use crate::{
     client::{build_messages, ensure_valid_params},
     provider::Provider,
     schema::{merge_system, native_schema_format, schema_instruction, strip_code_fence},
+    settings::ModelSettings,
     tool_loop::{self, BudgetExhausted},
   },
   tools::ToolRegistry,
@@ -84,12 +85,18 @@ impl StructuredMode {
     }
   }
 
-  /// Output token budget for this mode.
+  /// Output token budget for this mode — a floor, raised further by a larger configured
+  /// [`ModelSettings::max_tokens`] (see [`ModelSettings::at_least`]).
   pub fn max_tokens(self) -> u32 {
     match self {
       Self::NativeSchema => NATIVE_SCHEMA_MAX_TOKENS,
       Self::JsonObject => JSON_OBJECT_MAX_TOKENS,
     }
+  }
+
+  /// `settings` with the output cap raised to at least this mode's budget.
+  pub fn settings(self, settings: &ModelSettings) -> ModelSettings {
+    settings.at_least(self.max_tokens())
   }
 }
 
@@ -134,6 +141,8 @@ impl std::error::Error for TruncatedOutput {}
 pub struct StructuredChoice {
   choice: ChatChoice,
   mode: StructuredMode,
+  /// The output cap the request was actually sent with, for an accurate truncation error.
+  limit: u32,
   budget_exhausted: bool,
 }
 
@@ -163,12 +172,7 @@ impl StructuredChoice {
     // When truncated by max_tokens the JSON is necessarily incomplete (under reasoning models content is often empty);
     // throw a dedicated error up front to avoid degrading into the cryptic "EOF while parsing a value".
     if finish_reason == Some(FinishReason::Length) {
-      return Err(
-        TruncatedOutput {
-          limit: self.mode.max_tokens(),
-        }
-        .into(),
-      );
+      return Err(TruncatedOutput { limit: self.limit }.into());
     }
 
     let content = self
@@ -233,12 +237,13 @@ pub async fn chat_complete_structured_raw<T: JsonSchema>(
 
   // Goes through the tool loop so a structured request can also use tools: without it the
   // model's tool call would leave `content` empty and surface as a bogus parse error.
+  let settings = mode.settings(&ModelSettings::from_config());
   let completion = tool_loop::run(
     provider,
     model,
     build_messages(system_content.as_deref(), prompt)?,
     registry,
-    mode.max_tokens(),
+    &settings,
     Some(response_format),
   )
   .await?;
@@ -246,6 +251,7 @@ pub async fn chat_complete_structured_raw<T: JsonSchema>(
   Ok(StructuredChoice {
     choice: completion.choice,
     mode,
+    limit: settings.max_tokens,
     budget_exhausted: completion.budget_exhausted,
   })
 }

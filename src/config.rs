@@ -63,6 +63,25 @@ const ENV_TOOL_TIMEOUT_SECS: &str = "AGENT_TOOL_TIMEOUT_SECS";
 /// Environment variable: tool calls of one round that may execute at the same time.
 const ENV_TOOL_MAX_CONCURRENCY: &str = "AGENT_TOOL_MAX_CONCURRENCY";
 
+/// Environment variable: output token cap of one ordinary model request.
+const ENV_MAX_OUTPUT_TOKENS: &str = "LLM_MAX_TOKENS";
+
+/// Environment variable: sampling temperature, `0`..=`2`.
+const ENV_TEMPERATURE: &str = "LLM_TEMPERATURE";
+
+/// Environment variable: nucleus sampling `top_p`, `0`..=`1`.
+const ENV_TOP_P: &str = "LLM_TOP_P";
+
+/// Environment variable: `reasoning_effort` sent to reasoning models, e.g. `low` / `high`.
+const ENV_REASONING_EFFORT: &str = "LLM_REASONING_EFFORT";
+
+/// Environment variable: which request field carries the output cap, `max_tokens` or
+/// `max_completion_tokens`.
+const ENV_TOKEN_LIMIT_FIELD: &str = "LLM_TOKEN_LIMIT_FIELD";
+
+/// Environment variable: send earlier turns' chain of thought back to the model.
+const ENV_REPLAY_REASONING: &str = "LLM_REPLAY_REASONING";
+
 /// Environment variable: Tavily API key, used by the `web_search` tool.
 const ENV_TAVILY_API_KEY: &str = "TAVILY_API_KEY";
 
@@ -281,7 +300,7 @@ pub fn cli_web_dist_dir() -> PathBuf {
 ///
 /// This is the budget for the *request*, and the model's context window has to hold the
 /// request **plus** the answer it generates. Nothing here checks that: raising this past
-/// `window - `[`crate::llm::client::DEFAULT_MAX_TOKENS`] (or past the tighter ceiling the
+/// `window - `[`crate::llm::settings::ModelSettings::max_tokens`] (or past the tighter ceiling the
 /// structured routes of [`crate::agent::Agent`] apply) leaves a request that fits on its
 /// own and still overflows once the model starts writing. Tool definitions come out of the
 /// same window and are not counted either, so a large toolbox wants more headroom still.
@@ -306,6 +325,53 @@ pub fn tool_timeout() -> Duration {
 /// default.
 pub fn tool_max_concurrency() -> usize {
   parsed_var_nonzero(ENV_TOOL_MAX_CONCURRENCY, DEFAULT_TOOL_MAX_CONCURRENCY)
+}
+
+/// Output token cap of one ordinary model request, when configured. Override with
+/// `LLM_MAX_TOKENS`; `None` when unset or invalid (non-numeric or 0, which is logged),
+/// leaving the caller to its own default (see
+/// [`crate::llm::settings::ModelSettings::from_config`]).
+pub fn max_output_tokens() -> Option<u32> {
+  match parsed_var_opt::<u32>(ENV_MAX_OUTPUT_TOKENS)? {
+    0 => {
+      tracing::warn!("ignoring {ENV_MAX_OUTPUT_TOKENS}: must be greater than 0");
+      None
+    }
+    value => Some(value),
+  }
+}
+
+/// Sampling temperature, when configured (`LLM_TEMPERATURE`). Raw: the range check
+/// lives with the type that sends it, [`crate::llm::settings::ModelSettings`]. A value
+/// that is not a number is logged and treated as unset.
+pub fn temperature() -> Option<f32> {
+  parsed_var_opt(ENV_TEMPERATURE)
+}
+
+/// Nucleus sampling `top_p`, when configured (`LLM_TOP_P`). Raw, like [`temperature`].
+pub fn top_p() -> Option<f32> {
+  parsed_var_opt(ENV_TOP_P)
+}
+
+/// Whether the chain of thought of earlier assistant turns is sent back to the model
+/// (`LLM_REPLAY_REASONING`). Off unless set: only providers that require it (DeepSeek's
+/// thinking mode with tools) accept the extra field, and others reject it.
+pub fn replay_reasoning() -> bool {
+  parse_bool_var(ENV_REPLAY_REASONING).unwrap_or(false)
+}
+
+/// `reasoning_effort` to send, when configured (`LLM_REASONING_EFFORT`).
+///
+/// A raw string for the same reason as [`structured_mode_override`]: the `llm` layer
+/// parses it, so this module does not depend on the request types.
+pub fn reasoning_effort_override() -> Option<String> {
+  non_empty_var(ENV_REASONING_EFFORT)
+}
+
+/// Which request field carries the output cap, when configured
+/// (`LLM_TOKEN_LIMIT_FIELD`). Raw, like [`reasoning_effort_override`].
+pub fn token_limit_field_override() -> Option<String> {
+  non_empty_var(ENV_TOKEN_LIMIT_FIELD)
 }
 
 /// Tavily API key used by the `web_search` tool. `None` when unset.
@@ -402,6 +468,19 @@ fn parsed_var_nonzero<T: FromStr + PartialEq + Default>(key: &str, default: T) -
     .and_then(|value| value.parse::<T>().ok())
     .filter(|value| *value != T::default())
     .unwrap_or(default)
+}
+
+/// Parse an env var that has no sensible default of its own: `None` when unset or blank,
+/// and also — after a warning, so a typo does not silently do nothing — when unparseable.
+fn parsed_var_opt<T: FromStr>(key: &str) -> Option<T> {
+  let raw = non_empty_var(key)?;
+  match raw.parse::<T>() {
+    Ok(value) => Some(value),
+    Err(_) => {
+      tracing::warn!("ignoring {key}: `{raw}` is not a valid value");
+      None
+    }
+  }
 }
 
 /// Parse a boolean-ish env var; unrecognized values are treated as unset (returns `None`).
@@ -519,6 +598,35 @@ mod tests {
     assert_eq!(
       parsed_var_nonzero::<usize>("AGENT_TEST_PARSED_VAR_NONZERO_UNSET", 7),
       7
+    );
+  }
+
+  /// A setting with no default of its own is simply absent when unset, blank or
+  /// unparseable (the last also logs, which is the point of the helper) — never a panic,
+  /// and never a silently different value.
+  #[test]
+  fn parsed_var_opt_is_none_unless_the_value_parses() {
+    assert_eq!(
+      parsed_var_opt::<f32>("AGENT_TEST_PARSED_VAR_OPT_UNSET"),
+      None
+    );
+
+    unsafe { std::env::set_var("AGENT_TEST_PARSED_VAR_OPT_BLANK", "   ") };
+    assert_eq!(
+      parsed_var_opt::<f32>("AGENT_TEST_PARSED_VAR_OPT_BLANK"),
+      None
+    );
+
+    unsafe { std::env::set_var("AGENT_TEST_PARSED_VAR_OPT_JUNK", "warm") };
+    assert_eq!(
+      parsed_var_opt::<f32>("AGENT_TEST_PARSED_VAR_OPT_JUNK"),
+      None
+    );
+
+    unsafe { std::env::set_var("AGENT_TEST_PARSED_VAR_OPT_VALUE", " 0.7 ") };
+    assert_eq!(
+      parsed_var_opt::<f32>("AGENT_TEST_PARSED_VAR_OPT_VALUE"),
+      Some(0.7)
     );
   }
 }

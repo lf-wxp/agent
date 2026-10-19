@@ -17,9 +17,11 @@ use futures::future::join_all;
 use crate::{
   config,
   llm::{
-    client::{first_choice, request_builder},
+    backend::ChatResponse,
+    client::{WireMessages, first_choice, request_builder},
     provider::Provider,
     retry::{is_transient, with_retry},
+    settings::ModelSettings,
   },
   tools::{ToolRegistry, schedule},
   util::truncate_chars,
@@ -30,13 +32,20 @@ use crate::{
 const TOOL_LOG_PREVIEW_CHARS: usize = 500;
 
 /// The outcome of a tool-enabled completion.
+///
+/// `#[non_exhaustive]`: it only ever comes out of [`run`], and a field added later (as
+/// `reasoning` was) should not break code that reads one.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Completion {
   pub choice: ChatChoice,
   /// `true` when the round budget ran out and the answer was produced with tools
   /// disabled, i.e. the model had to work from partial information. Callers may want
   /// to treat such answers as lower confidence, or report them separately.
   pub budget_exhausted: bool,
+  /// The chain of thought behind [`Self::choice`], when the provider returns one (see
+  /// [`crate::llm::backend`]).
+  pub reasoning: Option<String>,
 }
 
 /// Marker attached to failures that happened after the tool budget was spent.
@@ -66,20 +75,28 @@ impl fmt::Display for BudgetExhausted {
 /// built from the results already gathered instead of losing all of that work. That case
 /// is flagged through [`Completion::budget_exhausted`].
 ///
-/// `provider` supplies both the credentials for the model call and the concurrency slot
-/// it is charged against (see [`Provider::acquire`]) — held only for the duration of that
-/// one call, not the whole loop, so time spent running tools does not also block other
+/// `provider` supplies both the backend for the model call and the concurrency slot it
+/// is charged against (see [`Provider::chat`]) — held only for the duration of that one
+/// call, not the whole loop, so time spent running tools does not also block other
 /// callers sharing the same provider from reaching the model.
+///
+/// `settings` is applied to every request the loop sends (see [`ModelSettings`]).
+///
+/// With [`ModelSettings::replay_reasoning`] on, each tool round's chain of thought is kept
+/// for the rounds after it *within this call* and sent back with the assistant message
+/// it belongs to — what a provider such as DeepSeek's thinking mode demands when tools
+/// are on offer. The call returns no transcript, so nothing outlives it.
 pub async fn run(
   provider: &Provider,
   model: &str,
-  mut messages: Vec<ChatCompletionRequestMessage>,
+  messages: Vec<ChatCompletionRequestMessage>,
   registry: &ToolRegistry,
-  max_tokens: u32,
+  settings: &ModelSettings,
   response_format: Option<ResponseFormat>,
 ) -> anyhow::Result<Completion> {
   let max_rounds = config::max_tool_rounds();
   let mut round: usize = 0;
+  let mut wire = WireMessages::from(messages);
 
   loop {
     let tools_allowed = round < max_rounds;
@@ -87,7 +104,7 @@ pub async fn run(
     // no loop to exhaust, so the flag must stay false.
     let budget_exhausted = !tools_allowed && !registry.is_empty();
 
-    let mut builder = request_builder(model, messages.clone(), max_tokens, registry.definitions());
+    let mut builder = request_builder(model, wire.clone(), settings, registry.definitions());
     if let Some(response_format) = response_format.clone() {
       builder.response_format(response_format);
     }
@@ -106,12 +123,11 @@ pub async fn run(
     // `is_transient` filters out the deterministic ones — a rejected key or a malformed
     // request fails identically on every attempt, so retrying only spends the budget and
     // delays the real error.
-    let response = with_retry(
-      || async {
-        let _permit = provider.acquire().await?;
-        let response = provider.client().chat().create(builder.build()?).await?;
-        anyhow::Ok(response)
-      },
+    let ChatResponse {
+      response,
+      reasoning,
+    } = with_retry(
+      || async { provider.chat(builder.chat_request()?).await },
       is_transient,
     )
     .await?;
@@ -131,6 +147,7 @@ pub async fn run(
       return Ok(Completion {
         choice,
         budget_exhausted,
+        reasoning,
       });
     };
 
@@ -141,11 +158,20 @@ pub async fn run(
       return Ok(Completion {
         choice,
         budget_exhausted,
+        reasoning,
       });
     }
 
     round += 1;
-    append_tool_results(registry, &mut messages, tool_calls, choice.message.content).await?;
+    let replay = reasoning.filter(|_| settings.replay_reasoning);
+    append_tool_results(
+      registry,
+      &mut wire,
+      tool_calls,
+      choice.message.content,
+      replay,
+    )
+    .await?;
   }
 }
 
@@ -171,11 +197,16 @@ pub(crate) fn disable_tools(
 /// The assistant message must come first, and **every** tool call needs a matching tool
 /// message — even a failing or unsupported one: the API rejects a follow-up request that
 /// leaves a `tool_call_id` unanswered.
+///
+/// `reasoning`, when given, is sent back with that assistant message (see
+/// [`WireMessages`]); callers pass it only when
+/// [`ModelSettings::replay_reasoning`] is on.
 pub(crate) async fn append_tool_results(
   registry: &ToolRegistry,
-  messages: &mut Vec<ChatCompletionRequestMessage>,
+  wire: &mut WireMessages,
   tool_calls: Vec<ChatCompletionMessageToolCalls>,
   assistant_text: Option<String>,
+  reasoning: Option<String>,
 ) -> anyhow::Result<()> {
   let mut assistant = ChatCompletionRequestAssistantMessageArgs::default();
   assistant.tool_calls(tool_calls.clone());
@@ -183,7 +214,10 @@ pub(crate) async fn append_tool_results(
   if let Some(text) = assistant_text.filter(|text| !text.trim().is_empty()) {
     assistant.content(text);
   }
-  messages.push(assistant.build()?.into());
+  wire.push(assistant.build()?);
+  if let Some(text) = reasoning.filter(|text| !text.trim().is_empty()) {
+    wire.attach_reasoning_to_last(text);
+  }
 
   // Independent tool calls in the same round are executed concurrently: sequential
   // awaits would otherwise add up their network latency instead of overlapping it.
@@ -214,12 +248,11 @@ pub(crate) async fn append_tool_results(
   .await;
 
   for (id, result) in results {
-    messages.push(
+    wire.push(
       ChatCompletionRequestToolMessageArgs::default()
         .tool_call_id(id)
         .content(result)
-        .build()?
-        .into(),
+        .build()?,
     );
   }
 
@@ -285,7 +318,7 @@ mod tests {
 
   #[test]
   fn disable_tools_is_noop_without_any_tools() {
-    let mut builder = request_builder("gpt-test", Vec::new(), 16, &[]);
+    let mut builder = request_builder("gpt-test", Vec::new(), &ModelSettings::default(), &[]);
     disable_tools(&mut builder, &[]);
     let request = builder.build().unwrap();
     assert_eq!(request.tool_choice, None);
@@ -294,7 +327,12 @@ mod tests {
   #[test]
   fn disable_tools_pins_choice_to_none_when_tools_are_present() {
     let registry = ToolRegistry::builtin().unwrap();
-    let mut builder = request_builder("gpt-test", Vec::new(), 16, registry.definitions());
+    let mut builder = request_builder(
+      "gpt-test",
+      Vec::new(),
+      &ModelSettings::default(),
+      registry.definitions(),
+    );
     disable_tools(&mut builder, registry.definitions());
     let request = builder.build().unwrap();
     assert_eq!(
@@ -311,7 +349,7 @@ mod tests {
   async fn append_tool_results_pairs_every_call_with_a_tool_message() {
     let mut registry = ToolRegistry::empty();
     registry.add(std::sync::Arc::new(Calculator)).unwrap();
-    let mut messages = Vec::new();
+    let mut wire = WireMessages::default();
 
     let calls = vec![function_call(
       "call_1",
@@ -319,10 +357,11 @@ mod tests {
       r#"{"operator":"add","first_number":1,"second_number":2}"#,
     )];
 
-    append_tool_results(&registry, &mut messages, calls, None)
+    append_tool_results(&registry, &mut wire, calls, None, None)
       .await
       .unwrap();
 
+    let messages = &wire.messages;
     assert_eq!(messages.len(), 2, "assistant message + one tool message");
     assert!(matches!(
       messages[0],
@@ -332,24 +371,26 @@ mod tests {
       panic!("expected a tool message");
     };
     assert_eq!(tool_message.tool_call_id, "call_1");
+    assert!(wire.reasoning.is_empty(), "nothing to replay by default");
   }
 
   #[tokio::test]
   async fn append_tool_results_keeps_narration_alongside_the_tool_call() {
     let registry = ToolRegistry::empty();
-    let mut messages = Vec::new();
+    let mut wire = WireMessages::default();
 
     let calls = vec![function_call("call_1", "nope", "{}")];
     append_tool_results(
       &registry,
-      &mut messages,
+      &mut wire,
       calls,
       Some("let me check".to_owned()),
+      None,
     )
     .await
     .unwrap();
 
-    let ChatCompletionRequestMessage::Assistant(assistant) = &messages[0] else {
+    let ChatCompletionRequestMessage::Assistant(assistant) = &wire.messages[0] else {
       panic!("expected an assistant message");
     };
     assert_eq!(
@@ -363,17 +404,55 @@ mod tests {
   #[tokio::test]
   async fn append_tool_results_drops_blank_narration() {
     let registry = ToolRegistry::empty();
-    let mut messages = Vec::new();
+    let mut wire = WireMessages::default();
 
     let calls = vec![function_call("call_1", "nope", "{}")];
-    append_tool_results(&registry, &mut messages, calls, Some("   ".to_owned()))
+    append_tool_results(&registry, &mut wire, calls, Some("   ".to_owned()), None)
       .await
       .unwrap();
 
-    let ChatCompletionRequestMessage::Assistant(assistant) = &messages[0] else {
+    let ChatCompletionRequestMessage::Assistant(assistant) = &wire.messages[0] else {
       panic!("expected an assistant message");
     };
     assert!(assistant.content.is_none());
+  }
+
+  /// The reasoning rides with the assistant message that asked for the tools — index 1
+  /// here, behind a user message — and not with the tool messages after it.
+  #[tokio::test]
+  async fn append_tool_results_attaches_reasoning_to_the_assistant_message() {
+    let registry = ToolRegistry::empty();
+    let mut wire = WireMessages::from(crate::llm::client::build_messages(None, "hi").unwrap());
+
+    let calls = vec![function_call("call_1", "nope", "{}")];
+    append_tool_results(
+      &registry,
+      &mut wire,
+      calls,
+      None,
+      Some("check the file first".to_owned()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(wire.messages.len(), 3, "user + assistant + tool");
+    assert_eq!(
+      wire.reasoning,
+      vec![None, Some("check the file first".to_owned())]
+    );
+  }
+
+  #[tokio::test]
+  async fn append_tool_results_ignores_blank_reasoning() {
+    let registry = ToolRegistry::empty();
+    let mut wire = WireMessages::default();
+
+    let calls = vec![function_call("call_1", "nope", "{}")];
+    append_tool_results(&registry, &mut wire, calls, None, Some("  ".to_owned()))
+      .await
+      .unwrap();
+
+    assert!(wire.reasoning.is_empty());
   }
 
   #[tokio::test]
@@ -414,5 +493,102 @@ mod tests {
     assert_eq!(id, "call_1");
     assert!(result.contains("shell"), "got: {result}");
     assert!(result.contains("not supported"), "got: {result}");
+  }
+
+  /// Answers each request with the next scripted reply and records the body as sent.
+  struct ScriptedReplies {
+    replies: std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>,
+    seen: std::sync::Mutex<Vec<serde_json::Value>>,
+  }
+
+  #[async_trait::async_trait]
+  impl crate::llm::backend::ChatBackend for ScriptedReplies {
+    async fn create(
+      &self,
+      request: crate::llm::backend::ChatRequest,
+    ) -> anyhow::Result<ChatResponse> {
+      self.seen.lock().unwrap().push(request.to_body()?);
+      let reply = self.replies.lock().unwrap().pop_front().expect("scripted");
+      crate::llm::backend::parse_response(reply)
+    }
+
+    async fn create_stream(
+      &self,
+      _request: crate::llm::backend::ChatRequest,
+    ) -> anyhow::Result<crate::llm::backend::ChatChunkStream> {
+      anyhow::bail!("not used")
+    }
+  }
+
+  /// A tool round that carries reasoning, then an answer; returns the request bodies.
+  async fn run_two_rounds(settings: ModelSettings) -> Vec<serde_json::Value> {
+    use serde_json::json;
+
+    let reply = |message: serde_json::Value| {
+      json!({
+        "id": "x", "object": "chat.completion", "created": 0, "model": "m",
+        "choices": [{ "index": 0, "message": message, "finish_reason": "stop" }],
+      })
+    };
+    let backend = std::sync::Arc::new(ScriptedReplies {
+      replies: std::sync::Mutex::new(
+        [
+          reply(json!({
+            "role": "assistant", "content": null,
+            "reasoning_content": "add first",
+            "tool_calls": [{
+              "id": "call_1", "type": "function",
+              "function": {
+                "name": calculator::NAME,
+                "arguments": r#"{"operator":"add","first_number":2,"second_number":3}"#,
+              },
+            }],
+          })),
+          reply(json!({ "role": "assistant", "content": "5" })),
+        ]
+        .into(),
+      ),
+      seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let provider = Provider::with_backend(
+      std::sync::Arc::clone(&backend) as std::sync::Arc<dyn crate::llm::backend::ChatBackend>,
+      1,
+    );
+    let mut registry = ToolRegistry::empty();
+    registry.add(std::sync::Arc::new(Calculator)).unwrap();
+
+    let completion = run(
+      &provider,
+      "gpt-test",
+      crate::llm::client::build_messages(None, "add 2 and 3").unwrap(),
+      &registry,
+      &settings,
+      None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(completion.choice.message.content.as_deref(), Some("5"));
+
+    backend.seen.lock().unwrap().clone()
+  }
+
+  /// The stateless loop replays a round's reasoning to the rounds after it, when asked.
+  #[tokio::test]
+  async fn run_replays_a_rounds_reasoning_when_asked() {
+    let seen = run_two_rounds(ModelSettings {
+      replay_reasoning: true,
+      ..ModelSettings::default()
+    })
+    .await;
+
+    let messages = seen[1]["messages"].as_array().unwrap();
+    assert_eq!(messages[1]["reasoning_content"], "add first");
+    assert!(messages[2].get("reasoning_content").is_none());
+  }
+
+  #[tokio::test]
+  async fn run_does_not_replay_reasoning_by_default() {
+    let seen = run_two_rounds(ModelSettings::default()).await;
+    assert!(!seen[1].to_string().contains("reasoning_content"));
   }
 }

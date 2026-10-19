@@ -337,6 +337,15 @@ if let Err(err) = &result
 }
 ```
 
+**模型参数、推理内容与其他后端**：
+- `Agent::with_model_settings(ModelSettings { .. })` 设置输出上限、`temperature`、`top_p`、`reasoning_effort`，默认取自上表中的环境变量。
+- 对推理模型（DeepSeek、Qwen、Kimi、vLLM、OpenRouter 等），会读取它们返回的 `reasoning_content` / `reasoning`：
+  - 非流式：放在 `AgentResult::reasoning`，只含最终回答那一轮的推理；
+  - 流式：以 `AgentStreamEvent::Reasoning` 事件在回答之前推送。
+  - 推理内容默认**不写入对话记录**，也不会在后续请求里发回给模型。
+  - 有的提供商要求回传：DeepSeek 思考模式在请求带 `tools` 时，如果历史 assistant 消息没有带回 `reasoning_content`，会返回 400。此时设置 `LLM_REPLAY_REASONING=true`（或 `ModelSettings { replay_reasoning: true, .. }`）：对话记录会保存推理内容（`ContentItem::Reasoning`），每次请求把它连同所属的 assistant 消息一起发回去，同一次运行内、跨轮次、以及无状态的 `llm::*` 辅助函数都一样。对不接受该字段的提供商请保持关闭。
+- 对接非 OpenAI 兼容的后端时，实现 `llm::backend::ChatBackend`，再用 `Provider::with_backend(backend, 并发上限)` 包装；`Agent` 和其余代码无需改动。
+
 **结构化输出**（反序列化为 Rust 类型）：
 
 ```rust
@@ -397,6 +406,12 @@ agent.run_continuing(
 | `LLM_MAX_TOOL_ROUNDS` | `10` | 单次调用工具轮次预算 |
 | `LLM_MAX_RETRIES` | `3` | 单次模型请求失败后的重试次数（指数退避，`0` 关闭重试） |
 | `LLM_MAX_HISTORY_TOKENS` | `6000` | 多轮历史 token 软上限 |
+| `LLM_MAX_TOKENS` | `2048` | 单次普通请求的输出 token 上限（结构化输出会按需上调，但不会调低） |
+| `LLM_TOKEN_LIMIT_FIELD` | `max_tokens` | 输出上限放在哪个字段：`max_tokens`（多数兼容服务）或 `max_completion_tokens`（OpenAI 推理模型只认这个） |
+| `LLM_TEMPERATURE` | 不发送 | 采样温度，`0`–`2`；不设置时请求里不带这个字段（部分推理模型带了就报错） |
+| `LLM_TOP_P` | 不发送 | 核采样 `top_p`，`0`–`1` |
+| `LLM_REASONING_EFFORT` | 不发送 | 推理强度：`none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` |
+| `LLM_REPLAY_REASONING` | `false` | 把历史 assistant 消息的推理内容以 `reasoning_content` 发回（DeepSeek 思考模式带 tools 时必须；部分其他提供商会拒绝） |
 | `MCP_CONFIG_PATH` | `mcp.json` | MCP Server 配置路径 |
 | `AGENT_CLI_SESSION_DIR` | `.agent/sessions` | CLI 会话落盘目录 |
 | `AGENT_CLI_APPROVAL_DIR` | `.agent/approvals` | 挂起轮次的落盘目录（与会话目录分开：两者生命周期相反，清空历史不该顺手丢掉一个待批准的操作） |

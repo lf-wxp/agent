@@ -58,6 +58,22 @@ impl ToolRegistry {
   ///
   /// Use [`Self::builtin_all`] when the caller does supply that gate (as the CLI does),
   /// or [`Self::select`] to pick tools by name.
+  ///
+  /// # Model calls made by a tool
+  ///
+  /// `read_image` asks a vision model, and the registry cannot know which tenant it is
+  /// for: here (and in [`Self::builtin_all`] and [`Self::select`]) it goes through
+  /// [`crate::llm::provider::Provider::shared`], i.e. the credentials in the environment
+  /// — not through the
+  /// provider of whichever [`crate::agent::Agent`] the registry ends up in. A
+  /// multi-tenant caller leaves it out of the registry it builds (`select` with every
+  /// other name) and adds [`ReadImageTool::new`] with that tenant's provider, so image
+  /// requests are billed to, and rate-limited with, the right tenant:
+  ///
+  /// ```ignore
+  /// let mut registry = ToolRegistry::select(&["read_file".to_owned()])?;
+  /// registry.add(Arc::new(ReadImageTool::new(tenant_provider.clone())))?;
+  /// ```
   pub fn builtin() -> anyhow::Result<Self> {
     let mut registry = Self::empty();
     registry.add(Arc::new(Calculator))?;
@@ -66,7 +82,7 @@ impl ToolRegistry {
     registry.add(Arc::new(ListFileTool))?;
     registry.add(Arc::new(ReadFileTool))?;
     registry.add(Arc::new(UnzipFileTool))?;
-    registry.add(Arc::new(ReadImageTool))?;
+    registry.add(Arc::new(ReadImageTool::default()))?;
     registry.add(Arc::new(GrepTool))?;
     Ok(registry)
   }
@@ -104,7 +120,7 @@ impl ToolRegistry {
         file_list::NAME => Arc::new(ListFileTool),
         file_read::NAME => Arc::new(ReadFileTool),
         file_upzip::NAME => Arc::new(UnzipFileTool),
-        read_image::NAME => Arc::new(ReadImageTool),
+        read_image::NAME => Arc::new(ReadImageTool::default()),
         file_write::NAME => Arc::new(WriteFileTool),
         file_edit::NAME => Arc::new(EditFileTool),
         grep::NAME => Arc::new(GrepTool),

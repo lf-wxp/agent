@@ -34,12 +34,14 @@ use serde_json::Value;
 use crate::{
   config,
   llm::{
-    client::{DEFAULT_MAX_TOKENS, first_choice, request_builder},
+    backend::ChatResponse,
+    client::{WireMessages, first_choice, request_builder},
     schema::{
       FINAL_ANSWER_TOOL_NAME, final_answer_tool, final_answer_tool_from_schema,
       native_schema_format, native_schema_format_from_value, schema_instruction,
       schema_instruction_from_value, strip_code_fence, validate_schema_name,
     },
+    settings::DEFAULT_MAX_TOKENS,
     structured::{StructuredMode, TruncatedOutput},
     tool_loop::{BudgetExhausted, disable_tools},
   },
@@ -180,13 +182,21 @@ impl Agent {
       };
 
       let request = self.prepare_llm_request(&context).await;
-      let messages = self.build_messages(request)?;
-      let mut builder = request_builder(&self.model, messages, DEFAULT_MAX_TOKENS, definitions);
+      let wire = self.build_messages(request)?;
+      // This route's answer is a tool call that shares the output cap with a reasoning
+      // model's chain of thought, so the cap is a floor here, as on the other structured
+      // route: a configured `LLM_MAX_TOKENS` below the ordinary default would otherwise
+      // truncate the JSON this route used to have room for.
+      let settings = self.settings.at_least(DEFAULT_MAX_TOKENS);
+      let mut builder = request_builder(&self.model, wire, &settings, definitions);
       builder.tool_choice(ChatCompletionToolChoiceOption::Mode(
         ToolChoiceOptions::Required,
       ));
 
-      let response = self.complete(&builder).await?;
+      let ChatResponse {
+        response,
+        reasoning,
+      } = self.complete(&builder).await?;
       self.record_usage(&mut context, &response);
       let choice = first_choice(response)?;
 
@@ -196,7 +206,7 @@ impl Agent {
       if choice.finish_reason == Some(FinishReason::Length) {
         return Err(
           TruncatedOutput {
-            limit: DEFAULT_MAX_TOKENS,
+            limit: settings.max_tokens,
           }
           .into(),
         );
@@ -211,6 +221,7 @@ impl Agent {
         )
       })?;
 
+      self.record_reasoning(&mut context, reasoning.as_deref());
       self.record_tool_calls(&mut context, &tool_calls);
 
       let final_call = tool_calls.iter().find_map(|tool_call| match tool_call {
@@ -332,7 +343,7 @@ impl Agent {
       // model picks when to stop calling tools and answer, and if that round were
       // unconstrained it would reply in prose and fail to parse. On tool-calling rounds
       // `content` is empty anyway, so the constraint is harmless there.
-      let messages = match &schema_hint {
+      let wire = match &schema_hint {
         Some(hint) => self.messages_with_schema_hint(&context, hint).await?,
         None => {
           let request = self.prepare_llm_request(&context).await;
@@ -340,26 +351,26 @@ impl Agent {
         }
       };
       // Reasoning models keep `max_tokens` covering chain-of-thought + answer, so the
-      // structured budget applies here too (see `structured::JSON_OBJECT_MAX_TOKENS`).
-      let mut builder = request_builder(
-        &self.model,
-        messages,
-        mode.max_tokens(),
-        self.toolbox.definitions(),
-      );
+      // structured budget applies here too (see `structured::JSON_OBJECT_MAX_TOKENS`) —
+      // as a floor under the configured cap, never a ceiling over it.
+      let settings = mode.settings(&self.settings);
+      let mut builder = request_builder(&self.model, wire, &settings, self.toolbox.definitions());
       builder.response_format(response_format.clone());
       if !tools_allowed {
         disable_tools(&mut builder, self.toolbox.definitions());
       }
 
-      let response = self.complete(&builder).await?;
+      let ChatResponse {
+        response,
+        reasoning,
+      } = self.complete(&builder).await?;
       self.record_usage(&mut context, &response);
       let choice = first_choice(response)?;
 
       if choice.finish_reason == Some(FinishReason::Length) {
         return Err(
           TruncatedOutput {
-            limit: mode.max_tokens(),
+            limit: settings.max_tokens,
           }
           .into(),
         );
@@ -374,6 +385,7 @@ impl Agent {
           // rather than looping forever.
           tracing::warn!("model requested tools after they were disabled");
         } else {
+          self.record_reasoning(&mut context, reasoning.as_deref());
           // See `record_assistant_text`: the model often explains a call on the same
           // message it makes the call on.
           if let Some(text) = &message.content {
@@ -411,6 +423,7 @@ impl Agent {
         )
       })?;
 
+      self.record_reasoning(&mut context, reasoning.as_deref());
       self.record_final_answer(&mut context, &content);
 
       return Ok(StructuredAgentResult {
@@ -435,16 +448,15 @@ impl Agent {
     &self,
     context: &ExecutionContext,
     hint: &str,
-  ) -> anyhow::Result<Vec<async_openai::types::chat::ChatCompletionRequestMessage>> {
+  ) -> anyhow::Result<WireMessages> {
     let request = self.prepare_llm_request_with_trailer(context, hint).await;
-    let mut messages = self.build_messages(request)?;
-    messages.push(
+    let mut wire = self.build_messages(request)?;
+    wire.push(
       ChatCompletionRequestSystemMessageArgs::default()
         .content(hint)
-        .build()?
-        .into(),
+        .build()?,
     );
-    Ok(messages)
+    Ok(wire)
   }
 
   /// Record a structured final answer produced through the `final_answer` tool.

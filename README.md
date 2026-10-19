@@ -317,6 +317,8 @@ let result = agent.run_continuing(history, "What time did I just ask you to note
 
 **Cancellation and timeouts**: pass a `tokio_util::sync::CancellationToken` via `Conversation::with_cancellation(token)`. Once it fires, a model request in flight is abandoned, still-running tools are cut short and recorded as cancelled, and the run ends with an `agent::Cancelled` error carrying the transcript so far (downcast it and persist as usual). Use `AgentRunState::with_cancellation` when resuming. For a whole-run deadline, start a timer that calls `token.cancel()`. Per-tool timeout and concurrency: `Agent::with_tool_timeout` / `Agent::with_tool_concurrency`.
 
+**Model settings, reasoning and other backends**: `Agent::with_model_settings(ModelSettings { .. })` sets the output cap, `temperature`, `top_p` and `reasoning_effort` (defaults come from the environment variables in the table below). For reasoning models (DeepSeek, Qwen, Kimi, vLLM, OpenRouter, …) the `reasoning_content` / `reasoning` they return is surfaced as `AgentResult::reasoning` (the final round's) and, when streaming, as `AgentStreamEvent::Reasoning` events ahead of the answer; by default it is **not written to the transcript** and not sent back to the model. Some providers require it back — DeepSeek's thinking mode answers 400 when a request carries tools and earlier assistant messages arrive without their `reasoning_content` — so set `LLM_REPLAY_REASONING=true` (or `ModelSettings { replay_reasoning: true, .. }`): the transcript then records it (`ContentItem::Reasoning`) and each request sends it back with the assistant message it belongs to, within a run, across turns, and in the stateless `llm::*` helpers. Leave it off for providers that reject the field. To talk to a backend that is not OpenAI-compatible, implement `llm::backend::ChatBackend` and wrap it with `Provider::with_backend(backend, max_concurrency)` — `Agent` and everything else work unchanged.
+
 **Structured output** (deserialized into a Rust type):
 
 ```rust
@@ -377,6 +379,12 @@ Everything is read from environment variables (single entry point: [`src/config.
 | `LLM_MAX_TOOL_ROUNDS` | `10` | Tool-round budget for a single call |
 | `LLM_MAX_RETRIES` | `3` | Retries after a failed model request (exponential backoff, `0` disables) |
 | `LLM_MAX_HISTORY_TOKENS` | `6000` | Soft token cap for multi-turn history |
+| `LLM_MAX_TOKENS` | `2048` | Output token cap of one ordinary request (structured output raises it as needed, never lowers it) |
+| `LLM_TOKEN_LIMIT_FIELD` | `max_tokens` | Which field carries the cap: `max_tokens` (most compatible servers) or `max_completion_tokens` (the only one OpenAI's reasoning models accept) |
+| `LLM_TEMPERATURE` | not sent | Sampling temperature, `0`–`2`; left out of the request when unset (some reasoning models reject it) |
+| `LLM_TOP_P` | not sent | Nucleus sampling `top_p`, `0`–`1` |
+| `LLM_REASONING_EFFORT` | not sent | `none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` |
+| `LLM_REPLAY_REASONING` | `false` | Send earlier assistant turns' chain of thought back as `reasoning_content` (required by DeepSeek's thinking mode with tools; rejected by some other providers) |
 | `MCP_CONFIG_PATH` | `mcp.json` | Path to the MCP Server config |
 | `AGENT_CLI_SESSION_DIR` | `.agent/sessions` | Directory for persisted CLI sessions |
 | `AGENT_CLI_APPROVAL_DIR` | `.agent/approvals` | Directory for suspended turns (separate from sessions: the two have opposite lifecycles, and clearing history shouldn't also drop a pending operation) |

@@ -394,7 +394,7 @@ mod tests {
           seen.contains(&tool_call_id.as_str()),
           "tool result {tool_call_id} was orphaned"
         ),
-        ContentItem::Message { .. } => {}
+        ContentItem::Message { .. } | ContentItem::Reasoning { .. } => {}
       }
     }
   }

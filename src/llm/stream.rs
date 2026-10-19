@@ -4,9 +4,10 @@ use futures::{Stream, StreamExt};
 use crate::{
   config,
   llm::{
-    client::{DEFAULT_MAX_TOKENS, build_messages, ensure_valid_params, request_builder},
+    client::{WireMessages, build_messages, ensure_valid_params, request_builder},
     provider::Provider,
     retry::{is_transient, with_retry},
+    settings::ModelSettings,
     tool_calls::ToolCallAccumulator,
     tool_loop::{append_tool_results, disable_tools},
   },
@@ -18,31 +19,36 @@ use crate::{
 /// Tool calls are handled transparently: a streamed call is reassembled from its fragments,
 /// executed, and the conversation continues in a new stream, so the caller only ever sees
 /// the text of the final answer. Text emitted *before* a tool call is forwarded as well,
-/// since some models narrate what they are about to do.
+/// since some models narrate what they are about to do. Reasoning, if the model streams
+/// any, is not forwarded: this helper yields answer text only (see
+/// [`crate::agent::AgentStreamEvent::Reasoning`] for a stream that carries it).
 ///
 /// Same budget policy as [`crate::llm::tool_loop::run`]: when the round budget is spent,
 /// the last stream goes out with tools disabled so an answer still comes back. `provider`
-/// supplies the credentials and concurrency slot for each stream request (see
-/// [`Provider::acquire`]), held only while the stream for that one round is open.
+/// supplies the backend and concurrency slot for each stream request (see
+/// [`Provider::chat_stream`]), held only while the stream for that one round is opened.
+/// `settings` applies to every request, and with
+/// [`ModelSettings::replay_reasoning`] on each round's reasoning is sent back with the
+/// assistant message it belongs to.
 fn chat_stream<'a>(
   provider: &'a Provider,
   model: &'a str,
   system: Option<&'a str>,
   prompt: &'a str,
   registry: &'a ToolRegistry,
+  settings: &'a ModelSettings,
 ) -> impl Stream<Item = anyhow::Result<String>> + 'a {
   stream! {
     ensure_valid_params(model, prompt)?;
 
     let max_rounds = config::max_tool_rounds();
-    let mut messages = build_messages(system, prompt)?;
+    let mut wire = WireMessages::from(build_messages(system, prompt)?);
     let mut round: usize = 0;
 
     loop {
       let tools_allowed = round < max_rounds;
 
-      let mut builder =
-        request_builder(model, messages.clone(), DEFAULT_MAX_TOKENS, registry.definitions());
+      let mut builder = request_builder(model, wire.clone(), settings, registry.definitions());
       if !tools_allowed {
         disable_tools(&mut builder, registry.definitions());
         // Only worth warning about when tools were actually taken away.
@@ -50,14 +56,14 @@ fn chat_stream<'a>(
           tracing::warn!(max_rounds, "tool round budget spent; forcing a final answer");
         }
       }
-      let mut chunks = {
-        let _permit = provider.acquire().await?;
-        provider.client().chat().create_stream(builder.build()?).await?
-      };
+      let mut chunks = provider.chat_stream(builder.chat_request()?).await?;
 
       let mut accumulator = ToolCallAccumulator::default();
       // Kept so the assistant message we replay carries whatever the model said.
       let mut assistant_text = String::new();
+      // Not forwarded, but kept when the provider wants it back (see
+      // `ModelSettings::replay_reasoning`).
+      let mut reasoning = String::new();
 
       while let Some(chunk) = chunks.next().await {
         let chunk = match chunk {
@@ -65,10 +71,16 @@ fn chat_stream<'a>(
           // Abort instead of continuing: after a transport error the remaining
           // fragments would assemble into a truncated tool call.
           Err(err) => {
-            yield Err(err.into());
+            yield Err(err);
             return;
           }
         };
+        if settings.replay_reasoning
+          && let Some(text) = &chunk.reasoning
+        {
+          reasoning.push_str(text);
+        }
+        let chunk = chunk.chunk;
 
         let Some(choice) = chunk.choices.first() else {
           continue;
@@ -109,8 +121,14 @@ fn chat_stream<'a>(
         }
       };
 
-      if let Err(err) =
-        append_tool_results(registry, &mut messages, tool_calls, Some(assistant_text)).await
+      if let Err(err) = append_tool_results(
+        registry,
+        &mut wire,
+        tool_calls,
+        Some(assistant_text),
+        Some(reasoning),
+      )
+      .await
       {
         yield Err(err);
         return;
@@ -133,9 +151,10 @@ pub async fn chat_stream_with_retry(
   prompt: &str,
   registry: &ToolRegistry,
 ) -> anyhow::Result<String> {
+  let settings = ModelSettings::from_config();
   with_retry(
     || async {
-      let stream = chat_stream(provider, model, system, prompt, registry);
+      let stream = chat_stream(provider, model, system, prompt, registry, &settings);
       futures::pin_mut!(stream);
 
       let mut output = String::new();
@@ -155,4 +174,120 @@ pub async fn chat_stream_with_retry(
     is_transient,
   )
   .await
+}
+
+#[cfg(test)]
+mod tests {
+  use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+  };
+
+  use serde_json::{Value, json};
+
+  use super::*;
+  use crate::llm::backend::{ChatBackend, ChatChunkStream, ChatRequest, ChatResponse, parse_chunk};
+
+  /// Streams the next scripted round, and records every request body as sent.
+  struct ScriptedStreams {
+    rounds: Mutex<VecDeque<Vec<Value>>>,
+    seen: Mutex<Vec<Value>>,
+  }
+
+  #[async_trait::async_trait]
+  impl ChatBackend for ScriptedStreams {
+    async fn create(&self, _request: ChatRequest) -> anyhow::Result<ChatResponse> {
+      anyhow::bail!("not used")
+    }
+
+    async fn create_stream(&self, request: ChatRequest) -> anyhow::Result<ChatChunkStream> {
+      self.seen.lock().unwrap().push(request.to_body()?);
+      let chunks = self
+        .rounds
+        .lock()
+        .unwrap()
+        .pop_front()
+        .expect("the test scripted a round for every request");
+      Ok(Box::pin(futures::stream::iter(
+        chunks.into_iter().map(parse_chunk),
+      )))
+    }
+  }
+
+  fn chunk(delta: Value) -> Value {
+    json!({
+      "id": "chatcmpl-1",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "gpt-test",
+      "choices": [{ "index": 0, "delta": delta, "finish_reason": null }],
+    })
+  }
+
+  /// A tool round with streamed reasoning, then an answer; returns the request bodies.
+  async fn run_two_rounds(settings: ModelSettings) -> Vec<Value> {
+    let backend = Arc::new(ScriptedStreams {
+      rounds: Mutex::new(VecDeque::from([
+        vec![
+          chunk(json!({ "role": "assistant", "reasoning_content": "add " })),
+          chunk(json!({ "reasoning_content": "first" })),
+          chunk(json!({ "tool_calls": [{
+            "index": 0, "id": "call_1", "type": "function",
+            "function": {
+              "name": "calculator",
+              "arguments": r#"{"operator":"add","first_number":2,"second_number":3}"#,
+            },
+          }] })),
+        ],
+        vec![chunk(json!({ "content": "5" }))],
+      ])),
+      seen: Mutex::new(Vec::new()),
+    });
+    let provider = Provider::with_backend(Arc::clone(&backend) as Arc<dyn ChatBackend>, 1);
+    let registry = ToolRegistry::select(&["calculator".to_owned()]).unwrap();
+
+    let stream = chat_stream(
+      &provider,
+      "gpt-test",
+      None,
+      "add 2 and 3",
+      &registry,
+      &settings,
+    );
+    futures::pin_mut!(stream);
+    let mut answer = String::new();
+    while let Some(text) = stream.next().await {
+      answer.push_str(&text.unwrap());
+    }
+    assert_eq!(answer, "5");
+
+    backend.seen.lock().unwrap().clone()
+  }
+
+  /// A provider that demands reasoning back gets it on the assistant message that made the
+  /// tool call — streamed reasoning is not forwarded to the caller, but it is not lost.
+  #[tokio::test]
+  async fn replayed_reasoning_is_assembled_from_the_stream_and_sent_back() {
+    let seen = run_two_rounds(ModelSettings {
+      replay_reasoning: true,
+      ..ModelSettings::default()
+    })
+    .await;
+
+    assert_eq!(seen.len(), 2);
+    let messages = seen[1]["messages"].as_array().unwrap();
+    assert_eq!(messages[1]["reasoning_content"], "add first");
+    assert!(messages[2].get("reasoning_content").is_none());
+  }
+
+  #[tokio::test]
+  async fn reasoning_is_not_sent_back_by_default() {
+    let seen = run_two_rounds(ModelSettings::default()).await;
+
+    assert!(
+      !seen[1].to_string().contains("reasoning_content"),
+      "got: {}",
+      seen[1]
+    );
+  }
 }

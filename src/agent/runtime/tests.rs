@@ -267,7 +267,7 @@ fn build_messages_replays_system_user_tool_call_and_result() {
   ));
 
   let request = LlmRequest::new(Some("be nice".to_owned()), &context.events);
-  let messages = agent.build_messages(request).unwrap();
+  let messages = agent.build_messages(request).unwrap().messages;
 
   assert_eq!(messages.len(), 4, "system + user + assistant + tool");
   assert!(matches!(
@@ -306,7 +306,7 @@ fn build_messages_merges_consecutive_tool_calls_into_one_assistant_message() {
   ));
 
   let request = LlmRequest::new(None, &context.events);
-  let messages = agent.build_messages(request).unwrap();
+  let messages = agent.build_messages(request).unwrap().messages;
   assert_eq!(messages.len(), 1);
   let ChatCompletionRequestMessage::Assistant(assistant) = &messages[0] else {
     panic!("expected an assistant message");
@@ -1453,7 +1453,7 @@ fn accompanying_text_and_its_calls_build_into_one_assistant_message() {
   agent.record_tool_calls(&mut context, &[spy_call()]);
 
   let request = LlmRequest::new(None, &context.events);
-  let messages = agent.build_messages(request).unwrap();
+  let messages = agent.build_messages(request).unwrap().messages;
 
   assert_eq!(
     messages.len(),

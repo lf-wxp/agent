@@ -6,13 +6,43 @@
 //! budget ([`crate::config::max_retries`]) and backoff curve live in one place instead of
 //! being copied (and drifting) at each call site.
 
-use std::future::Future;
+use std::{error::Error, fmt, future::Future};
 
 use async_openai::error::OpenAIError;
 use backon::{ExponentialBuilder, Retryable};
 use reqwest::StatusCode;
 
 use crate::config;
+
+/// An error a [`crate::llm::backend::ChatBackend`] reports as not worth retrying.
+///
+/// [`is_transient`] can only tell a provider failure it recognizes
+/// ([`OpenAIError`]) from one it does not, and retries the latter. A custom backend knows
+/// better about its own errors — a rejected key, a request its API calls malformed — and
+/// says so by wrapping them with [`Self::wrap`]. Displays exactly like the error it wraps.
+#[derive(Debug)]
+pub struct Permanent(anyhow::Error);
+
+impl Permanent {
+  /// Mark `err` as deterministic: the identical request would fail identically.
+  pub fn wrap(err: impl Into<anyhow::Error>) -> anyhow::Error {
+    anyhow::Error::new(Self(err.into()))
+  }
+}
+
+impl fmt::Display for Permanent {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fmt::Display::fmt(&self.0, f)
+  }
+}
+
+impl Error for Permanent {
+  /// What the wrapped error was caused by, so a `{:#}` of the chain reads as if the
+  /// marker were not there.
+  fn source(&self) -> Option<&(dyn Error + 'static)> {
+    self.0.source()
+  }
+}
 
 /// Whether `err` is the kind of failure another attempt could plausibly survive.
 ///
@@ -26,7 +56,8 @@ use crate::config;
 ///
 /// Errors that are not an [`OpenAIError`] are treated as retryable: this predicate only
 /// claims to recognize *provably* deterministic provider failures, and guessing at
-/// anything else would silently turn a recoverable blip into a hard failure.
+/// anything else would silently turn a recoverable blip into a hard failure. A backend
+/// that knows an error of its own is deterministic wraps it in [`Permanent`].
 ///
 /// # Known limitation: `Retry-After`
 ///
@@ -38,6 +69,9 @@ use crate::config;
 /// this needs either an upstream change or a custom transport, so until then
 /// [`with_retry`]'s exponential curve is the whole of the backoff policy.
 pub fn is_transient(err: &anyhow::Error) -> bool {
+  if err.downcast_ref::<Permanent>().is_some() {
+    return false;
+  }
   match err.downcast_ref::<OpenAIError>() {
     Some(OpenAIError::InvalidArgument(_)) => false,
     Some(OpenAIError::ApiError(response)) => {
@@ -170,5 +204,25 @@ mod tests {
   #[test]
   fn unrecognized_errors_keep_their_retries() {
     assert!(is_transient(&anyhow::anyhow!("some other failure")));
+  }
+
+  /// A backend's own deterministic error opts out of retries, and still reads as itself.
+  #[test]
+  fn a_permanent_error_is_not_retried_and_keeps_its_message() {
+    let inner = anyhow::anyhow!("key rejected").context("calling the backend");
+    let err = Permanent::wrap(inner);
+
+    assert!(!is_transient(&err));
+    assert_eq!(format!("{err}"), "calling the backend");
+    assert_eq!(format!("{err:#}"), "calling the backend: key rejected");
+  }
+
+  /// Wrapping a provider error hides it from the `OpenAIError` check, so the marker has to
+  /// win on its own — and an unwrapped one next to it still behaves as before.
+  #[test]
+  fn the_permanent_marker_overrides_an_otherwise_transient_error() {
+    let transient = api_error(StatusCode::SERVICE_UNAVAILABLE);
+    assert!(is_transient(&transient));
+    assert!(!is_transient(&Permanent::wrap(transient)));
   }
 }
