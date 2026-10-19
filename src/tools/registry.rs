@@ -4,15 +4,20 @@ use std::{path::Path, sync::Arc};
 
 use async_openai::types::chat::ChatCompletionTools;
 
+use crate::config;
 use crate::tools::{
   calculator::{self, Calculator},
   file_delete::{self, DeleteFileTool},
+  file_edit::{self, EditFileTool},
   file_list::{self, ListFileTool},
   file_read::{self, ReadFileTool},
   file_upzip::{self, UnzipFileTool},
+  file_write::{self, WriteFileTool},
+  grep::{self, GrepTool},
   mcp::{McpConfig, McpConnection},
   read_image::{self, ReadImageTool},
-  tool::Tool,
+  shell::{self, RunCommandTool},
+  tool::{Tool, execute_with_timeout},
   web_search::{self, WebSearch},
 };
 
@@ -35,14 +40,24 @@ impl ToolRegistry {
     Self::default()
   }
 
-  /// The built-in tools, which need no external process to construct.
+  /// The built-in tools that cannot write an arbitrary file or run a program, and need
+  /// no external process to construct.
   ///
-  /// Includes the filesystem tools (`file_delete`, `file_list`, `file_read`,
-  /// `file_upzip`, `read_image`) by default, alongside `calculator` / `web_search`:
-  /// this agent is meant to run with local filesystem access, so there is no
-  /// safer-by-default subset to fall back to. Callers that need to withhold them
-  /// (e.g. a sandboxed or read-only deployment) should build a registry with
-  /// [`Self::select`] instead.
+  /// `calculator`, `web_search`, and the filesystem tools that read (`list_files`,
+  /// `read_file`, `read_image`, `grep`) plus the two that already existed before the
+  /// write/execute tools did (`delete_file`, `unzip_file`). This is what a caller gets
+  /// when it reaches for "the defaults" without having set up a sandbox and an approval
+  /// step, so it deliberately leaves out `write_file`, `edit_file` and `run_command`:
+  /// next to `web_search`, whose results are attacker-influenced text, a shell tool with
+  /// no gate in front of it is a prompt-injection-to-code-execution path.
+  ///
+  /// `delete_file` and `unzip_file` are still destructive — they stay only because they
+  /// predate the sandbox/approval split, and dropping them here would be a breaking
+  /// change. A caller that cannot gate them (an unattended job) should pick its tools
+  /// with [`Self::select`] rather than read this list as "harmless".
+  ///
+  /// Use [`Self::builtin_all`] when the caller does supply that gate (as the CLI does),
+  /// or [`Self::select`] to pick tools by name.
   pub fn builtin() -> anyhow::Result<Self> {
     let mut registry = Self::empty();
     registry.add(Arc::new(Calculator))?;
@@ -52,6 +67,24 @@ impl ToolRegistry {
     registry.add(Arc::new(ReadFileTool))?;
     registry.add(Arc::new(UnzipFileTool))?;
     registry.add(Arc::new(ReadImageTool))?;
+    registry.add(Arc::new(GrepTool))?;
+    Ok(registry)
+  }
+
+  /// Every built-in tool: [`Self::builtin`] plus `write_file`, `edit_file` and
+  /// `run_command`.
+  ///
+  /// This agent is meant to run with local filesystem and shell access, but the tools
+  /// that write and execute do nothing to confine themselves — pair them with
+  /// [`crate::callback::path_guard::WorkspaceGuardCallback`] and
+  /// [`crate::callback::dual_approval::DualApprovalCallback`] as the CLI does. A caller
+  /// that cannot (an unattended job, a library embedding with no human to ask) should
+  /// use [`Self::builtin`] or [`Self::select`] instead.
+  pub fn builtin_all() -> anyhow::Result<Self> {
+    let mut registry = Self::builtin()?;
+    registry.add(Arc::new(WriteFileTool))?;
+    registry.add(Arc::new(EditFileTool))?;
+    registry.add(Arc::new(RunCommandTool))?;
     Ok(registry)
   }
 
@@ -72,6 +105,10 @@ impl ToolRegistry {
         file_read::NAME => Arc::new(ReadFileTool),
         file_upzip::NAME => Arc::new(UnzipFileTool),
         read_image::NAME => Arc::new(ReadImageTool),
+        file_write::NAME => Arc::new(WriteFileTool),
+        file_edit::NAME => Arc::new(EditFileTool),
+        grep::NAME => Arc::new(GrepTool),
+        shell::NAME => Arc::new(RunCommandTool),
         other => anyhow::bail!("unknown tool `{other}`"),
       };
       registry.add(tool)?;
@@ -79,7 +116,7 @@ impl ToolRegistry {
     Ok(registry)
   }
 
-  /// Built-in tools plus every enabled server declared in an `mcp.json`.
+  /// [`Self::builtin`] plus every enabled server declared in an `mcp.json`.
   ///
   /// A missing config file is not an error: MCP is optional, so the result is simply the
   /// built-in tools.
@@ -88,7 +125,15 @@ impl ToolRegistry {
   /// shut down only after it is dropped. Individual servers and tools that fail are logged
   /// and skipped, so one bad entry cannot take the rest down with it.
   pub async fn with_mcp(path: impl AsRef<Path>) -> anyhow::Result<(Self, Vec<McpConnection>)> {
-    let mut registry = Self::builtin()?;
+    Self::with_mcp_over(Self::builtin()?, path).await
+  }
+
+  /// Like [`Self::with_mcp`], but on top of a registry the caller already built — e.g.
+  /// [`Self::builtin_all`], which `with_mcp` deliberately does not use by itself.
+  pub async fn with_mcp_over(
+    mut registry: Self,
+    path: impl AsRef<Path>,
+  ) -> anyhow::Result<(Self, Vec<McpConnection>)> {
     let path = path.as_ref();
 
     if !tokio::fs::try_exists(path).await.unwrap_or(false) {
@@ -185,7 +230,7 @@ impl ToolRegistry {
       return format!("Error: unknown tool `{name}`");
     };
 
-    match tool.execute(arguments).await {
+    match execute_with_timeout(tool.as_ref(), arguments, config::tool_timeout()).await {
       Ok(output) => output,
       Err(err) => {
         // Keep the full chain in the logs; the model only needs the summary.
@@ -216,7 +261,8 @@ impl std::fmt::Debug for ToolRegistry {
 mod tests {
   use super::*;
   use crate::tools::{
-    calculator, file_delete, file_list, file_read, file_upzip, read_image, web_search,
+    calculator, file_delete, file_edit, file_list, file_read, file_upzip, file_write, grep,
+    read_image, shell, web_search,
   };
 
   #[test]
@@ -238,9 +284,43 @@ mod tests {
       file_read::NAME,
       file_upzip::NAME,
       read_image::NAME,
+      grep::NAME,
     ] {
       assert!(registry.contains(name), "missing built-in tool `{name}`");
     }
+  }
+
+  /// The point of the split: whoever asks for "the defaults" without having built a
+  /// sandbox and an approval step must not receive a shell or arbitrary file writes.
+  #[test]
+  fn builtin_leaves_out_the_write_and_execute_tools() {
+    let registry = ToolRegistry::builtin().unwrap();
+    for name in [file_write::NAME, file_edit::NAME, shell::NAME] {
+      assert!(!registry.contains(name), "`{name}` is in the default set");
+    }
+  }
+
+  #[test]
+  fn builtin_all_adds_exactly_the_write_and_execute_tools() {
+    let all = ToolRegistry::builtin_all().unwrap();
+    let default = ToolRegistry::builtin().unwrap();
+    assert_eq!(all.len(), default.len() + 3);
+    for name in [file_write::NAME, file_edit::NAME, shell::NAME] {
+      assert!(all.contains(name), "missing `{name}`");
+    }
+    for name in default.names() {
+      assert!(all.contains(name), "`{name}` was dropped");
+    }
+  }
+
+  /// `select` and `builtin_all` are two hand-written lists of the same tools; every
+  /// built-in must be selectable by name, or `--tools` silently cannot reach it.
+  #[test]
+  fn every_builtin_is_selectable_by_name() {
+    let builtin = ToolRegistry::builtin_all().unwrap();
+    let names: Vec<String> = builtin.names().map(str::to_owned).collect();
+    let selected = ToolRegistry::select(&names).unwrap();
+    assert_eq!(selected.len(), builtin.len());
   }
 
   #[test]

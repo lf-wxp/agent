@@ -1,7 +1,7 @@
 [package]
 edition = "2024"
 name = "agent"
-version = "0.1.0"
+version = "0.2.0"
 
 # This crate is both a regular Cargo package (native, tokio/axum-based) and the root of a
 # workspace whose other members target `wasm32-unknown-unknown` (the Leptos web UI, see
@@ -16,7 +16,7 @@ resolver = "2"
 
 [dependencies]
 anyhow = "1.0.104"
-async-openai = { version = "0.42.0", features = ["chat-completion", "embedding"] }
+async-openai = { version = "0.42.2", features = ["chat-completion", "embedding"] }
 async-stream = "0.3.6"
 async-trait = "0.1.92"
 axum = "0.8.9"
@@ -27,9 +27,10 @@ crossterm = "0.29.0"
 csv = "1.4.0"
 dotenvy = "0.15.7"
 futures = "0.3.34"
-reedline = "0.51.0"
+reedline = "0.52.1"
+regex = "1.13.1"
 reqwest = { version = "0.13.5", features = ["json"] }
-rmcp = { version = "3.3.0", features = [
+rmcp = { version = "3.5.1", features = [
   "client",
   "server",
   "macros",
@@ -40,15 +41,18 @@ rmcp = { version = "3.3.0", features = [
   # features are per-package rather than per-target, so it is enabled here.
   "transport-streamable-http-server",
 ] }
-schemars = "1.2.2"
+schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = "1.0.154"
 shared = { path = "crates/shared" }
-tiktoken-rs = "0.12.0"
-tokio = { version = "1.53.1", features = [
+tiktoken-rs = "0.12.1"
+tokio = { version = "1.53.3", features = [
   "fs",
+  "io-util",
   "macros",
   "net",
+  # `run_command` spawns a shell child process.
+  "process",
   "rt-multi-thread",
   # `Ctrl-C` at an approval prompt has to wind the turn down rather than take it with
   # the process — see `spawn_interrupt_handler` in `src/bin/cli/main.rs`.
@@ -56,11 +60,17 @@ tokio = { version = "1.53.1", features = [
   "sync",
   "time",
 ] }
+tokio-util = "0.7.20"
 tower-http = { version = "0.7.1", features = ["cors", "fs", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
-uuid = { version = "1.26.1", features = ["v4"] }
-zip = "8.6.0"
+uuid = { version = "1.28.0", features = ["v4"] }
+walkdir = "2.5.0"
+zip = "9.0"
+
+# `run_command` signals its child's whole process group, which std/tokio do not expose.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
 
 [profile.release]
 codegen-units = 1

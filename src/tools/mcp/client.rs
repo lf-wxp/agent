@@ -138,6 +138,15 @@ impl McpConnection {
           service: Arc::clone(&self.service),
           name: local_name(&self.label, &remote_name),
           remote_name,
+          // Only a *relaxation* is taken from the server's say-so: a server that claims
+          // read-only lets its calls overlap, which a wrong claim can make merely
+          // slower to debug, not more dangerous (approval and path guards are not
+          // keyed on it). Without the hint a call takes its turn like any unknown tool.
+          read_only: tool
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.read_only_hint)
+            .unwrap_or(false),
           description: tool
             .description
             .map(|description| description.to_string())
@@ -192,12 +201,19 @@ pub struct McpTool {
   remote_name: String,
   description: String,
   parameters: Value,
+  /// The server's `readOnlyHint`, `false` when it gave none. See
+  /// [`Tool::concurrency_safe`].
+  read_only: bool,
 }
 
 #[async_trait::async_trait]
 impl Tool for McpTool {
   fn name(&self) -> &str {
     &self.name
+  }
+
+  fn concurrency_safe(&self) -> bool {
+    self.read_only
   }
 
   fn description(&self) -> &str {

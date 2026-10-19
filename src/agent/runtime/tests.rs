@@ -1819,3 +1819,403 @@ fn record_tool_calls_falls_back_to_null_on_malformed_arguments() {
   };
   assert!(arguments.is_null());
 }
+
+// ---- tool timeouts, concurrency and cancellation ---------------------------------
+
+/// Sleeps for `delay`, tracking how many instances are inside `execute` at once.
+///
+/// Read-only (concurrency-safe) unless made otherwise with [`Self::with_side_effects`],
+/// so the cap/overlap tests below exercise the semaphore rather than the ordering.
+struct SlowTool {
+  delay: Duration,
+  in_flight: Arc<AtomicUsize>,
+  peak: Arc<AtomicUsize>,
+  finished: Arc<AtomicUsize>,
+  concurrency_safe: bool,
+}
+
+impl SlowTool {
+  fn new(delay: Duration) -> Self {
+    Self {
+      delay,
+      in_flight: Arc::default(),
+      peak: Arc::default(),
+      finished: Arc::default(),
+      concurrency_safe: true,
+    }
+  }
+
+  /// Behaves like a tool that writes: it must not overlap its siblings.
+  fn with_side_effects(mut self) -> Self {
+    self.concurrency_safe = false;
+    self
+  }
+}
+
+#[async_trait::async_trait]
+impl Tool for SlowTool {
+  fn name(&self) -> &str {
+    "slow"
+  }
+
+  fn description(&self) -> &str {
+    "sleeps, then succeeds"
+  }
+
+  fn parameters(&self) -> Value {
+    json!({"type": "object", "properties": {}})
+  }
+
+  fn concurrency_safe(&self) -> bool {
+    self.concurrency_safe
+  }
+
+  async fn execute(&self, _args_json: &str) -> anyhow::Result<String> {
+    let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+    self.peak.fetch_max(now, Ordering::SeqCst);
+    tokio::time::sleep(self.delay).await;
+    self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    self.finished.fetch_add(1, Ordering::SeqCst);
+    Ok("done".to_owned())
+  }
+}
+
+fn slow_calls(count: usize) -> Vec<ChatCompletionMessageToolCalls> {
+  (0..count)
+    .map(|i| {
+      ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+        id: format!("call_{i}"),
+        function: FunctionCall {
+          name: "slow".to_owned(),
+          arguments: "{}".to_owned(),
+        },
+      })
+    })
+    .collect()
+}
+
+fn slow_agent(tool: SlowTool) -> Agent {
+  let mut registry = ToolRegistry::empty();
+  registry.add(Arc::new(tool)).unwrap();
+  agent_with(registry)
+}
+
+fn results_of(context: &ExecutionContext) -> Vec<(ToolResultStatus, String)> {
+  context
+    .events
+    .iter()
+    .flat_map(|event| &event.content)
+    .filter_map(|item| match item {
+      ContentItem::ToolResult {
+        status, content, ..
+      } => Some((*status, content.clone())),
+      _ => None,
+    })
+    .collect()
+}
+
+/// A call that never returns must not hold the round (and the turn) forever: it is
+/// abandoned at the limit and reported as an error the model can react to.
+#[tokio::test]
+async fn a_tool_outliving_the_agents_timeout_is_reported_as_an_error() {
+  let agent =
+    slow_agent(SlowTool::new(Duration::from_secs(30))).with_tool_timeout(Duration::from_millis(50));
+  let mut context = ExecutionContext::new();
+
+  let started = std::time::Instant::now();
+  agent
+    .execute_tool_calls(&mut context, &slow_calls(1), &HashMap::new())
+    .await;
+
+  assert!(started.elapsed() < Duration::from_secs(5));
+  let results = results_of(&context);
+  assert_eq!(results.len(), 1);
+  assert_eq!(results[0].0, ToolResultStatus::Error);
+  assert!(
+    results[0].1.contains("did not finish within"),
+    "got: {}",
+    results[0].1
+  );
+}
+
+/// The cap bounds how many tools run at once, not how many results come back: every
+/// call still gets one.
+#[tokio::test]
+async fn tool_concurrency_caps_how_many_calls_run_at_once() {
+  let tool = SlowTool::new(Duration::from_millis(30));
+  let peak = Arc::clone(&tool.peak);
+  let agent = slow_agent(tool).with_tool_concurrency(2);
+  let mut context = ExecutionContext::new();
+
+  agent
+    .execute_tool_calls(&mut context, &slow_calls(6), &HashMap::new())
+    .await;
+
+  assert_eq!(
+    peak.load(Ordering::SeqCst),
+    2,
+    "never more than the cap at once"
+  );
+  let results = results_of(&context);
+  assert_eq!(results.len(), 6);
+  assert!(
+    results
+      .iter()
+      .all(|(status, _)| *status == ToolResultStatus::Success)
+  );
+}
+
+/// Within the cap, a round's calls overlap — the reason they run concurrently at all.
+#[tokio::test]
+async fn calls_within_the_cap_overlap() {
+  let tool = SlowTool::new(Duration::from_millis(30));
+  let peak = Arc::clone(&tool.peak);
+  let agent = slow_agent(tool).with_tool_concurrency(8);
+  let mut context = ExecutionContext::new();
+
+  agent
+    .execute_tool_calls(&mut context, &slow_calls(4), &HashMap::new())
+    .await;
+
+  assert_eq!(peak.load(Ordering::SeqCst), 4);
+}
+
+#[test]
+fn a_zero_tool_concurrency_is_treated_as_one() {
+  let agent = agent_with(ToolRegistry::empty()).with_tool_concurrency(0);
+  assert_eq!(agent.tool_concurrency, 1);
+}
+
+/// The reason ordering exists: two calls that change state must not run side by side,
+/// whatever the concurrency cap would otherwise allow.
+#[tokio::test]
+async fn calls_with_side_effects_take_turns_even_under_a_high_cap() {
+  let tool = SlowTool::new(Duration::from_millis(20)).with_side_effects();
+  let peak = Arc::clone(&tool.peak);
+  let agent = slow_agent(tool).with_tool_concurrency(8);
+  let mut context = ExecutionContext::new();
+
+  agent
+    .execute_tool_calls(&mut context, &slow_calls(4), &HashMap::new())
+    .await;
+
+  assert_eq!(peak.load(Ordering::SeqCst), 1, "overlapped");
+  let results = results_of(&context);
+  assert_eq!(results.len(), 4, "every call still gets a result");
+  assert!(
+    results
+      .iter()
+      .all(|(status, _)| *status == ToolResultStatus::Success)
+  );
+}
+
+/// A call that never reaches its tool (here: denied by a hook) must not leave the calls
+/// behind it waiting for a turn that never comes.
+#[tokio::test]
+async fn a_denied_call_does_not_hold_up_the_calls_after_it() {
+  let tool = SlowTool::new(Duration::from_millis(5)).with_side_effects();
+  let finished = Arc::clone(&tool.finished);
+  let mut registry = ToolRegistry::empty();
+  registry.add(Arc::new(tool)).unwrap();
+  registry
+    .add(Arc::new(SpyTool {
+      executed: Arc::new(AtomicBool::new(false)),
+    }))
+    .unwrap();
+  let agent = agent_with(registry).with_before_tool_callback(Arc::new(DenySpy));
+  let mut context = ExecutionContext::new();
+
+  let mut calls = vec![ChatCompletionMessageToolCalls::Function(
+    ChatCompletionMessageToolCall {
+      id: "denied".to_owned(),
+      function: FunctionCall {
+        name: "spy".to_owned(),
+        arguments: "{}".to_owned(),
+      },
+    },
+  )];
+  calls.extend(slow_calls(2));
+
+  tokio::time::timeout(
+    Duration::from_secs(5),
+    agent.execute_tool_calls(&mut context, &calls, &HashMap::new()),
+  )
+  .await
+  .expect("the round hung behind a denied call");
+
+  assert_eq!(finished.load(Ordering::SeqCst), 2);
+}
+
+/// Cancelling while calls are queued for their turn releases them all, instead of
+/// leaving the round waiting on a call that was cut short.
+#[tokio::test]
+async fn cancelling_with_calls_queued_for_a_turn_ends_the_round() {
+  let tool = SlowTool::new(Duration::from_secs(30)).with_side_effects();
+  let agent = slow_agent(tool);
+  let mut context = ExecutionContext::new();
+  let token = context.cancellation.clone();
+
+  tokio::spawn(async move {
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    token.cancel();
+  });
+
+  tokio::time::timeout(
+    Duration::from_secs(5),
+    agent.execute_tool_calls(&mut context, &slow_calls(3), &HashMap::new()),
+  )
+  .await
+  .expect("cancellation did not release the queued calls");
+
+  let results = results_of(&context);
+  assert_eq!(results.len(), 3);
+  assert!(results.iter().all(|(status, content)| {
+    *status == ToolResultStatus::Error && content.contains("cancelled")
+  }));
+}
+
+/// Denies only the `spy` tool, leaving everything else alone.
+struct DenySpy;
+
+#[async_trait::async_trait]
+impl BeforeToolCallback for DenySpy {
+  async fn call(
+    &self,
+    _context: &ExecutionContext,
+    tool_call: ToolCallView<'_>,
+  ) -> ToolCallDecision {
+    if tool_call.name == "spy" {
+      ToolCallDecision::deny("no spies")
+    } else {
+      ToolCallDecision::Proceed
+    }
+  }
+}
+
+/// Cancelling mid-round stops the tools still running, and says so — without claiming
+/// they had no effect, since they had started.
+#[tokio::test]
+async fn cancelling_mid_round_cuts_running_tools_short() {
+  let tool = SlowTool::new(Duration::from_secs(30));
+  let finished = Arc::clone(&tool.finished);
+  let agent = slow_agent(tool);
+  let mut context = ExecutionContext::new();
+  let token = context.cancellation.clone();
+
+  tokio::spawn(async move {
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    token.cancel();
+  });
+  let started = std::time::Instant::now();
+  agent
+    .execute_tool_calls(&mut context, &slow_calls(2), &HashMap::new())
+    .await;
+
+  assert!(started.elapsed() < Duration::from_secs(5));
+  assert_eq!(
+    finished.load(Ordering::SeqCst),
+    0,
+    "no tool ran to completion"
+  );
+  let results = results_of(&context);
+  assert_eq!(results.len(), 2, "every call still gets a result");
+  for (status, content) in results {
+    assert_eq!(status, ToolResultStatus::Error);
+    assert!(
+      content.contains("may have partly taken effect"),
+      "got: {content}"
+    );
+  }
+}
+
+/// An already-cancelled run neither runs tools nor asks anyone for approval: the hooks
+/// are skipped too, so no prompt pops up for a run that is already over.
+#[tokio::test]
+async fn an_already_cancelled_round_runs_no_hooks_and_no_tools() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let hooks = Arc::new(AtomicUsize::new(0));
+  let agent = agent_with(spy_registry(&executed))
+    .with_before_tool_callback(Arc::new(CountingBefore(Arc::clone(&hooks))));
+  let mut context = ExecutionContext::new();
+  context.cancellation.cancel();
+
+  agent
+    .execute_tool_calls(&mut context, &[spy_call()], &HashMap::new())
+    .await;
+
+  assert!(!executed.load(Ordering::SeqCst));
+  assert_eq!(hooks.load(Ordering::SeqCst), 0);
+  let results = results_of(&context);
+  assert!(
+    results[0].1.contains("did not run"),
+    "got: {}",
+    results[0].1
+  );
+}
+
+/// A cancelled run ends with `Cancelled` carrying the transcript — before any request
+/// is sent, since the token had already fired, which is also why this needs no provider.
+#[tokio::test]
+async fn a_cancelled_run_returns_its_transcript_without_calling_the_model() {
+  let agent = agent_with(ToolRegistry::empty());
+  let token = CancellationToken::new();
+  token.cancel();
+
+  let err = agent
+    .run_continuing(
+      Conversation::anonymous(Vec::new()).with_cancellation(token),
+      "hi",
+    )
+    .await
+    .expect_err("a cancelled run does not finish");
+
+  let cancelled = err
+    .downcast_ref::<Cancelled>()
+    .expect("the error is `Cancelled`, so a caller can recover the transcript");
+  assert_eq!(cancelled.context.events.len(), 1, "the user's turn is kept");
+}
+
+/// Same on the streaming path: the cancellation is the stream's last item.
+#[tokio::test]
+async fn a_cancelled_stream_ends_with_cancelled() {
+  let agent = agent_with(ToolRegistry::empty());
+  let token = CancellationToken::new();
+  token.cancel();
+
+  let stream = agent.run_continuing_stream(
+    Conversation::anonymous(Vec::new()).with_cancellation(token),
+    "hi",
+  );
+  futures::pin_mut!(stream);
+  let first = stream.next().await.expect("one item");
+
+  let err = first.expect_err("a cancelled stream reports it");
+  assert!(err.downcast_ref::<Cancelled>().is_some(), "got: {err}");
+  assert!(
+    stream.next().await.is_none(),
+    "nothing follows the cancellation"
+  );
+}
+
+/// A restored state carries a fresh token (tokens do not survive storage), so a resumed
+/// run needs its own attached to be cancellable.
+#[tokio::test]
+async fn a_resumed_run_can_be_given_a_token() {
+  let executed = Arc::new(AtomicBool::new(false));
+  let agent = agent_with(spy_registry(&executed));
+  let token = CancellationToken::new();
+  token.cancel();
+  let state = suspended_state(&agent, "call_1").with_cancellation(token);
+
+  let decisions = HashMap::from([("call_1".to_owned(), ResumedDecision::Approved)]);
+  let err = agent
+    .resume(state, &decisions)
+    .await
+    .expect_err("the attached token is cancelled");
+
+  assert!(err.downcast_ref::<Cancelled>().is_some(), "got: {err}");
+  assert!(
+    !executed.load(Ordering::SeqCst),
+    "a cancelled resume runs nothing"
+  );
+}

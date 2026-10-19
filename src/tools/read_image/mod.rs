@@ -37,4 +37,5 @@ simple_tool!(
   name = NAME,
   description = "Analyze an image file with a vision model to answer a question about what it shows.",
   async run = execute::run,
+  concurrency_safe = true,
 );

@@ -27,19 +27,40 @@
 /// declares `args_json`) from the body (which uses it) across the two macros would
 /// reintroduce exactly the hygiene error described above — so the `name`/`description`/
 /// `parameters` boilerplate is all that gets factored out here.
+///
+/// A synchronous `run` is executed on tokio's blocking pool (`spawn_blocking`), not
+/// inline: the file tools use `std::fs`, and a large read or a recursive delete would
+/// otherwise stall the async worker thread — and every other task scheduled on it — for
+/// as long as the syscall takes.
+///
+/// Two optional trailing settings, in this order:
+///
+/// - `timeout = <Duration expr>` overrides
+///   [`Tool::timeout`](crate::tools::tool::Tool::timeout).
+/// - `concurrency_safe = <bool expr>` overrides
+///   [`Tool::concurrency_safe`](crate::tools::tool::Tool::concurrency_safe). Left out, the
+///   tool is *not* concurrency-safe, so a new tool has to opt in to overlapping with its
+///   siblings rather than opt out.
 macro_rules! simple_tool {
   (
     $tool:ident,
     $args:ty,
     name = $name:expr,
     description = $description:expr,
-    run = $run:path $(,)?
+    run = $run:path
+    $(, timeout = $timeout:expr)?
+    $(, concurrency_safe = $safe:expr)? $(,)?
   ) => {
-    $crate::tools::macros::impl_simple_tool!($tool, $args, $name, $description, {
-      async fn execute(&self, args_json: &str) -> anyhow::Result<String> {
-        $run(args_json)
+    $crate::tools::macros::impl_simple_tool!(
+      $tool, $args, $name, $description, [$($timeout)?], [$($safe)?], {
+        async fn execute(&self, args_json: &str) -> anyhow::Result<String> {
+          let args_json = args_json.to_owned();
+          tokio::task::spawn_blocking(move || $run(&args_json))
+            .await
+            .map_err(|err| anyhow::anyhow!("tool task panicked: {err}"))?
+        }
       }
-    });
+    );
   };
 
   (
@@ -47,13 +68,17 @@ macro_rules! simple_tool {
     $args:ty,
     name = $name:expr,
     description = $description:expr,
-    async run = $run:path $(,)?
+    async run = $run:path
+    $(, timeout = $timeout:expr)?
+    $(, concurrency_safe = $safe:expr)? $(,)?
   ) => {
-    $crate::tools::macros::impl_simple_tool!($tool, $args, $name, $description, {
-      async fn execute(&self, args_json: &str) -> anyhow::Result<String> {
-        $run(args_json).await
+    $crate::tools::macros::impl_simple_tool!(
+      $tool, $args, $name, $description, [$($timeout)?], [$($safe)?], {
+        async fn execute(&self, args_json: &str) -> anyhow::Result<String> {
+          $run(args_json).await
+        }
       }
-    });
+    );
   };
 }
 
@@ -64,8 +89,14 @@ macro_rules! simple_tool {
 /// exists so both of its arms have somewhere to funnel into instead of repeating the
 /// struct/`impl` wrapper. `$execute_fn` arrives pre-built (see [`simple_tool`] for why)
 /// and is spliced back in unmodified.
+///
+/// The two optional settings arrive bracketed (`[]` when absent) so that either can be
+/// left out without the other's position becoming ambiguous.
 macro_rules! impl_simple_tool {
-  ($tool:ident, $args:ty, $name:expr, $description:expr, { $($execute_fn:tt)* }) => {
+  (
+    $tool:ident, $args:ty, $name:expr, $description:expr,
+    [$($timeout:expr)?], [$($safe:expr)?], { $($execute_fn:tt)* }
+  ) => {
     pub struct $tool;
 
     #[async_trait::async_trait]
@@ -82,6 +113,18 @@ macro_rules! impl_simple_tool {
         serde_json::to_value(schemars::schema_for!($args))
           .expect("schema is always serializable")
       }
+
+      $(
+        fn timeout(&self) -> Option<std::time::Duration> {
+          Some($timeout)
+        }
+      )?
+
+      $(
+        fn concurrency_safe(&self) -> bool {
+          $safe
+        }
+      )?
 
       $($execute_fn)*
     }

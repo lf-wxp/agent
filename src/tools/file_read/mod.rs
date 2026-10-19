@@ -45,4 +45,5 @@ simple_tool!(
   name = NAME,
   description = "Read a text file (returned with line numbers, optionally a range) or a CSV file (returned as a markdown table).",
   run = execute::run,
+  concurrency_safe = true,
 );

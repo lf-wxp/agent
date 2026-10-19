@@ -21,7 +21,7 @@ use crate::{
     provider::Provider,
     retry::{is_transient, with_retry},
   },
-  tools::ToolRegistry,
+  tools::{ToolRegistry, schedule},
   util::truncate_chars,
 };
 
@@ -187,11 +187,30 @@ pub(crate) async fn append_tool_results(
 
   // Independent tool calls in the same round are executed concurrently: sequential
   // awaits would otherwise add up their network latency instead of overlapping it.
-  let results = join_all(
-    tool_calls
-      .into_iter()
-      .map(|tool_call| execute(registry, tool_call)),
-  )
+  // Bounded by `config::tool_max_concurrency`; `join_all` keeps results in call order.
+  // A call that is not concurrency-safe (anything that writes) takes its turn instead —
+  // see `schedule::plan` — so two edits to one file cannot overwrite each other.
+  let safety: Vec<bool> = tool_calls
+    .iter()
+    .map(|tool_call| match tool_call {
+      ChatCompletionMessageToolCalls::Function(call) => registry
+        .get(&call.function.name)
+        .is_none_or(|tool| tool.concurrency_safe()),
+      ChatCompletionMessageToolCalls::Custom(_) => true,
+    })
+    .collect();
+  let semaphore = tokio::sync::Semaphore::new(config::tool_max_concurrency());
+  let slots = &semaphore;
+  let results = join_all(tool_calls.into_iter().zip(schedule::plan(&safety)).map(
+    |(tool_call, mut gate)| async move {
+      gate.turn().await;
+      // Never closed, so `acquire` cannot fail; see `Agent::execute_tool_calls`.
+      let _slot = slots.acquire().await.ok();
+      let result = execute(registry, tool_call).await;
+      gate.finish();
+      result
+    },
+  ))
   .await;
 
   for (id, result) in results {

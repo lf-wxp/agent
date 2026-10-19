@@ -57,6 +57,12 @@ const ENV_MAX_HISTORY_TOKENS: &str = "LLM_MAX_HISTORY_TOKENS";
 /// Environment variable: seconds a dangerous-tool approval waits for a human.
 const ENV_APPROVAL_TIMEOUT_SECS: &str = "AGENT_APPROVAL_TIMEOUT_SECS";
 
+/// Environment variable: seconds one tool call may run before it is abandoned.
+const ENV_TOOL_TIMEOUT_SECS: &str = "AGENT_TOOL_TIMEOUT_SECS";
+
+/// Environment variable: tool calls of one round that may execute at the same time.
+const ENV_TOOL_MAX_CONCURRENCY: &str = "AGENT_TOOL_MAX_CONCURRENCY";
+
 /// Environment variable: Tavily API key, used by the `web_search` tool.
 const ENV_TAVILY_API_KEY: &str = "TAVILY_API_KEY";
 
@@ -119,6 +125,16 @@ const DEFAULT_MAX_HISTORY_TOKENS: usize = 6_000;
 /// and come back, short enough that an abandoned prompt does not hold the session's turn
 /// lock for the rest of the day.
 const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 300;
+
+/// Default per-call tool timeout. Generous, because it is a backstop against a call that
+/// never returns (a wedged MCP server, a stalled download), not a latency target: a slow
+/// but working tool killed at this point loses real work.
+const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 300;
+
+/// Default number of a round's tool calls executing at once. Models rarely ask for more
+/// than a handful per round; the cap is for the one that asks for fifty file reads or
+/// searches at once, which would otherwise all hit the disk / network together.
+const DEFAULT_TOOL_MAX_CONCURRENCY: usize = 8;
 
 /// Default Tavily search depth: `basic` costs 1 credit and balances latency against relevance.
 const DEFAULT_TAVILY_SEARCH_DEPTH: &str = "basic";
@@ -274,6 +290,24 @@ pub fn max_history_tokens() -> usize {
   parsed_var_nonzero(ENV_MAX_HISTORY_TOKENS, DEFAULT_MAX_HISTORY_TOKENS)
 }
 
+/// How long one tool call may run before it is abandoned and reported to the model as
+/// timed out. Applies to every tool that does not declare its own limit via
+/// [`crate::tools::Tool::timeout`]. Override with `AGENT_TOOL_TIMEOUT_SECS`; invalid
+/// values (non-numeric or 0) fall back to the default.
+pub fn tool_timeout() -> Duration {
+  Duration::from_secs(parsed_var_nonzero(
+    ENV_TOOL_TIMEOUT_SECS,
+    DEFAULT_TOOL_TIMEOUT_SECS,
+  ))
+}
+
+/// How many of one round's tool calls may execute at the same time. Override with
+/// `AGENT_TOOL_MAX_CONCURRENCY`; invalid values (non-numeric or 0) fall back to the
+/// default.
+pub fn tool_max_concurrency() -> usize {
+  parsed_var_nonzero(ENV_TOOL_MAX_CONCURRENCY, DEFAULT_TOOL_MAX_CONCURRENCY)
+}
+
 /// Tavily API key used by the `web_search` tool. `None` when unset.
 pub fn tavily_api_key() -> Option<String> {
   non_empty_var(ENV_TAVILY_API_KEY)
@@ -308,6 +342,36 @@ pub fn embed_base_url() -> Option<String> {
 /// letting the caller fall back to `OPENAI_API_KEY`.
 pub fn embed_api_key() -> Option<String> {
   non_empty_var(ENV_EMBED_API_KEY)
+}
+
+/// Environment variable read by the OpenAI client for the chat API key.
+const ENV_OPENAI_API_KEY: &str = "OPENAI_API_KEY";
+
+/// The credentials this process itself reads from its environment — the ones nothing it
+/// launches on a model's behalf has any business seeing.
+///
+/// Derived from the same constants the getters above use rather than retyped where it is
+/// needed, so a credential added to this module cannot be forgotten by a consumer that
+/// has to strip them (see `run_command`).
+pub const SECRET_ENV_VARS: &[&str] = &[
+  ENV_OPENAI_API_KEY,
+  ENV_TAVILY_API_KEY,
+  ENV_EMBED_API_KEY,
+  ENV_HF_TOKEN,
+];
+
+/// Whether an environment variable *name* looks like it holds a credential.
+///
+/// A heuristic on the suffix, as a net under [`SECRET_ENV_VARS`]: the process may have
+/// been given other keys through `.env` (a different provider's key, a cloud token) that
+/// this module never reads but a shell child could still print. Deliberately by name and
+/// not by value — values are secrets and must not be inspected or logged — and
+/// deliberately blunt: a false positive costs a command one variable, a false negative
+/// hands a prompt-injected page a key.
+pub fn is_secret_env_name(name: &str) -> bool {
+  const SUFFIXES: &[&str] = &["_API_KEY", "_SECRET_KEY", "_SECRET", "_PASSWORD", "_TOKEN"];
+  let name = name.to_ascii_uppercase();
+  SECRET_ENV_VARS.contains(&name.as_str()) || SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
 }
 
 /// Read an environment variable and trim leading/trailing whitespace; unset or blank is treated as not configured.
@@ -398,6 +462,43 @@ mod tests {
 
     unsafe { std::env::set_var("AGENT_TEST_PARSED_VAR_VALUE", "5") };
     assert_eq!(parsed_var::<usize>("AGENT_TEST_PARSED_VAR_VALUE", 7), 5);
+  }
+
+  /// A credential is recognised by name, whether or not this crate reads that variable:
+  /// the ones it does read are matched exactly, anything else by its suffix. Names that
+  /// merely mention a token (a tokenizer's thread count) are not credentials.
+  #[test]
+  fn secret_env_names_are_recognised_by_the_names_that_carry_credentials() {
+    for name in [
+      "OPENAI_API_KEY",
+      "TAVILY_API_KEY",
+      "EMBED_API_KEY",
+      "HF_TOKEN",
+      "GITHUB_TOKEN",
+      "AWS_SECRET_KEY",
+      "db_password",
+      "SOME_SECRET",
+    ] {
+      assert!(
+        is_secret_env_name(name),
+        "`{name}` should be treated as a secret"
+      );
+    }
+    for name in [
+      "PATH",
+      "HOME",
+      "CARGO_HOME",
+      "VIRTUAL_ENV",
+      "TOKENIZERS_PARALLELISM",
+    ] {
+      assert!(!is_secret_env_name(name), "`{name}` should be left alone");
+    }
+    // Matching is on the *end* of the name only, and deliberately blunt about it: a
+    // variable that merely mentions a credential word in the middle is left alone, while
+    // anything that ends in one is stripped even if it is not truly secret — the accepted
+    // cost of never guessing wrong in the other direction.
+    assert!(!is_secret_env_name("PASSWORD_STORE_DIR"));
+    assert!(is_secret_env_name("PASSWORD_STORE_DIR_IS_NOT_A_PASSWORD"));
   }
 
   #[test]

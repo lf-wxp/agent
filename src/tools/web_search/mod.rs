@@ -41,6 +41,12 @@ impl Tool for WebSearch {
   async fn execute(&self, args_json: &str) -> anyhow::Result<String> {
     execute::run(args_json).await
   }
+
+  /// A query changes nothing locally, and overlapping several is the point of running a
+  /// round's calls together.
+  fn concurrency_safe(&self) -> bool {
+    true
+  }
 }
 
 /// Arguments as produced by the model.

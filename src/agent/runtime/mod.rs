@@ -33,7 +33,7 @@
 
 mod structured;
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_openai::types::chat::{
   ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
@@ -46,6 +46,7 @@ use async_openai::types::chat::{
 use async_stream::stream;
 use futures::{Stream, StreamExt, future::join_all};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
   agent::{
@@ -63,7 +64,7 @@ use crate::{
     tool_calls::ToolCallAccumulator,
     tool_loop::disable_tools,
   },
-  tools::ToolRegistry,
+  tools::{ToolRegistry, schedule, tool::execute_with_timeout},
   util::truncate_chars,
 };
 
@@ -419,7 +420,49 @@ impl AgentRunState {
   pub fn context(&self) -> &ExecutionContext {
     &self.context
   }
+
+  /// Let `token` stop the resumed run, as [`Conversation::with_cancellation`] does for a
+  /// new one. Needed because a token does not survive storage (see
+  /// [`ExecutionContext::cancellation`]): a state loaded from disk carries a fresh one
+  /// nobody else holds.
+  #[must_use]
+  pub fn with_cancellation(mut self, token: CancellationToken) -> Self {
+    self.context.cancellation = token;
+    self
+  }
 }
+
+/// The run was stopped through its [`ExecutionContext::cancellation`] token.
+///
+/// Returned as an error (downcast it from [`anyhow::Error`]) because the run did not
+/// finish, but it carries the transcript up to that point: every completed round, plus
+/// a result for each call that was cut short saying so. A caller that persists history
+/// can file [`Self::context`] and the conversation carries on from there; one that does
+/// not care just sees "the run was cancelled".
+///
+/// Only tools are cut short. A before-tool hook already waiting — typically an approval
+/// prompt — is left to its own timeout rather than dropped mid-wait, since dropping it
+/// would leave the prompt it raised dangling in every front-end showing it.
+#[derive(Debug)]
+pub struct Cancelled {
+  pub context: Box<ExecutionContext>,
+}
+
+impl Cancelled {
+  fn new(context: ExecutionContext) -> Self {
+    Self {
+      context: Box::new(context),
+    }
+  }
+}
+
+impl std::fmt::Display for Cancelled {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "the run was cancelled")
+  }
+}
+
+impl std::error::Error for Cancelled {}
 
 /// How a resumable run ended: with an answer, or with a question.
 #[derive(Debug)]
@@ -479,6 +522,10 @@ pub struct Agent {
   /// run can still be suspended gracefully, but a killed one is lost. See
   /// [`RunCheckpoint`].
   checkpoint: Option<Arc<dyn RunCheckpoint>>,
+  /// Default limit for one tool call; see [`Self::with_tool_timeout`].
+  tool_timeout: Duration,
+  /// Calls of one round executing at once; see [`Self::with_tool_concurrency`].
+  tool_concurrency: usize,
 }
 
 impl Agent {
@@ -514,7 +561,33 @@ impl Agent {
         ContextOptimizer::new(config::max_history_tokens()),
       )],
       checkpoint: None,
+      tool_timeout: config::tool_timeout(),
+      tool_concurrency: config::tool_max_concurrency(),
     }
+  }
+
+  /// How long one tool call may run before it is abandoned and reported to the model as
+  /// timed out, for tools that do not declare their own limit ([`Tool::timeout`]).
+  /// Defaults to [`config::tool_timeout`].
+  ///
+  /// Guards against a call that never returns — a wedged MCP server, a stalled network
+  /// read — holding the round, and with it the whole turn, forever.
+  ///
+  /// [`Tool::timeout`]: crate::tools::Tool::timeout
+  #[must_use]
+  pub fn with_tool_timeout(mut self, timeout: Duration) -> Self {
+    self.tool_timeout = timeout;
+    self
+  }
+
+  /// How many of one round's tool calls may execute at the same time; the rest wait for
+  /// a free slot. Defaults to [`config::tool_max_concurrency`]. `0` is treated as `1`.
+  ///
+  /// Results keep call order either way, so this changes only how much runs at once.
+  #[must_use]
+  pub fn with_tool_concurrency(mut self, concurrency: usize) -> Self {
+    self.tool_concurrency = concurrency.max(1);
+    self
   }
 
   /// Park each round's state in `checkpoint` while it runs, so a turn survives the
@@ -916,7 +989,10 @@ impl Agent {
         disable_tools(&mut builder, self.toolbox.definitions());
       }
 
-      let response = self.complete(&builder).await?;
+      let token = context.cancellation.clone();
+      let Some(response) = self.complete_unless_cancelled(&builder, &token).await? else {
+        return Err(Cancelled::new(context).into());
+      };
       self.record_usage(&mut context, &response);
       let message = first_choice(response)?.message;
 
@@ -1176,14 +1252,38 @@ impl Agent {
           disable_tools(&mut builder, self.toolbox.definitions());
         }
 
-        let mut chunks = self.complete_stream(&builder).await?;
+        let token = context.cancellation.clone();
+        let opened = tokio::select! {
+          biased;
+          () = token.cancelled() => None,
+          opened = self.complete_stream(&builder) => Some(opened),
+        };
+        let Some(opened) = opened else {
+          yield Err(Cancelled::new(context).into());
+          return;
+        };
+        let mut chunks = opened?;
 
         let mut accumulator = ToolCallAccumulator::default();
         // Forwarded token by token as it arrives; also kept so the final answer (or the
         // fallback content once tools are disabled) can be recorded as one piece.
         let mut assistant_text = String::new();
 
-        while let Some(chunk) = chunks.next().await {
+        loop {
+          // Raced chunk by chunk, so a cancelled run stops mid-answer rather than only
+          // once the model decides it is done talking.
+          let next = tokio::select! {
+            biased;
+            () = token.cancelled() => None,
+            next = chunks.next() => Some(next),
+          };
+          let Some(next) = next else {
+            yield Err(Cancelled::new(context).into());
+            return;
+          };
+          let Some(chunk) = next else {
+            break;
+          };
           let chunk = match chunk {
             Ok(chunk) => chunk,
             // Abort instead of continuing: after a transport error the remaining
@@ -1329,6 +1429,21 @@ impl Agent {
     .await
   }
 
+  /// [`Self::complete`], abandoned as soon as `token` fires. `Ok(None)` means cancelled.
+  ///
+  /// `biased` so an already-cancelled token wins without the request ever being sent.
+  async fn complete_unless_cancelled(
+    &self,
+    builder: &CreateChatCompletionRequestArgs,
+    token: &CancellationToken,
+  ) -> anyhow::Result<Option<CreateChatCompletionResponse>> {
+    tokio::select! {
+      biased;
+      () = token.cancelled() => Ok(None),
+      response = self.complete(builder) => response.map(Some),
+    }
+  }
+
   /// Streaming counterpart of [`Self::complete`]: same permit/retry handling, but opens a
   /// stream instead of awaiting one complete response.
   ///
@@ -1379,6 +1494,9 @@ impl Agent {
     context.conversation_id = conversation.id;
     context.conversation_scope = conversation.scope;
     context.events = conversation.events;
+    if let Some(token) = conversation.cancellation {
+      context.cancellation = token;
+    }
     self.record_user_input(&mut context, user_input);
     context
   }
@@ -1452,12 +1570,24 @@ impl Agent {
   /// a throwaway copy and [`ExecutionContext::events`] survives intact for persistence.
   async fn prepare_llm_request(&self, context: &ExecutionContext) -> LlmRequest {
     let mut request = LlmRequest::new(self.instructions.clone(), &context.events);
-
-    for callback in &self.before_llm_callbacks {
-      callback.call(context, &mut request).await;
-    }
-
+    self.run_before_llm_callbacks(context, &mut request).await;
     request
+  }
+
+  /// Run the before-LLM hooks in order, stopping early once the run is cancelled.
+  ///
+  /// A hook can be a model call of its own (summarization), so without this a cancelled
+  /// run would still sit through it before noticing. Stopping leaves `request` however
+  /// far the hooks got, which is harmless: every caller checks the token right after and
+  /// ends the run without sending it.
+  async fn run_before_llm_callbacks(&self, context: &ExecutionContext, request: &mut LlmRequest) {
+    for callback in &self.before_llm_callbacks {
+      tokio::select! {
+        biased;
+        () = context.cancellation.cancelled() => break,
+        () = callback.call(context, request) => {}
+      }
+    }
   }
 
   /// [`Self::prepare_llm_request`] for a caller that will append `trailer` as a trailing
@@ -1590,17 +1720,55 @@ impl Agent {
     // an allow/deny decision), while the mutable borrow needed to record the resulting
     // event is only taken back once all of them have resolved, below.
     let context_ref: &ExecutionContext = &*context;
+    let token = &context_ref.cancellation;
+    // Bounds how many tools *execute* at once. Taken only around the tool itself, not
+    // the hooks: a call parked on an approval prompt must not occupy a slot its approved
+    // siblings are waiting for. A named binding rather than `&Semaphore::new(...)`: the
+    // borrow lives for the whole `join_all` below, and naming it makes that lifetime
+    // explicit instead of leaning on temporary-lifetime extension.
+    let semaphore = tokio::sync::Semaphore::new(self.tool_concurrency);
+    let slots = &semaphore;
+
+    // Which calls may overlap their siblings; see `schedule::plan`. Decided from the
+    // registered tool alone, so an unknown name (which never executes anything) counts
+    // as safe and holds nobody up.
+    let function_calls: Vec<_> = tool_calls
+      .iter()
+      .filter_map(|tool_call| match tool_call {
+        ChatCompletionMessageToolCalls::Function(function_call) => Some(function_call),
+        _ => None,
+      })
+      .collect();
+    let safety: Vec<bool> = function_calls
+      .iter()
+      .map(|call| {
+        self
+          .toolbox
+          .get(&call.function.name)
+          .is_none_or(|tool| tool.concurrency_safe())
+      })
+      .collect();
 
     // Every call resolves to either a result or a suspension; `join_all` keeps them in
     // call order, which both lists below inherit.
-    let settled = join_all(tool_calls.iter().filter_map(|tool_call| {
-      let ChatCompletionMessageToolCalls::Function(function_call) = tool_call else {
-        return None;
-      };
-
-      Some(async move {
+    let settled = join_all(function_calls.into_iter().zip(schedule::plan(&safety)).map(
+      |(function_call, mut gate)| async move {
         let function_name = &function_call.function.name;
         let arguments = &function_call.function.arguments;
+
+        // Cancelled before this call got a slot: nothing has run, so say exactly that —
+        // and do not raise an approval prompt for a run that is already over.
+        if token.is_cancelled() {
+          return Err(ContentItem::ToolResult {
+            tool_call_id: function_call.id.clone(),
+            name: function_name.clone(),
+            status: ToolResultStatus::Error,
+            content: format!(
+              "Tool execution cancelled: the run was cancelled before {function_name} \
+               started, so it did not run."
+            ),
+          });
+        }
 
         tracing::debug!(
           tool = %function_name,
@@ -1679,21 +1847,52 @@ impl Agent {
         }
 
         let (mut status, mut content) = match self.toolbox.get(function_name) {
-          Some(tool) => match tool.execute(arguments).await {
-            Ok(result) => {
-              tracing::debug!(
-                tool = %function_name,
-                result = %truncate_chars(&result, TOOL_LOG_PREVIEW_CHARS),
-                "tool finished"
-              );
-              (ToolResultStatus::Success, result)
+          Some(tool) => {
+            // `biased`: a token that fired while the hooks ran — or while this call
+            // waited for its turn or a slot — wins before the tool is even polled once.
+            let outcome = tokio::select! {
+              biased;
+              () = token.cancelled() => None,
+              result = async {
+                // After the hooks, not before: only the tool's own execution queues
+                // behind earlier calls, so approval prompts still go out together.
+                gate.turn().await;
+                // Never closed, so `acquire` cannot fail; a failure would only mean
+                // running unbounded, which is still correct.
+                let _slot = slots.acquire().await.ok();
+                execute_with_timeout(tool.as_ref(), arguments, self.tool_timeout).await
+              } => Some(result),
+            };
+            // The tool is done (or was cut short): let the calls queued behind it go
+            // now rather than after this call's after-hooks.
+            gate.finish();
+            match outcome {
+              Some(Ok(result)) => {
+                tracing::debug!(
+                  tool = %function_name,
+                  result = %truncate_chars(&result, TOOL_LOG_PREVIEW_CHARS),
+                  "tool finished"
+                );
+                (ToolResultStatus::Success, result)
+              }
+              Some(Err(err)) => {
+                let msg = format!("Tool execution error: {err}");
+                tracing::warn!("{msg}");
+                (ToolResultStatus::Error, msg)
+              }
+              None => {
+                tracing::info!(tool = %function_name, "tool call cancelled mid-run");
+                (
+                  ToolResultStatus::Error,
+                  format!(
+                    "Tool execution cancelled: the run was cancelled while {function_name} \
+                     was running, so it may have partly taken effect. Check the current \
+                     state before trying again."
+                  ),
+                )
+              }
             }
-            Err(err) => {
-              let msg = format!("Tool execution error: {err}");
-              tracing::warn!("{msg}");
-              (ToolResultStatus::Error, msg)
-            }
-          },
+          }
           None => {
             let msg = format!("Tool execution error: unknown tool {function_name}");
             tracing::warn!("{msg}");
@@ -1726,8 +1925,8 @@ impl Agent {
           status,
           content,
         })
-      })
-    }))
+      },
+    ))
     .await;
 
     // `Err` is the ordinary case here, not a failure: the two variants only distinguish

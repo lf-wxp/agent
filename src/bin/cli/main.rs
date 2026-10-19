@@ -41,7 +41,8 @@
 //! guards above; the working directory is still pinned, and stdio servers still get a
 //! minimal environment, either way.
 //!
-//! Destructive tools (`delete_file` by default) prompt for a `y`/`n` before running, via
+//! Destructive tools (`delete_file`, `write_file`, `edit_file`, `run_command` by
+//! default) prompt for a `y`/`n` before running, via
 //! [`agent::callback::dual_approval::DualApprovalCallback`] — see `--dangerous-tools` /
 //! `--no-approval` below. The prompt belongs to the *session*, not to whichever front-end
 //! started the turn: it is shown in the terminal and in every connected browser tab at
@@ -153,7 +154,7 @@ use agent::{
   llm::provider::Provider,
   session::{FileSessionStore, SessionStore},
   telemetry,
-  tools::{ToolRegistry, file_delete},
+  tools::{ToolRegistry, file_delete, file_edit, file_write, shell},
 };
 use anyhow::Context;
 use async_stream::stream;
@@ -162,7 +163,7 @@ use futures::{Stream, StreamExt};
 use reedline::{
   CursorConfig, EditMode as ReedlineEditMode, Emacs, Prompt, PromptEditMode, PromptHistorySearch,
   Reedline, Signal, Vi, default_emacs_keybindings, default_vi_insert_keybindings,
-  default_vi_normal_keybindings,
+  default_vi_normal_keybindings, default_vi_visual_keybindings,
 };
 use shared::{
   ChatEvent, MessageOrigin, PendingApprovalView, ToolResultSummary, commands as command_set,
@@ -310,13 +311,26 @@ async fn main() -> anyhow::Result<()> {
       ToolRegistry::select(&names.split(',').map(str::to_owned).collect::<Vec<_>>())?,
       Vec::new(),
     ),
-    None => ToolRegistry::with_mcp(config::mcp_config_path()).await?,
+    // The full set, including `write_file` / `edit_file` / `run_command`: this binary is
+    // the one caller that puts the workspace guard and the approval gate in front of
+    // them (see below), which is the condition `ToolRegistry::builtin_all` is for.
+    None => {
+      ToolRegistry::with_mcp_over(ToolRegistry::builtin_all()?, config::mcp_config_path()).await?
+    }
   };
 
-  // `delete_file` by default: the one built-in tool that destroys data outside this
-  // process. `--dangerous-tools` overrides the list (comma-separated; an empty value
+  // By default every built-in tool that changes something outside this process:
+  // `delete_file`, `write_file`, `edit_file` and `run_command` (the last one especially —
+  // the workspace guard can only check its `workdir`, never the command itself).
+  // `--dangerous-tools` overrides the list (comma-separated; an empty value
   // disables prompting for everything), and `--no-approval` is shorthand for the same
   // regardless of what `--dangerous-tools` would otherwise pick.
+  let default_dangerous_tools = [
+    file_delete::NAME,
+    file_write::NAME,
+    file_edit::NAME,
+    shell::NAME,
+  ];
   let dangerous_tools: Vec<String> = if args.contains_key("no-approval") {
     Vec::new()
   } else {
@@ -327,9 +341,27 @@ async fn main() -> anyhow::Result<()> {
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
         .collect(),
-      None => vec![file_delete::NAME.to_owned()],
+      None => default_dangerous_tools.map(str::to_owned).to_vec(),
     }
   };
+
+  // An explicit `--dangerous-tools` *replaces* the default list rather than adding to
+  // it, so a script written when only `delete_file` was gated would now run `run_command`
+  // and `write_file` without asking. Say so, once, at startup: a gate that quietly
+  // narrowed is worse than one that was never there, because it is still being trusted.
+  if args.contains_key("dangerous-tools") && !args.contains_key("no-approval") {
+    let ungated: Vec<&str> = default_dangerous_tools
+      .into_iter()
+      .filter(|name| registry.contains(name) && !dangerous_tools.iter().any(|gated| gated == name))
+      .collect();
+    if !ungated.is_empty() {
+      eprintln!(
+        "warning: --dangerous-tools replaces the default approval list; these enabled tools \
+         will run WITHOUT asking: {}",
+        ungated.join(", ")
+      );
+    }
+  }
 
   let agent = Agent::new(
     Provider::shared().clone(),
@@ -360,8 +392,13 @@ async fn main() -> anyhow::Result<()> {
   //
   // `None` when nothing is gated (`--no-approval`, or an empty `--dangerous-tools`), in
   // which case no callback is registered at all.
-  let approval_callback =
-    (!dangerous_tools.is_empty()).then(|| Arc::new(DualApprovalCallback::new(dangerous_tools)));
+  //
+  // `run_command` never gets a standing "always allow": one yes to a shell is a yes to
+  // every command that follows, including whatever a later prompt injection asks for.
+  // The other gated tools keep it.
+  let approval_callback = (!dangerous_tools.is_empty()).then(|| {
+    Arc::new(DualApprovalCallback::new(dangerous_tools).without_standing_approval(shell::NAME))
+  });
   let agent = match &approval_callback {
     // The explicit coercion is the point of holding an `Arc<DualApprovalCallback>`: the
     // same allocation is both the agent's hook and this binary's handle for clearing
@@ -531,7 +568,11 @@ async fn main() -> anyhow::Result<()> {
   let edit_mode: Box<dyn ReedlineEditMode> = if vi_mode {
     let mut insert = default_vi_insert_keybindings();
     completer::bind_menu_keys(&mut insert);
-    Box::new(Vi::new(insert, default_vi_normal_keybindings()))
+    Box::new(Vi::new(
+      insert,
+      default_vi_normal_keybindings(),
+      default_vi_visual_keybindings(),
+    ))
   } else {
     let mut emacs = default_emacs_keybindings();
     completer::bind_menu_keys(&mut emacs);

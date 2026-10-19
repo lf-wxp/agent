@@ -538,6 +538,9 @@ pub struct DualApprovalCallback {
   rejection_formatter: Option<RejectionFormatter>,
   /// See [`WhenUnanswered`].
   when_unanswered: WhenUnanswered,
+  /// Tools for which "always allow" is honoured for this call only; see
+  /// [`Self::without_standing_approval`].
+  once_only: std::collections::HashSet<String>,
   // Serializes the terminal prompt/read pair below: tool calls in the same round run
   // concurrently (see `Agent::execute_tool_calls`), and without this lock two concurrent
   // dangerous calls would interleave their console prompts and could read the wrong
@@ -559,8 +562,24 @@ impl DualApprovalCallback {
       sticky: Mutex::new(ContinuityCache::new(STICKY_CONVERSATIONS)),
       rejection_formatter: None,
       when_unanswered: WhenUnanswered::default(),
+      once_only: std::collections::HashSet::new(),
       terminal_prompt_lock: AsyncMutex::new(()),
     }
+  }
+
+  /// Never let an "always allow" answer for `tool` stand for later calls: each call is
+  /// put to a human on its own, whatever was answered before.
+  ///
+  /// For a tool where one approval says nothing about the next call. A standing "yes" to
+  /// `delete_file` still bounds itself to deleting files; a standing "yes" to a shell
+  /// tool is a standing "yes" to *any command*, including whatever a later prompt
+  /// injection asks for. An "always allow" typed at the prompt is still accepted — it
+  /// approves this call — but is not remembered. A remembered *refusal* (`never`) is
+  /// still honoured: remembering "no" can only make the tool safer.
+  #[must_use]
+  pub fn without_standing_approval(mut self, tool: impl Into<String>) -> Self {
+    self.once_only.insert(tool.into());
+    self
   }
 
   /// Gate `tool` under `rule`, replacing any rule already set for it.
@@ -882,7 +901,9 @@ impl BeforeToolCallback for DualApprovalCallback {
       };
     };
 
-    if outcome.sticky {
+    // A standing approval is not kept for a tool that opted out of it (the answer already
+    // approved this call, which is all it may do), but a standing refusal always is.
+    if outcome.sticky && (!outcome.approved || !self.once_only.contains(tool_call.name)) {
       self.remember(context, tool_call.name, &outcome);
     }
 
@@ -1428,6 +1449,61 @@ mod tests {
       approval.call(context, tool_call),
     )
     .await
+  }
+
+  /// A tool that opted out of standing approval takes the "always" answer for the call it
+  /// was given on, and asks again next time.
+  #[tokio::test]
+  async fn an_always_answer_is_not_remembered_for_a_tool_that_opted_out() {
+    let approval =
+      DualApprovalCallback::new(["run_command"]).without_standing_approval("run_command");
+    let context = conversation("local", "s1");
+    let args = json!({ "command": "ls" });
+
+    assert!(
+      answer_once(
+        &approval,
+        &context,
+        view("run_command", &args),
+        ApprovalOutcome::sticky(true)
+      )
+      .await,
+      "the answer itself still approves the call it was given on"
+    );
+
+    assert!(
+      !call_without_a_front_end(&approval, &context, view("run_command", &args))
+        .await
+        .is_proceed(),
+      "the next call must be put to a human again"
+    );
+  }
+
+  /// Remembering "no" can only make a tool safer, so the opt-out does not reach it.
+  #[tokio::test]
+  async fn a_never_answer_is_still_remembered_for_a_tool_that_opted_out() {
+    let approval =
+      DualApprovalCallback::new(["run_command"]).without_standing_approval("run_command");
+    let context = conversation("local", "s1");
+    let args = json!({ "command": "ls" });
+
+    assert!(
+      !answer_once(
+        &approval,
+        &context,
+        view("run_command", &args),
+        ApprovalOutcome::sticky(false)
+      )
+      .await
+    );
+
+    assert!(
+      matches!(
+        call_without_a_front_end(&approval, &context, view("run_command", &args)).await,
+        ToolCallDecision::ShortCircuit(ToolResultStatus::Error, _)
+      ),
+      "a remembered refusal must still deny without asking"
+    );
   }
 
   /// The point of a sticky answer: the second call of the same tool is not asked about.

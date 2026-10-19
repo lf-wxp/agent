@@ -36,6 +36,11 @@ impl Tool for Calculator {
     // Pure CPU work: nothing to await, and fast enough not to need spawn_blocking.
     execute::run(args_json)
   }
+
+  /// Pure arithmetic: nothing outside the call to disturb.
+  fn concurrency_safe(&self) -> bool {
+    true
+  }
 }
 
 /// Supported arithmetic operations.

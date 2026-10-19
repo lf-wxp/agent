@@ -31,7 +31,7 @@
 | 🔍 **搜索结果压缩** | `web_search` 结果自动分块 + 向量检索压缩后再写入历史（[`SearchCompressorCallback`](src/callback/search_compressor.rs)），避免长文本占满上下文 |
 | 🧠 **`Agent` 运行时** | 完整事件记录（`ExecutionContext`）+ 无状态多轮续接（`run_continuing`）+ 流式输出（`run_stream`，含工具调用过程事件），每轮请求副本按 token 预算自动裁剪（`context.events` 保持完整） |
 | 💾 **会话持久化** | 落盘的 `FileSessionStore`（按 `(scope, sessionId)` 存 JSON 文件），CLI 与 Web UI 共用，`SessionStore` trait 可替换为其他后端 |
-| 🧰 **工具生态** | 内置 `calculator`、`web_search`（Tavily），并通过 `mcp.json` 接入任意 MCP Server（stdio / Streamable HTTP 两种传输） |
+| 🧰 **工具生态** | 内置 `calculator`、`web_search`（Tavily）、文件工具（`read_file` / `list_files` / `write_file` / `edit_file` / `delete_file` / `unzip_file` / `read_image`）、`grep` 代码搜索与 `run_command` shell 执行（超时 + 进程组清理），并通过 `mcp.json` 接入任意 MCP Server（stdio / Streamable HTTP 两种传输） |
 | 🏢 **多租户（库内）** | `Provider` 封装每租户凭据 + 并发限流，互不干扰（见 [`examples/multi_tenant.rs`](examples/multi_tenant.rs)） |
 | 📚 **向量检索** | 文本分块 / embedding / 余弦相似度检索，适配 RAG 场景 |
 | 📊 **基准评测** | 内置 GAIA 数据集评测，量化模型 + 工具组合效果 |
@@ -124,7 +124,7 @@ cargo run --bin cli -- --mode web --web-port 4000  # 只起 Web UI，不进入�
 
 会话历史按 `--session` 的名字落盘到 [`agent::session::FileSessionStore`](src/agent/session/file.rs)（默认目录 `.agent/sessions`，可用 `AGENT_CLI_SESSION_DIR` 覆盖），**进程退出后再次运行同一个 `--session` 仍能续接对话，且永不过期**（用 `FileSessionStore::new_persistent` 构造）——多久以前的对话都能接着聊，只有 `--fresh` / `/reset` / `--rm` 会清空。
 
-**`--workspace <dir>`** 把这次运行钉在一个具体目录（默认：启动 `cli` 时所在的目录，因此不传这个参数时行为与以前完全一致），并通过真正的 `std::env::set_current_dir` 切换过去——此后进程里任何相对路径（模型传给文件工具的参数、`mcp.json` 的默认查找路径、`.agent/sessions` 的默认位置）都以它为基准解析。这也意味着不同 `--workspace` 默认拥有各自独立的会话与 MCP 配置（除非用绝对路径的 `AGENT_CLI_SESSION_DIR` / `MCP_CONFIG_PATH` 覆盖）。在此之上，[`WorkspaceGuardCallback`](src/callback/path_guard.rs) 把这个目录变成内置文件类工具（`delete_file`/`read_file`/`list_files`/`unzip_file`）的**硬边界**：模型传入的路径参数一旦解析后落在工作区之外（绝对路径、`../` 逃逸，甚至指向工作区外的符号链接），会在真正执行前直接被拒绝——甚至不会触发确认弹窗。这解决的正是"CLI 运行时没有限定到具体目录，危险操作可能波及工作区之外"的风险。默认开启（沙箱状态显示在启动横幅里），`--no-sandbox` 可关闭这层限制（工作目录本身仍会被钉住，只是不再拦截越权路径）。
+**`--workspace <dir>`** 把这次运行钉在一个具体目录（默认：启动 `cli` 时所在的目录，因此不传这个参数时行为与以前完全一致），并通过真正的 `std::env::set_current_dir` 切换过去——此后进程里任何相对路径（模型传给文件工具的参数、`mcp.json` 的默认查找路径、`.agent/sessions` 的默认位置）都以它为基准解析。这也意味着不同 `--workspace` 默认拥有各自独立的会话与 MCP 配置（除非用绝对路径的 `AGENT_CLI_SESSION_DIR` / `MCP_CONFIG_PATH` 覆盖）。在此之上，[`WorkspaceGuardCallback`](src/callback/path_guard.rs) 把这个目录变成内置文件类工具（`delete_file`/`read_file`/`list_files`/`unzip_file`/`write_file`/`edit_file`/`grep`，以及 `run_command` 的 `workdir`）的**硬边界**：模型传入的路径参数一旦解析后落在工作区之外（绝对路径、`../` 逃逸，甚至指向工作区外的符号链接），会在真正执行前直接被拒绝——甚至不会触发确认弹窗。这解决的正是"CLI 运行时没有限定到具体目录，危险操作可能波及工作区之外"的风险。默认开启（沙箱状态显示在启动横幅里），`--no-sandbox` 可关闭这层限制（工作目录本身仍会被钉住，只是不再拦截越权路径）。
 
 **MCP 工具的隔离机制**：由于 MCP 工具的参数 schema 只有连接后才知道，`WorkspaceGuardCallback` 无法像内置工具那样按字段名精确校验，因此单独提供了三层互补的防护（同样受 `--no-sandbox` 控制，除第一层外）：
 
@@ -136,7 +136,11 @@ MCP Server 本身仍然需要被信任（其 `command`/`args`/`env` 会作为子
 
 工具集：默认内置工具（`calculator`、`web_search`、文件系统工具等）之外，若 `mcp.json`（`MCP_CONFIG_PATH`，默认路径 `mcp.json`）存在，会自动连接其中每个已启用的 MCP Server 并把发现的工具一并注册（见 [`ToolRegistry::with_mcp`](src/tools/registry.rs)）；退出聊天时会优雅关闭这些连接。`--tools` 会切换到显式的内置工具子集，此时不加载 MCP（MCP 工具的名字要连接后才知道，无法提前按名选择）。
 
-`delete_file` 默认被视为高危操作，调用前会等待人工确认（[`DualApprovalCallback`](src/callback/dual_approval.rs)）。用 `--dangerous-tools` 指定另一份需确认的工具名单（逗号分隔，可以是内置工具或 `<server>__<tool>` 形式的 MCP 工具），或用 `--no-approval` 完全关闭确认、放行所有工具调用。
+`delete_file`、`write_file`、`edit_file`、`run_command` 默认被视为高危操作，调用前会等待人工确认（工作区沙箱只能检查 `run_command` 的 `workdir`，无法检查命令本身）（[`DualApprovalCallback`](src/callback/dual_approval.rs)）。用 `--dangerous-tools` 指定另一份需确认的工具名单（逗号分隔，可以是内置工具或 `<server>__<tool>` 形式的 MCP 工具），或用 `--no-approval` 完全关闭确认、放行所有工具调用。注意 `--dangerous-tools` 是**替换**默认名单而不是追加，名单里没有的内置工具将不再确认，启动时会打印警告。
+
+**库的默认值更保守**：`ToolRegistry::builtin()` 不含 `write_file`、`edit_file`、`run_command`——它们没有自带沙箱，也没有人工确认。需要时用 `ToolRegistry::builtin_all()`（CLI 即如此，并挂上 `WorkspaceGuardCallback` 与 `DualApprovalCallback`），或用 `ToolRegistry::select` 按名挑选。叠加 MCP 用 `ToolRegistry::with_mcp_over(base, path)`。
+
+同一轮里，有副作用的工具（任何未声明 `Tool::concurrency_safe` 的工具，包括未标注只读的 MCP 工具）按调用顺序依次执行，只读工具仍并发；审批提示依然同时弹出。`run_command` 的审批不接受「本会话总是允许」。工作区守卫另外禁止读写 `.env*`，并禁止写入 `.git/`、`.agent/` 与 `mcp.json`。
 
 审批的几个要点：
 
@@ -275,7 +279,7 @@ use agent::{Agent, config, llm::provider::Provider, telemetry, tools::ToolRegist
 async fn main() -> anyhow::Result<()> {
   telemetry::init()?; // 加载 .env 并初始化日志，务必在读取任何 config::* 之前调用
 
-  let toolbox = Arc::new(ToolRegistry::builtin()?); // 内置 calculator / web_search / mcp
+  let toolbox = Arc::new(ToolRegistry::builtin()?); // calculator / web_search / 只读文件工具 / grep（不含 shell 与写文件）
   let agent = Agent::new(
     Provider::shared().clone(),   // 读取 OPENAI_API_KEY 等环境变量
     config::model(),              // 默认 deepseek-v4-flash，见 LLM_MODEL
@@ -310,6 +314,28 @@ let result = agent.run_continuing(history, "我刚才让你记的是什么时间
 ```
 
 **流式输出**：用 `agent.run_stream(input)` 替代 `run`，得到 `impl Stream<Item = AgentStreamEvent>`，逐 token 转发，见 [`examples/agent_stream.rs`](examples/agent_stream.rs)。
+
+**取消与超时**：通过 `Conversation::with_cancellation(token)` 传入一个 `tokio_util::sync::CancellationToken`。取消后：
+- 正在进行的模型请求立即放弃；
+- 仍在执行的工具被中断，并记录为"已取消"；
+- 本次运行以 `agent::Cancelled` 错误结束。
+
+该错误里带有截至此刻的完整记录，可以 downcast 取出后照常落盘。恢复挂起的运行时，用 `AgentRunState::with_cancellation` 传入 token。需要整轮超时时，自己起一个定时器，到点调用 `token.cancel()` 即可。单个工具的超时和并发上限分别用 `Agent::with_tool_timeout`、`Agent::with_tool_concurrency` 设置。
+
+```rust
+use tokio_util::sync::CancellationToken;
+use agent::{Cancelled, agent::Conversation};
+
+let token = CancellationToken::new();
+let result = agent
+  .run_continuing(Conversation::new("chat-1", history).with_cancellation(token.clone()), "...")
+  .await;
+if let Err(err) = &result
+  && let Some(cancelled) = err.downcast_ref::<Cancelled>()
+{
+  store.save("local", "chat-1", cancelled.context.events.clone()).await;
+}
+```
 
 **结构化输出**（反序列化为 Rust 类型）：
 
@@ -377,6 +403,8 @@ agent.run_continuing(
 | `AGENT_CLI_WEB_PORT` | `4173` | `--mode web`/`both` 本地 Web 服务器端口（始终绑定 `127.0.0.1`） |
 | `AGENT_CLI_WEB_DIST_DIR` | `crates/web-ui/dist` | Web UI 静态资源目录（`trunk build` 产物） |
 | `AGENT_APPROVAL_TIMEOUT_SECS` | `300` | 审批等待人工决策的上限。超时**不按拒绝处理**，而是挂起该轮并落盘（见「挂起与恢复」）；这个上界的作用是释放会话的轮次锁 |
+| `AGENT_TOOL_TIMEOUT_SECS` | `300` | 单次工具调用的时间上限，超时后放弃该调用，并作为错误结果交给模型（工具可通过 `Tool::timeout` 自定义；`run_command` 自带上限） |
+| `AGENT_TOOL_MAX_CONCURRENCY` | `8` | 同一轮工具调用中最多同时执行的个数（等待审批的调用不占名额） |
 | `TAVILY_API_KEY` | - | `web_search` 工具密钥 |
 | `RUST_LOG` | `info` | 日志级别 |
 

@@ -8,7 +8,9 @@ use crate::{
     ExecutionContext,
     callback::{BeforeToolCallback, ToolCallDecision, ToolCallView},
   },
-  tools::{file_delete, file_list, file_read, file_upzip, read_image},
+  tools::{
+    file_delete, file_edit, file_list, file_read, file_upzip, file_write, grep, read_image, shell,
+  },
 };
 
 /// Denies a built-in filesystem tool call whose path argument resolves outside a fixed
@@ -27,6 +29,10 @@ use crate::{
 ///
 /// # Known limitations
 ///
+/// - **`run_command` is only guarded on its `workdir`**: the command string itself is
+///   arbitrary shell, and no path check on it could be sound (`cd .. && rm x`, `$HOME`,
+///   `eval`, ...). Whether it runs at all is left to a human via
+///   [`crate::callback::dual_approval::DualApprovalCallback`].
 /// - **Built-in tools only**: an MCP server's tools are discovered at runtime with no
 ///   fixed argument schema this callback could rely on, so a filesystem-touching MCP
 ///   tool is not covered by *this* boundary — only enable MCP servers you already trust
@@ -71,21 +77,41 @@ impl WorkspaceGuardCallback {
     if tool_name == file_delete::NAME
       || tool_name == file_read::NAME
       || tool_name == read_image::NAME
+      || tool_name == file_write::NAME
+      || tool_name == file_edit::NAME
     {
       &["file_path"]
-    } else if tool_name == file_list::NAME {
+    } else if tool_name == file_list::NAME || tool_name == grep::NAME {
       &["path"]
     } else if tool_name == file_upzip::NAME {
       &["zip_path", "extract_to"]
+    } else if tool_name == shell::NAME {
+      &["workdir"]
     } else {
       &[]
     }
   }
 
+  /// Whether `tool` *changes* what `field` names, as opposed to only reading it. Decides
+  /// which of the [`protected`] paths apply: reading `.git/config` is ordinary, writing
+  /// it is not.
+  ///
+  /// `unzip_file`'s `extract_to` is a write and its `zip_path` is not; everything else
+  /// the guard knows about that changes anything does so through `file_path`.
+  fn is_write(tool_name: &str, field: &str) -> bool {
+    match tool_name {
+      name if name == file_delete::NAME || name == file_write::NAME || name == file_edit::NAME => {
+        true
+      }
+      name if name == file_upzip::NAME => field == "extract_to",
+      _ => false,
+    }
+  }
+
   /// `None` if `candidate` — resolved against `self.root` when relative, taken as-is
-  /// when absolute — stays inside the workspace; `Some(reason)` naming the resolved
-  /// path otherwise.
-  fn violation(&self, candidate: &str) -> Option<String> {
+  /// when absolute — stays inside the workspace and is not a [`protected`] path for this
+  /// kind of access; `Some(reason)` naming the resolved path otherwise.
+  fn violation(&self, candidate: &str, write: bool) -> Option<String> {
     let requested = Path::new(candidate);
     let joined = if requested.is_absolute() {
       requested.to_path_buf()
@@ -95,16 +121,69 @@ impl WorkspaceGuardCallback {
 
     let resolved = resolve_best_effort(&joined);
 
-    if resolved.starts_with(&self.root) {
-      None
-    } else {
-      Some(format!(
+    let Ok(inside) = resolved.strip_prefix(&self.root) else {
+      return Some(format!(
         "`{candidate}` resolves to `{}`, outside the workspace root `{}`",
         resolved.display(),
         self.root.display(),
-      ))
+      ));
+    };
+    protected(inside, write).map(|why| {
+      format!(
+        "`{candidate}` resolves to `{}`, which is {why}",
+        resolved.display()
+      )
+    })
+  }
+}
+
+/// Why a path *inside* the workspace is still off limits, or `None` if it is not.
+///
+/// Being inside the root only says a path is the project's, not that it is ordinary
+/// project content. A few things in there are worth more than their size suggests, and a
+/// model that can overwrite them has been handed more than file access:
+///
+/// - `.env*` — credentials. Refused for reading as well as writing, since reading one
+///   puts the secrets straight into the model's context (and the provider's logs).
+/// - `.git/` — hooks run as the user the next time git does anything.
+/// - `.agent/` — the session and approval stores; rewriting them forges history and
+///   pending approvals.
+/// - `mcp.json` — each enabled entry is a command launched at startup, so writing it is
+///   code execution on the next run, with no approval prompt in the way.
+///
+/// `relative` is relative to the workspace root, so a root that itself sits under a
+/// directory with one of these names is not affected. The match is on whole path
+/// components, case-insensitively, since the filesystems this runs on are not all
+/// case-sensitive.
+fn protected(relative: &Path, write: bool) -> Option<&'static str> {
+  for component in relative.components() {
+    let Component::Normal(name) = component else {
+      continue;
+    };
+    let name = name.to_string_lossy().to_ascii_lowercase();
+    if name == ".env" || name.starts_with(".env.") {
+      return Some("a credentials file, which these tools may not read or write");
+    }
+    if !write {
+      continue;
+    }
+    match name.as_str() {
+      ".git" => return Some("inside `.git`, which these tools may not modify"),
+      ".agent" => {
+        return Some("inside `.agent` (sessions and approvals), which these tools may not modify");
+      }
+      _ => {}
     }
   }
+  if write {
+    let is_mcp_config = relative
+      .file_name()
+      .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("mcp.json"));
+    if is_mcp_config {
+      return Some("the MCP server config, whose entries run as commands at startup");
+    }
+  }
+  None
 }
 
 #[async_trait::async_trait]
@@ -120,16 +199,17 @@ impl BeforeToolCallback for WorkspaceGuardCallback {
       let Some(candidate) = tool_call.arguments.get(*field).and_then(Value::as_str) else {
         continue;
       };
-      if let Some(reason) = self.violation(candidate) {
+      let write = Self::is_write(tool_call.name, field);
+      if let Some(reason) = self.violation(candidate, write) {
         tracing::warn!(
           tool = tool_call.name,
           field = *field,
           %reason,
-          "blocked a filesystem call outside the workspace root"
+          "blocked a filesystem call outside the workspace root or on a protected path"
         );
         return ToolCallDecision::deny(format!(
-          "Denied: {reason}. This tool is restricted to the workspace root; ask for a \
-           path inside it."
+          "Denied: {reason}. This tool is restricted to the workspace root and may not \
+           touch protected files; ask for a different path."
         ));
       }
     }
@@ -190,7 +270,7 @@ mod tests {
 
   use super::*;
   use crate::agent::ToolResultStatus;
-  use crate::tools::ToolRegistry;
+  use crate::tools::{ToolRegistry, calculator, web_search};
 
   /// A freshly created directory under the OS temp dir that no other test can collide
   /// with; not cleaned up afterwards, same tradeoff as `agent::session`'s tests.
@@ -319,31 +399,192 @@ mod tests {
     ));
   }
 
-  /// Regression guard: every built-in tool that reads/writes a filesystem path (as
-  /// opposed to e.g. `calculator`, which never touches a path at all) must be named in
-  /// [`WorkspaceGuardCallback::guarded_fields`] — a new filesystem tool added to
-  /// [`ToolRegistry::builtin`] without a matching entry here would silently bypass the
-  /// sandbox. This walks the actual built-in tool list rather than hand-maintaining a
-  /// second copy of it, so the two cannot drift apart unnoticed.
+  /// Regression guard: every built-in tool must be *classified* — either it takes a
+  /// filesystem path and is named in [`WorkspaceGuardCallback::guarded_fields`], or it is
+  /// on the explicit list of tools that never touch a path. Walking the actual tool list
+  /// (rather than only the path-taking subset) is what makes this catch a new tool: one
+  /// added to [`ToolRegistry::builtin_all`] and named in neither place fails here, rather
+  /// than silently bypassing the sandbox.
   #[test]
-  fn every_path_taking_builtin_tool_is_guarded() {
-    let path_taking_tools = [
-      file_delete::NAME,
-      file_list::NAME,
-      file_read::NAME,
-      file_upzip::NAME,
-      read_image::NAME,
-    ];
-    let registry = ToolRegistry::builtin().unwrap();
+  fn every_builtin_tool_is_classified_for_the_guard() {
+    let path_free_tools = [calculator::NAME, web_search::NAME];
+    let registry = ToolRegistry::builtin_all().unwrap();
     for name in registry.names() {
-      if path_taking_tools.contains(&name) {
-        assert!(
-          !WorkspaceGuardCallback::guarded_fields(name).is_empty(),
-          "`{name}` reads/writes a filesystem path but is not guarded by \
-           WorkspaceGuardCallback"
-        );
-      }
+      let guarded = !WorkspaceGuardCallback::guarded_fields(name).is_empty();
+      let path_free = path_free_tools.contains(&name);
+      assert!(
+        guarded ^ path_free,
+        "`{name}` is {}; classify it in WorkspaceGuardCallback::guarded_fields or in \
+         this test's list of path-free tools",
+        if guarded {
+          "both guarded and listed as path-free"
+        } else {
+          "neither guarded nor listed as path-free"
+        }
+      );
     }
+  }
+
+  #[tokio::test]
+  async fn denies_writes_edits_and_searches_escaping_the_root() {
+    let root = unique_temp_dir("write-tools-escape");
+    let guard = WorkspaceGuardCallback::new(&root).unwrap();
+    let context = ExecutionContext::new();
+
+    let cases = [
+      (
+        file_write::NAME,
+        json!({ "file_path": "../x.txt", "content": "x" }),
+      ),
+      (
+        file_edit::NAME,
+        json!({ "file_path": "/etc/hosts", "old_string": "a", "new_string": "b" }),
+      ),
+      (grep::NAME, json!({ "pattern": "x", "path": "../" })),
+      (shell::NAME, json!({ "command": "ls", "workdir": "/" })),
+    ];
+    for (name, args) in cases {
+      let result = guard.call(&context, view(name, &args)).await;
+      assert!(!result.is_proceed(), "`{name}` escaped the workspace");
+    }
+  }
+
+  async fn decision(root: &Path, tool: &str, args: Value) -> ToolCallDecision {
+    let guard = WorkspaceGuardCallback::new(root).unwrap();
+    let context = ExecutionContext::new();
+    guard.call(&context, view(tool, &args)).await
+  }
+
+  /// Inside the root is not enough: these writes are a way to run code or forge state.
+  #[tokio::test]
+  async fn denies_writing_to_protected_paths_inside_the_root() {
+    let root = unique_temp_dir("protected-write");
+    for (tool, args) in [
+      (
+        file_write::NAME,
+        json!({ "file_path": "mcp.json", "content": "{}" }),
+      ),
+      (
+        file_write::NAME,
+        json!({ "file_path": "sub/MCP.JSON", "content": "{}" }),
+      ),
+      (
+        file_write::NAME,
+        json!({ "file_path": ".git/hooks/pre-commit", "content": "x" }),
+      ),
+      (
+        file_edit::NAME,
+        json!({ "file_path": ".agent/sessions/a.json", "old_string": "a", "new_string": "b" }),
+      ),
+      (file_delete::NAME, json!({ "file_path": ".git/config" })),
+      (
+        file_upzip::NAME,
+        json!({ "zip_path": "a.zip", "extract_to": ".git" }),
+      ),
+    ] {
+      let result = decision(&root, tool, args.clone()).await;
+      assert!(!result.is_proceed(), "`{tool}` {args} was allowed");
+    }
+  }
+
+  /// A protected path is protected against *changes*; looking is ordinary.
+  #[tokio::test]
+  async fn allows_reading_the_non_secret_protected_paths() {
+    let root = unique_temp_dir("protected-read");
+    for (tool, args) in [
+      (file_read::NAME, json!({ "file_path": ".git/config" })),
+      (file_read::NAME, json!({ "file_path": "mcp.json" })),
+      (file_list::NAME, json!({ "path": ".agent" })),
+      (
+        file_upzip::NAME,
+        json!({ "zip_path": ".git/x.zip", "extract_to": "out" }),
+      ),
+    ] {
+      let result = decision(&root, tool, args.clone()).await;
+      assert!(result.is_proceed(), "`{tool}` {args} was denied");
+    }
+  }
+
+  /// Credentials files are refused for reading too: a read puts the secrets in the model's
+  /// context.
+  #[tokio::test]
+  async fn denies_any_access_to_env_files() {
+    let root = unique_temp_dir("protected-env");
+    for (tool, args) in [
+      (file_read::NAME, json!({ "file_path": ".env" })),
+      (file_read::NAME, json!({ "file_path": "app/.env.local" })),
+      (grep::NAME, json!({ "pattern": "KEY", "path": ".env" })),
+      (
+        read_image::NAME,
+        json!({ "file_path": ".env", "query": "q", "model": "m" }),
+      ),
+      (
+        file_write::NAME,
+        json!({ "file_path": ".env", "content": "x" }),
+      ),
+    ] {
+      let result = decision(&root, tool, args.clone()).await;
+      assert!(!result.is_proceed(), "`{tool}` {args} was allowed");
+    }
+  }
+
+  /// Whole components only: a name that merely contains one is ordinary.
+  #[tokio::test]
+  async fn does_not_overreach_on_similar_names() {
+    let root = unique_temp_dir("protected-similar");
+    for (tool, args) in [
+      (
+        file_write::NAME,
+        json!({ "file_path": "environment.md", "content": "x" }),
+      ),
+      (
+        file_write::NAME,
+        json!({ "file_path": "docs/.github/ci.yml", "content": "x" }),
+      ),
+      (
+        file_write::NAME,
+        json!({ "file_path": "my-mcp.json.bak", "content": "x" }),
+      ),
+      (
+        file_write::NAME,
+        json!({ "file_path": "gitignore.txt", "content": "x" }),
+      ),
+    ] {
+      let result = decision(&root, tool, args.clone()).await;
+      assert!(result.is_proceed(), "`{tool}` {args} was denied");
+    }
+  }
+
+  /// A root that itself lives under a directory with a protected name is unaffected: only
+  /// the part of the path below the root counts.
+  #[tokio::test]
+  async fn a_protected_name_above_the_root_does_not_count() {
+    let parent = unique_temp_dir("protected-above");
+    let root = parent.join(".agent").join("work");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let result = decision(
+      &root,
+      file_write::NAME,
+      json!({ "file_path": "notes.txt", "content": "x" }),
+    )
+    .await;
+    assert!(result.is_proceed());
+  }
+
+  #[tokio::test]
+  async fn allows_run_command_without_a_workdir() {
+    let root = unique_temp_dir("shell-no-workdir");
+    let guard = WorkspaceGuardCallback::new(&root).unwrap();
+    let context = ExecutionContext::new();
+
+    let args = json!({ "command": "ls" });
+    assert!(
+      guard
+        .call(&context, view(shell::NAME, &args))
+        .await
+        .is_proceed()
+    );
   }
 
   #[tokio::test]

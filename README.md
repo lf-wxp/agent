@@ -31,7 +31,7 @@
 | 🔍 **Search result compression** | `web_search` results are chunked and compressed through vector retrieval before being written to history ([`SearchCompressorCallback`](src/callback/search_compressor.rs)), so long pages don't flood the context |
 | 🧠 **`Agent` runtime** | Full event record (`ExecutionContext`) + stateless multi-turn continuation (`run_continuing`) + streaming output (`run_stream`, including tool-call progress events), with each round's request copy trimmed to a token budget (`context.events` stays complete) |
 | 💾 **Session persistence** | An on-disk `FileSessionStore` (one JSON file per `(scope, sessionId)`) shared by the CLI and the Web UI; the `SessionStore` trait can be swapped for another backend |
-| 🧰 **Tool ecosystem** | Built-in `calculator` and `web_search` (Tavily), plus any MCP Server wired up through `mcp.json` (stdio / Streamable HTTP transports) |
+| 🧰 **Tool ecosystem** | Built-in `calculator`, `web_search` (Tavily), file tools (`read_file` / `list_files` / `write_file` / `edit_file` / `delete_file` / `unzip_file` / `read_image`), `grep` code search and `run_command` shell execution (timeout + process-group kill), plus any MCP Server wired up through `mcp.json` (stdio / Streamable HTTP transports) |
 | 🏢 **Multi-tenancy (in the library)** | `Provider` encapsulates per-tenant credentials + concurrency limits, isolated from each other (see [`examples/multi_tenant.rs`](examples/multi_tenant.rs)) |
 | 📚 **Vector retrieval** | Text chunking / embeddings / cosine-similarity search, fit for RAG scenarios |
 | 📊 **Benchmarking** | A built-in GAIA dataset evaluation to quantify model + tool combinations |
@@ -124,7 +124,7 @@ The `You>` prompt is edited by [`reedline`](https://github.com/nushell/reedline)
 
 Session history is persisted under the `--session` name by [`agent::session::FileSessionStore`](src/agent/session/file.rs) (default directory `.agent/sessions`, overridable with `AGENT_CLI_SESSION_DIR`); **re-running the same `--session` after the process exits continues the conversation, and it never expires** (constructed with `FileSessionStore::new_persistent`) — you can pick up a conversation from any time ago, and only `--fresh` / `/reset` / `--rm` clear it.
 
-**`--workspace <dir>`** pins the run to a concrete directory (default: the directory `cli` was started in, so omitting the flag behaves exactly as before) and actually `chdir`s into it via `std::env::set_current_dir` — from then on every relative path in the process (arguments the model passes to file tools, the default lookup path for `mcp.json`, the default location of `.agent/sessions`) resolves against it. This also means different `--workspace` values get their own sessions and MCP config by default (unless you override with an absolute `AGENT_CLI_SESSION_DIR` / `MCP_CONFIG_PATH`). On top of that, [`WorkspaceGuardCallback`](src/callback/path_guard.rs) turns this directory into a **hard boundary** for the built-in file tools (`delete_file`/`read_file`/`list_files`/`unzip_file`): if a path argument from the model resolves outside the workspace (absolute path, `../` escape, or even a symlink pointing out), it is rejected before execution — without even raising a confirmation prompt. That's the fix for "the CLI isn't scoped to a directory, so a dangerous operation can reach outside the workspace". It is on by default (the banner shows the sandbox state) and `--no-sandbox` disables this layer (the working directory is still pinned, out-of-bounds paths are just no longer blocked).
+**`--workspace <dir>`** pins the run to a concrete directory (default: the directory `cli` was started in, so omitting the flag behaves exactly as before) and actually `chdir`s into it via `std::env::set_current_dir` — from then on every relative path in the process (arguments the model passes to file tools, the default lookup path for `mcp.json`, the default location of `.agent/sessions`) resolves against it. This also means different `--workspace` values get their own sessions and MCP config by default (unless you override with an absolute `AGENT_CLI_SESSION_DIR` / `MCP_CONFIG_PATH`). On top of that, [`WorkspaceGuardCallback`](src/callback/path_guard.rs) turns this directory into a **hard boundary** for the built-in file tools (`delete_file`/`read_file`/`list_files`/`unzip_file`/`write_file`/`edit_file`/`grep`, plus `run_command`'s `workdir`): if a path argument from the model resolves outside the workspace (absolute path, `../` escape, or even a symlink pointing out), it is rejected before execution — without even raising a confirmation prompt. That's the fix for "the CLI isn't scoped to a directory, so a dangerous operation can reach outside the workspace". It is on by default (the banner shows the sandbox state) and `--no-sandbox` disables this layer (the working directory is still pinned, out-of-bounds paths are just no longer blocked).
 
 **Isolation for MCP tools**: because an MCP tool's argument schema is only known after connecting, `WorkspaceGuardCallback` can't validate field-by-field the way it does for built-in tools, so three complementary layers are provided instead (all governed by `--no-sandbox` except the first):
 
@@ -136,7 +136,11 @@ The MCP Server itself still has to be trusted (its `command`/`args`/`env` are ex
 
 Tool set: besides the default built-in tools (`calculator`, `web_search`, file system tools, …), if `mcp.json` (`MCP_CONFIG_PATH`, default path `mcp.json`) exists, every enabled MCP Server in it is connected automatically and its discovered tools are registered as well (see [`ToolRegistry::with_mcp`](src/tools/registry.rs)); those connections are shut down gracefully when chat exits. `--tools` switches to an explicit subset of built-in tools and skips MCP entirely (MCP tool names are only known after connecting, so they cannot be selected by name up front).
 
-`delete_file` is treated as high-risk by default and waits for human confirmation before running ([`DualApprovalCallback`](src/callback/dual_approval.rs)). Use `--dangerous-tools` to supply a different list of tools requiring confirmation (comma separated, either built-in or MCP tools as `<server>__<tool>`), or `--no-approval` to turn confirmation off entirely and let every tool call through.
+`delete_file`, `write_file`, `edit_file` and `run_command` are treated as high-risk by default and wait for human confirmation before running (the workspace guard can only check `run_command`'s `workdir`, never the command itself) ([`DualApprovalCallback`](src/callback/dual_approval.rs)). Use `--dangerous-tools` to supply a different list of tools requiring confirmation (comma separated, either built-in or MCP tools as `<server>__<tool>`), or `--no-approval` to turn confirmation off entirely and let every tool call through. Note that `--dangerous-tools` *replaces* the default list rather than extending it: a built-in tool left off it runs without asking, and a warning naming those tools is printed at startup.
+
+**The library's defaults are more conservative.** `ToolRegistry::builtin()` leaves out `write_file`, `edit_file` and `run_command` — they confine nothing themselves and have no human in front of them. Use `ToolRegistry::builtin_all()` when you supply the gate (the CLI does, with `WorkspaceGuardCallback` and `DualApprovalCallback`), or `ToolRegistry::select` to pick by name; layer MCP on top with `ToolRegistry::with_mcp_over(base, path)`.
+
+Within one round, tools with side effects (anything that does not declare `Tool::concurrency_safe`, including MCP tools not marked read-only) run in call order, while read-only tools still overlap; approval prompts still appear together. `run_command` approvals never offer "always allow for this session". The workspace guard also refuses reads and writes of `.env*`, and writes to `.git/`, `.agent/` and `mcp.json`.
 
 Key points about approval:
 
@@ -275,7 +279,7 @@ use agent::{Agent, config, llm::provider::Provider, telemetry, tools::ToolRegist
 async fn main() -> anyhow::Result<()> {
   telemetry::init()?; // loads .env and initializes logging; call before reading any config::*
 
-  let toolbox = Arc::new(ToolRegistry::builtin()?); // built-in calculator / web_search / mcp
+  let toolbox = Arc::new(ToolRegistry::builtin()?); // calculator / web_search / read-only file tools / grep (no shell, no writes)
   let agent = Agent::new(
     Provider::shared().clone(),   // reads OPENAI_API_KEY and friends
     config::model(),              // defaults to deepseek-v4-flash, see LLM_MODEL
@@ -310,6 +314,8 @@ let result = agent.run_continuing(history, "What time did I just ask you to note
 ```
 
 **Streaming output**: replace `run` with `agent.run_stream(input)` to get an `impl Stream<Item = AgentStreamEvent>` and forward it token by token — see [`examples/agent_stream.rs`](examples/agent_stream.rs).
+
+**Cancellation and timeouts**: pass a `tokio_util::sync::CancellationToken` via `Conversation::with_cancellation(token)`. Once it fires, a model request in flight is abandoned, still-running tools are cut short and recorded as cancelled, and the run ends with an `agent::Cancelled` error carrying the transcript so far (downcast it and persist as usual). Use `AgentRunState::with_cancellation` when resuming. For a whole-run deadline, start a timer that calls `token.cancel()`. Per-tool timeout and concurrency: `Agent::with_tool_timeout` / `Agent::with_tool_concurrency`.
 
 **Structured output** (deserialized into a Rust type):
 
@@ -377,6 +383,8 @@ Everything is read from environment variables (single entry point: [`src/config.
 | `AGENT_CLI_WEB_PORT` | `4173` | Port for the `--mode web`/`both` local web server (always bound to `127.0.0.1`) |
 | `AGENT_CLI_WEB_DIST_DIR` | `crates/web-ui/dist` | Web UI static asset directory (`trunk build` output) |
 | `AGENT_APPROVAL_TIMEOUT_SECS` | `300` | Upper bound for waiting on a human decision. A timeout is **not treated as a denial**; it suspends and persists the turn (see "Suspension and recovery"); the bound exists to release the session's round lock |
+| `AGENT_TOOL_TIMEOUT_SECS` | `300` | Time limit for one tool call; past it the call is abandoned and reported to the model as an error (a tool can override via `Tool::timeout`; `run_command` carries its own) |
+| `AGENT_TOOL_MAX_CONCURRENCY` | `8` | How many of one round's tool calls execute at once (calls waiting on approval do not take a slot) |
 | `TAVILY_API_KEY` | - | API key for the `web_search` tool |
 | `RUST_LOG` | `info` | Log level |
 

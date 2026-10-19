@@ -13,7 +13,7 @@ use chrono::{Datelike, NaiveDate, Utc};
 use rmcp::{
   ErrorData, ServerHandler,
   handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-  model::{ServerCapabilities, ServerInfo},
+  model::{ServerCapabilities, ServerConfig},
   tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
@@ -92,8 +92,8 @@ fn parse_date(value: &str) -> Result<NaiveDate, ErrorData> {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for DemoServer {
-  fn get_info(&self) -> ServerInfo {
+  fn get_info(&self) -> ServerConfig {
     // Advertising the tools capability is what makes the client call `tools/list`.
-    ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
   }
 }

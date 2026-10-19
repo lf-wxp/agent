@@ -5,7 +5,7 @@ use agent::{
   gaia::{dataset::load_gaia_level1, evaluator::evaluate_gaia_single, models::GaiaEvalResult},
   llm::provider::Provider,
   telemetry,
-  tools::ToolRegistry,
+  tools::{ToolRegistry, calculator, file_list, file_read, file_upzip, read_image, web_search},
 };
 use std::sync::Arc;
 use tokio::task::JoinSet;
@@ -34,9 +34,31 @@ pub async fn gaia_level1_experiment() -> anyhow::Result<()> {
 
   // Both arms run the same problems, so the comparison is paired rather than across samples.
   // `Arc` because each spawned task needs its own handle on the shared registry.
+  //
+  // The tool arm is pinned to a fixed set rather than `builtin()`: the run is unattended
+  // (no approval callback), so it must not be able to delete or write files or run shell
+  // commands, and pinning keeps results comparable across versions.
+  //
+  // That is the set the experiment had before the write/execute tools existed, minus
+  // `delete_file`: nothing in a question-answering benchmark needs to destroy data, and
+  // with no human to approve it the tool could only do harm. `unzip_file` stays because
+  // GAIA questions ship archives as attachments.
+  let with_tools: Vec<String> = [
+    calculator::NAME,
+    web_search::NAME,
+    file_list::NAME,
+    file_read::NAME,
+    file_upzip::NAME,
+    read_image::NAME,
+  ]
+  .map(str::to_owned)
+  .to_vec();
   let groups: [(&'static str, Arc<ToolRegistry>); 2] = [
     (GROUP_WITHOUT_TOOLS, Arc::new(ToolRegistry::empty())),
-    (GROUP_WITH_TOOLS, Arc::new(ToolRegistry::builtin()?)),
+    (
+      GROUP_WITH_TOOLS,
+      Arc::new(ToolRegistry::select(&with_tools)?),
+    ),
   ];
 
   let mut set = JoinSet::new();

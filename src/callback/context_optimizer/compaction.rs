@@ -9,9 +9,10 @@
 //! Three properties make it the right thing to try first:
 //!
 //! - **Free.** No model call, no tokenizer pass — just a walk over the items.
-//! - **Structure-preserving.** Only [`ContentItem::ToolResult::content`] is rewritten;
-//!   no item is added or removed, so tool calls keep their results and every index into
-//!   the conversation stays valid (which [`super::summarization`] relies on).
+//! - **Structure-preserving.** Only the text inside items is rewritten — a result's
+//!   `content`, and the bulky string arguments described below; no item is added or
+//!   removed, so tool calls keep their results and every index into the conversation
+//!   stays valid (which [`super::summarization`] relies on).
 //! - **Recoverable.** The replacement text tells the model how to get the real output
 //!   back, so a rewrite that turns out to have been premature costs one extra tool call
 //!   rather than the answer.
@@ -19,20 +20,36 @@
 //! The tail is exempt: [`Compaction::keep_recent`] items at the end are left whole, so
 //! the model still sees the full output of what it just did.
 //!
+//! # Bulky *arguments* of calls that were made
+//!
+//! Results are not the only large thing in a transcript. `write_file`'s `content` and
+//! `edit_file`'s `old_string` / `new_string` are the file, or a large part of it, and
+//! stay in the request for the rest of the conversation. Those are trimmed here as well
+//! ([`BULKY_ARGUMENTS`]), once the call is no longer recent. Nothing is lost that matters
+//! for the model's next step: the call's result already says what happened, and the
+//! file on disk is the record of its content. The *keys* stay, so the call still
+//! reads as a call to that tool with those parameters (a provider validating the history
+//! against the tool's schema sees every required field), and each trimmed value says how
+//! much was cut.
+//!
+//! This is the opposite exemption from the one below: a trimmed argument is never
+//! re-fetched, so it applies to tools with side effects — the call has already happened.
+//!
 //! Only tools that have been *registered* are recognized. An unknown tool is left alone
 //! rather than summarized by guesswork — a tool with side effects, or one whose result
 //! cannot be reproduced, must not be told to re-run. [`Compaction::new`] pre-registers
-//! the three built-in tools whose output is bulky, side-effect-free and cheap to fetch
-//! again; [`Compaction::with_tool`] extends that to a caller's own tools, including ones
-//! reached over MCP.
+//! the four built-in tools whose output is bulky, side-effect-free and cheap to fetch
+//! again (`read_file`, `list_files`, `grep`, `web_search`); [`Compaction::with_tool`]
+//! extends that to a caller's own tools, including ones reached over MCP.
 //!
 //! The remaining built-ins are left out on purpose, for three different reasons. Worth
 //! spelling out, because "was never considered" and "was considered and rejected" look
 //! identical from the registry:
 //!
-//! - [`crate::tools::file_delete`], [`crate::tools::file_upzip`] — side effects.
-//!   Re-running deletes or overwrites again, so the note would be an instruction to redo
-//!   work, not to re-fetch it.
+//! - [`crate::tools::file_delete`], [`crate::tools::file_upzip`],
+//!   [`crate::tools::file_write`], [`crate::tools::file_edit`], [`crate::tools::shell`]
+//!   — side effects. Re-running deletes, overwrites or executes again, so the note would
+//!   be an instruction to redo work, not to re-fetch it.
 //! - [`crate::tools::read_image`] — safe and reproducible, but not *cheap*: recovering
 //!   the dropped answer costs another vision model call, and the new answer need not
 //!   match the old one.
@@ -45,8 +62,23 @@ use serde_json::Value;
 
 use crate::{
   agent::{ContentItem, llm_request::LlmRequest},
-  tools::{file_list, file_read, web_search},
+  tools::{file_edit, file_list, file_read, file_write, grep, web_search},
 };
+
+/// Arguments of already-made calls that are bulky enough to trim, per tool.
+///
+/// Only the named keys: a path or a flag is small and is what makes the call
+/// recognizable. Keyed by tool name rather than by size alone so that an unregistered
+/// tool's arguments are never touched, for the same reason its results are not (see the
+/// module docs).
+const BULKY_ARGUMENTS: &[(&str, &[&str])] = &[
+  (file_write::NAME, &["content"]),
+  (file_edit::NAME, &["old_string", "new_string"]),
+];
+
+/// A bulky argument is only replaced when it is longer than this many chars: the stand-in
+/// text has a length of its own, so trimming something already shorter would grow it.
+const MIN_TRIMMED_ARGUMENT_CHARS: usize = 256;
 
 /// Builds the note that stands in for one tool's spent result, given the arguments the
 /// call was made with.
@@ -131,6 +163,43 @@ fn describe_file_list(arguments: &Value) -> String {
   )
 }
 
+/// Same reasoning as [`describe_file_list`] for the optional `path`.
+///
+/// Also names the options that change *which* lines match (`include`,
+/// `case_insensitive`): a model that re-runs the search from this note should get the
+/// same matches back, not a differently filtered set.
+fn describe_grep(arguments: &Value) -> String {
+  let path = preview(
+    arguments
+      .get("path")
+      .and_then(Value::as_str)
+      .unwrap_or(grep::DEFAULT_PATH),
+  );
+
+  let mut options = String::new();
+  if let Some(include) = arguments
+    .get("include")
+    .and_then(Value::as_str)
+    .filter(|include| !include.is_empty())
+  {
+    options.push_str(&format!(", only files matching '{}'", preview(include)));
+  }
+  if arguments
+    .get("case_insensitive")
+    .and_then(Value::as_bool)
+    .unwrap_or(false)
+  {
+    options.push_str(", case-insensitive");
+  }
+
+  format!(
+    "Search for '{}' in '{path}'{options} was already run. Call {} again with the same \
+     arguments if you need the matches.",
+    argument(arguments, "pattern"),
+    grep::NAME
+  )
+}
+
 #[derive(Clone)]
 pub struct Compaction {
   /// Trailing items left untouched — recent work the model is still reasoning about.
@@ -152,11 +221,12 @@ impl std::fmt::Debug for Compaction {
 
 impl Compaction {
   /// Rewrite spent results for the built-in reproducible tools (`read_file`,
-  /// `list_files`, `web_search`), leaving the last `keep_recent` items whole.
+  /// `list_files`, `grep`, `web_search`), leaving the last `keep_recent` items whole.
   pub fn new(keep_recent: usize) -> Self {
     Self::empty(keep_recent)
       .with_tool(file_read::NAME, describe_file_read)
       .with_tool(file_list::NAME, describe_file_list)
+      .with_tool(grep::NAME, describe_grep)
       .with_tool(web_search::NAME, describe_web_search)
   }
 
@@ -207,15 +277,22 @@ impl Compaction {
     // Calls always precede their results, so a single forward pass suffices.
     let mut call_args: HashMap<&str, &Value> = HashMap::new();
     let mut planned: Vec<(usize, String)> = Vec::new();
+    let mut trimmed_calls: Vec<usize> = Vec::new();
 
     for (index, item) in request.contents.iter().enumerate() {
       match item {
         ContentItem::ToolCall {
           tool_call_id,
+          name,
           arguments,
-          ..
         } => {
           call_args.insert(tool_call_id.as_str(), arguments);
+          // Trimmed whether or not a result is already paired with this call: an
+          // unpaired (cancelled or interrupted) write/edit is just as much "already
+          // sent" as a completed one, and its payload is no longer needed either way.
+          if index < protect_from && has_bulky_arguments(name, arguments) {
+            trimmed_calls.push(index);
+          }
         }
         ContentItem::ToolResult {
           tool_call_id,
@@ -238,15 +315,64 @@ impl Compaction {
       }
     }
 
-    let mut rewritten = Vec::with_capacity(planned.len());
+    let mut rewritten = Vec::with_capacity(planned.len() + trimmed_calls.len());
     for (index, replacement) in planned {
       if let Some(ContentItem::ToolResult { content, .. }) = request.contents.get_mut(index) {
         *content = replacement;
         rewritten.push(index);
       }
     }
+    for index in trimmed_calls {
+      if let Some(ContentItem::ToolCall {
+        name, arguments, ..
+      }) = request.contents.get_mut(index)
+      {
+        trim_bulky_arguments(name, arguments);
+        rewritten.push(index);
+      }
+    }
 
     rewritten
+  }
+}
+
+/// Whether `arguments` of a call to `tool` hold something [`trim_bulky_arguments`] would
+/// shrink.
+fn has_bulky_arguments(tool: &str, arguments: &Value) -> bool {
+  bulky_keys(tool).iter().any(|key| {
+    arguments
+      .get(*key)
+      .and_then(Value::as_str)
+      .is_some_and(|text| text.chars().count() > MIN_TRIMMED_ARGUMENT_CHARS)
+  })
+}
+
+fn bulky_keys(tool: &str) -> &'static [&'static str] {
+  BULKY_ARGUMENTS
+    .iter()
+    .find(|(name, _)| *name == tool)
+    .map_or(&[], |(_, keys)| *keys)
+}
+
+/// Replace each bulky string argument of `tool` with a note of how much it held.
+///
+/// Idempotent: the note is shorter than [`MIN_TRIMMED_ARGUMENT_CHARS`], so a second pass
+/// finds nothing left to do.
+fn trim_bulky_arguments(tool: &str, arguments: &mut Value) {
+  for key in bulky_keys(tool) {
+    let Some(slot) = arguments.get_mut(*key) else {
+      continue;
+    };
+    let Some(text) = slot.as_str() else {
+      continue;
+    };
+    let chars = text.chars().count();
+    if chars > MIN_TRIMMED_ARGUMENT_CHARS {
+      let lines = text.lines().count();
+      *slot = Value::String(format!(
+        "[{chars} chars, {lines} lines, omitted from history]"
+      ));
+    }
   }
 }
 
@@ -258,7 +384,7 @@ mod tests {
   use crate::{
     agent::ToolResultStatus,
     callback::context_optimizer::tokens,
-    tools::{calculator, file_delete, file_upzip, read_image},
+    tools::{calculator, file_delete, file_edit, file_upzip, file_write, read_image, shell},
   };
 
   fn call(id: &str, name: &str, arguments: Value) -> ContentItem {
@@ -361,6 +487,44 @@ mod tests {
   }
 
   /// `path` is optional, so a call that omits it must still name the directory that was
+  /// actually searched — the executor's default — rather than degrading to "unknown".
+  #[test]
+  fn a_spent_grep_is_replaced_by_a_note_naming_pattern_and_path() {
+    let mut request = request_of(vec![
+      call("g0", grep::NAME, json!({ "pattern": "fn main" })),
+      result("g0", grep::NAME, &"src/main.rs:1: fn main\n".repeat(300)),
+    ]);
+    Compaction::new(0).apply(&mut request);
+
+    let first = result_contents(&request)[0];
+    assert!(first.contains("fn main"), "got: {first}");
+    assert!(
+      first.contains(&format!("'{}'", grep::DEFAULT_PATH)),
+      "got: {first}"
+    );
+    assert!(first.contains(grep::NAME), "got: {first}");
+  }
+
+  /// A note that dropped the filters would send the model back for a different result
+  /// set than the one it had.
+  #[test]
+  fn a_spent_grep_note_keeps_the_options_that_change_the_matches() {
+    let mut request = request_of(vec![
+      call(
+        "g0",
+        grep::NAME,
+        json!({ "pattern": "todo", "include": "*.rs", "case_insensitive": true }),
+      ),
+      result("g0", grep::NAME, &"src/main.rs:1: TODO\n".repeat(300)),
+    ]);
+    Compaction::new(0).apply(&mut request);
+
+    let first = result_contents(&request)[0];
+    assert!(first.contains("*.rs"), "got: {first}");
+    assert!(first.contains("case-insensitive"), "got: {first}");
+  }
+
+  /// `path` is optional, so a call that omits it must still name the directory that was
   /// actually listed — the executor's default — rather than degrading to "unknown".
   #[test]
   fn a_listing_without_an_explicit_path_names_the_default_directory() {
@@ -423,6 +587,135 @@ mod tests {
     assert_eq!(result_contents(&request), ["deleted /tmp/x", "payload"]);
   }
 
+  /// A model-written file stays in every later request unless its payload is dropped, and
+  /// the file on disk already is the record of it.
+  #[test]
+  fn a_spent_write_has_its_content_trimmed_but_keeps_its_shape() {
+    let body = "line\n".repeat(400);
+    let mut request = request_of(vec![
+      call(
+        "w0",
+        file_write::NAME,
+        json!({ "file_path": "src/a.rs", "content": body }),
+      ),
+      result(
+        "w0",
+        file_write::NAME,
+        "Created src/a.rs (2000 bytes, 400 lines)",
+      ),
+    ]);
+    let rewritten = Compaction::new(0).apply(&mut request);
+
+    assert_eq!(rewritten, vec![0]);
+    let ContentItem::ToolCall { arguments, .. } = &request.contents[0] else {
+      panic!("the call must stay a call");
+    };
+    assert_eq!(arguments["file_path"], "src/a.rs", "the path is kept");
+    let content = arguments["content"].as_str().unwrap();
+    assert!(content.contains("2000 chars"), "got: {content}");
+    assert!(content.contains("400 lines"), "got: {content}");
+    // Its result is still the real one: only the payload was dropped.
+    assert_eq!(
+      result_contents(&request)[0],
+      "Created src/a.rs (2000 bytes, 400 lines)"
+    );
+  }
+
+  #[test]
+  fn a_spent_edit_has_both_strings_trimmed() {
+    let big = "x".repeat(1000);
+    let mut request = request_of(vec![
+      call(
+        "e0",
+        file_edit::NAME,
+        json!({ "file_path": "a.rs", "old_string": big, "new_string": big }),
+      ),
+      result("e0", file_edit::NAME, "Replaced 1 occurrence in a.rs"),
+    ]);
+    Compaction::new(0).apply(&mut request);
+
+    let ContentItem::ToolCall { arguments, .. } = &request.contents[0] else {
+      panic!("the call must stay a call");
+    };
+    for key in ["old_string", "new_string"] {
+      assert!(
+        arguments[key].as_str().unwrap().contains("1000 chars"),
+        "{key}: {arguments}"
+      );
+    }
+  }
+
+  /// The newest call is the one the model is still acting on.
+  #[test]
+  fn a_recent_write_keeps_its_content() {
+    let body = "line\n".repeat(400);
+    let mut request = request_of(vec![call(
+      "w0",
+      file_write::NAME,
+      json!({ "file_path": "a.rs", "content": body.clone() }),
+    )]);
+    let rewritten = Compaction::new(5).apply(&mut request);
+
+    assert!(rewritten.is_empty());
+    let ContentItem::ToolCall { arguments, .. } = &request.contents[0] else {
+      panic!("the call must stay a call");
+    };
+    assert_eq!(arguments["content"], body);
+  }
+
+  /// Short arguments stay: the stand-in text would not be shorter.
+  #[test]
+  fn a_small_write_is_left_alone() {
+    let mut request = request_of(vec![
+      call(
+        "w0",
+        file_write::NAME,
+        json!({ "file_path": "a.txt", "content": "hello" }),
+      ),
+      result("w0", file_write::NAME, "Created a.txt"),
+    ]);
+
+    assert!(Compaction::new(0).apply(&mut request).is_empty());
+  }
+
+  /// Another tool's `content` argument is not this module's to judge.
+  #[test]
+  fn an_unrelated_tool_keeps_its_arguments() {
+    let body = "x".repeat(1000);
+    let mut request = request_of(vec![
+      call("o0", "some_other_tool", json!({ "content": body.clone() })),
+      result("o0", "some_other_tool", "ok"),
+    ]);
+    Compaction::new(0).apply(&mut request);
+
+    let ContentItem::ToolCall { arguments, .. } = &request.contents[0] else {
+      panic!("the call must stay a call");
+    };
+    assert_eq!(arguments["content"], body);
+  }
+
+  #[test]
+  fn trimming_arguments_is_idempotent_and_shrinks_the_request() {
+    let mut once = request_of(vec![
+      call(
+        "w0",
+        file_write::NAME,
+        json!({ "file_path": "a.rs", "content": "line\n".repeat(400) }),
+      ),
+      result("w0", file_write::NAME, "Created a.rs"),
+    ]);
+    let before = tokens::count_request(&once);
+    Compaction::new(0).apply(&mut once);
+    assert!(tokens::count_request(&once) < before);
+
+    let mut twice = request_of(once.contents.clone());
+    assert!(Compaction::new(0).apply(&mut twice).is_empty());
+    assert_eq!(
+      serde_json::to_string(&once.contents).unwrap(),
+      serde_json::to_string(&twice.contents).unwrap()
+    );
+  }
+
   /// The built-ins this module's docs single out are excluded by decision, not by
   /// oversight. Asserting it keeps someone from "completing" the registry by hand and
   /// quietly telling the model to re-delete a file or re-pay for a vision call.
@@ -432,6 +725,9 @@ mod tests {
     for name in [
       file_delete::NAME,
       file_upzip::NAME,
+      file_write::NAME,
+      file_edit::NAME,
+      shell::NAME,
       read_image::NAME,
       calculator::NAME,
     ] {

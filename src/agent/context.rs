@@ -1,6 +1,7 @@
 use std::{borrow::Cow, collections::VecDeque};
 
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::event::Event;
@@ -55,6 +56,8 @@ pub struct Conversation {
   /// enforces. Pass the same scope here that is passed to the store.
   pub scope: Option<String>,
   pub events: Vec<Event>,
+  /// Cancels the run started from this conversation; see [`Self::with_cancellation`].
+  pub cancellation: Option<CancellationToken>,
 }
 
 impl Conversation {
@@ -64,6 +67,7 @@ impl Conversation {
       id: Some(id.into()),
       scope: None,
       events,
+      cancellation: None,
     }
   }
 
@@ -73,7 +77,21 @@ impl Conversation {
       id: None,
       scope: None,
       events,
+      cancellation: None,
     }
+  }
+
+  /// Let `token` stop the run started from this conversation.
+  ///
+  /// Once it fires, a model request in flight is abandoned, tool calls still running are
+  /// dropped and recorded as cancelled, and the run ends with a
+  /// [`crate::agent::Cancelled`] error carrying the transcript so far — so the caller can
+  /// still persist what did happen. Combine with a timer (`tokio::time::sleep` then
+  /// `token.cancel()`) for a whole-run deadline.
+  #[must_use]
+  pub fn with_cancellation(mut self, token: CancellationToken) -> Self {
+    self.cancellation = Some(token);
+    self
   }
 
   /// Namespace [`Self::id`] is unique within — the same value handed to
@@ -124,6 +142,14 @@ pub struct ExecutionContext {
   pub current_step: u32,
   pub final_result: Option<String>,
   pub usage: TokenUsage,
+  /// Fires when the caller wants this run to stop; see
+  /// [`Conversation::with_cancellation`]. A fresh, never-cancelled token by default.
+  ///
+  /// Not serialized: a token is a live handle to whoever holds its other end, which
+  /// cannot survive a trip through storage. A run restored from disk (e.g. to be resumed)
+  /// starts with a fresh one — see [`crate::agent::AgentRunState::with_cancellation`].
+  #[serde(skip)]
+  pub cancellation: CancellationToken,
 }
 
 impl ExecutionContext {
@@ -136,6 +162,7 @@ impl ExecutionContext {
       current_step: 0,
       final_result: None,
       usage: TokenUsage::default(),
+      cancellation: CancellationToken::new(),
     }
   }
 

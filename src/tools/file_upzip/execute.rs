@@ -37,8 +37,12 @@ pub fn run(args_json: &str) -> anyhow::Result<String> {
   let mut names = Vec::with_capacity(archive.len());
   for i in 0..archive.len() {
     let mut entry = archive.by_index(i)?;
-    let out_path = extract_to.join(entry.name());
-    names.push(entry.name().to_string());
+    // `name()` returns `Result<Cow<str>, _>` since zip 9.0: the name is decoded from the
+    // raw bytes on demand, so a non-UTF-8 entry name is an error rather than a garbled
+    // string.
+    let name = entry.name().context("entry name is not valid UTF-8")?;
+    let out_path = extract_to.join(name.as_ref());
+    names.push(name.into_owned());
 
     if entry.is_dir() {
       fs::create_dir_all(&out_path)?;

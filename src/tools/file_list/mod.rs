@@ -39,4 +39,5 @@ simple_tool!(
   name = NAME,
   description = "List files and directories at a given path, directories listed first.",
   run = execute::run,
+  concurrency_safe = true,
 );
