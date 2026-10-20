@@ -41,7 +41,7 @@ const QUESTION: &str = "What did the most recent stable Rust release change, and
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  telemetry::init()?;
+  let _telemetry = telemetry::init()?;
 
   let toolbox = Arc::new(ToolRegistry::select(&[web_search::NAME.to_owned()])?);
 

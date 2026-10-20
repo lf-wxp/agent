@@ -986,6 +986,17 @@ button {
   margin: 0.4rem 0 0;
 }
 
+/* What a turn spent, right under its reply: present for whoever wants it, quiet enough
+   for whoever does not. */
+.turn-usage {
+  align-self: flex-start;
+  margin-top: -0.35rem;
+  padding-left: 0.2rem;
+  font-size: 0.68rem;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
 .notice-icon {
   flex-shrink: 0;
   width: 1.1rem;

@@ -1,16 +1,31 @@
-use std::{borrow::Cow, collections::VecDeque};
+use std::{
+  borrow::Cow,
+  collections::{BTreeMap, VecDeque},
+};
 
+use async_openai::types::chat::CompletionUsage;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::event::Event;
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+/// Tokens spent, as the provider reported them.
+///
+/// The two breakdowns are subsets, not extra tokens: `cached_prompt_tokens` is the part
+/// of `prompt_tokens` served from the provider's prompt cache (usually billed at a
+/// discount), `reasoning_tokens` the part of `completion_tokens` a reasoning model spent
+/// thinking (billed as output). Both stay `0` for a provider that does not report them,
+/// and default to `0` when reading data saved before they existed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
   pub prompt_tokens: u32,
   pub completion_tokens: u32,
   pub total_tokens: u32,
+  #[serde(default)]
+  pub cached_prompt_tokens: u32,
+  #[serde(default)]
+  pub reasoning_tokens: u32,
 }
 
 impl TokenUsage {
@@ -23,6 +38,45 @@ impl TokenUsage {
     self.prompt_tokens = self.prompt_tokens.saturating_add(prompt_tokens);
     self.completion_tokens = self.completion_tokens.saturating_add(completion_tokens);
     self.total_tokens = self.total_tokens.saturating_add(total_tokens);
+  }
+
+  /// Accumulate `other`, breakdowns included. Saturating, like [`Self::add`].
+  pub fn merge(&mut self, other: &TokenUsage) {
+    self.add(
+      other.prompt_tokens,
+      other.completion_tokens,
+      other.total_tokens,
+    );
+    self.cached_prompt_tokens = self
+      .cached_prompt_tokens
+      .saturating_add(other.cached_prompt_tokens);
+    self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
+  }
+
+  /// Nothing was spent — what a provider that reports no usage leaves behind.
+  pub fn is_empty(&self) -> bool {
+    *self == Self::default()
+  }
+}
+
+impl From<&CompletionUsage> for TokenUsage {
+  /// A response's (or a stream's final chunk's) `usage` block, breakdowns included.
+  fn from(usage: &CompletionUsage) -> Self {
+    Self {
+      prompt_tokens: usage.prompt_tokens,
+      completion_tokens: usage.completion_tokens,
+      total_tokens: usage.total_tokens,
+      cached_prompt_tokens: usage
+        .prompt_tokens_details
+        .as_ref()
+        .and_then(|details| details.cached_tokens)
+        .unwrap_or(0),
+      reasoning_tokens: usage
+        .completion_tokens_details
+        .as_ref()
+        .and_then(|details| details.reasoning_tokens)
+        .unwrap_or(0),
+    }
   }
 }
 
@@ -141,7 +195,18 @@ pub struct ExecutionContext {
   pub events: Vec<Event>,
   pub current_step: u32,
   pub final_result: Option<String>,
+  /// Everything this run spent, across every model: its own requests, plus whatever
+  /// the tools and hooks it ran charged to it (a sub-agent, a vision call, a summary —
+  /// see [`crate::agent::usage`]).
   pub usage: TokenUsage,
+  /// [`Self::usage`] split by the model it was spent on, which is what pricing needs:
+  /// a sub-agent on a cheaper model costs differently per token than its parent. Kept in
+  /// step with `usage` by [`Self::record_usage`].
+  ///
+  /// Empty in data saved before it existed, and omitted from serialized output while
+  /// empty.
+  #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+  pub usage_by_model: BTreeMap<String, TokenUsage>,
   /// Fires when the caller wants this run to stop; see
   /// [`Conversation::with_cancellation`]. A fresh, never-cancelled token by default.
   ///
@@ -162,8 +227,24 @@ impl ExecutionContext {
       current_step: 0,
       final_result: None,
       usage: TokenUsage::default(),
+      usage_by_model: BTreeMap::new(),
       cancellation: CancellationToken::new(),
     }
+  }
+
+  /// Add `usage`, spent on `model`, to both [`Self::usage`] and
+  /// [`Self::usage_by_model`]. Empty usage is ignored, so a provider that reports none
+  /// does not leave a row of zeros behind.
+  pub fn record_usage(&mut self, model: &str, usage: TokenUsage) {
+    if usage.is_empty() {
+      return;
+    }
+    self.usage.merge(&usage);
+    self
+      .usage_by_model
+      .entry(model.to_owned())
+      .or_default()
+      .merge(&usage);
   }
 
   /// The most stable identity available for this run: the conversation it belongs to when
@@ -350,6 +431,60 @@ mod tests {
     assert_eq!(usage.prompt_tokens, u32::MAX);
     assert_eq!(usage.completion_tokens, u32::MAX);
     assert_eq!(usage.total_tokens, u32::MAX);
+  }
+
+  #[test]
+  fn token_usage_reads_the_cached_and_reasoning_breakdowns() {
+    let reported: CompletionUsage = serde_json::from_value(serde_json::json!({
+      "prompt_tokens": 100,
+      "completion_tokens": 40,
+      "total_tokens": 140,
+      "prompt_tokens_details": { "cached_tokens": 64 },
+      "completion_tokens_details": { "reasoning_tokens": 30 },
+    }))
+    .unwrap();
+    let usage = TokenUsage::from(&reported);
+    assert_eq!(usage.cached_prompt_tokens, 64);
+    assert_eq!(usage.reasoning_tokens, 30);
+    assert_eq!(usage.total_tokens, 140);
+  }
+
+  /// Sessions and suspended runs saved before the breakdowns existed must still load.
+  #[test]
+  fn usage_saved_without_the_breakdowns_still_loads() {
+    let old: TokenUsage =
+      serde_json::from_str(r#"{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}"#)
+        .unwrap();
+    assert_eq!(old.cached_prompt_tokens, 0);
+    assert_eq!(old.reasoning_tokens, 0);
+
+    let mut context = serde_json::to_value(ExecutionContext::new()).unwrap();
+    context.as_object_mut().unwrap().remove("usage_by_model");
+    let back: ExecutionContext = serde_json::from_value(context).unwrap();
+    assert!(back.usage_by_model.is_empty());
+  }
+
+  #[test]
+  fn record_usage_keeps_the_total_and_the_per_model_split_in_step() {
+    let mut context = ExecutionContext::new();
+    let spend = |prompt, completion| TokenUsage {
+      prompt_tokens: prompt,
+      completion_tokens: completion,
+      total_tokens: prompt + completion,
+      ..TokenUsage::default()
+    };
+    context.record_usage("big", spend(100, 10));
+    context.record_usage("small", spend(50, 5));
+    context.record_usage("big", spend(1, 1));
+    context.record_usage("silent", TokenUsage::default());
+
+    assert_eq!(context.usage.prompt_tokens, 151);
+    assert_eq!(context.usage_by_model["big"].prompt_tokens, 101);
+    assert_eq!(context.usage_by_model["small"].completion_tokens, 5);
+    assert!(
+      !context.usage_by_model.contains_key("silent"),
+      "nothing spent, nothing recorded"
+    );
   }
 
   /// The premise behind resuming an interrupted run: a run in progress is data, so it

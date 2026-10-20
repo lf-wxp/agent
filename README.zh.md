@@ -321,11 +321,25 @@ let result = agent.run_continuing(history, "我刚才让你记的是什么时间
   - 每次调用都是全新的一次运行，看不到父 agent 的对话。
   - 只有子 agent 的工具全部可以并发时，这个工具才会和同一轮的其他调用并发执行。
   - 耗时长的任务可以用 `.with_timeout(..)` 放宽时间上限。
-  - 子 agent 消耗的 token 记在 `AgentTool::usage()` 里，不计入父 agent 的 `usage`。
+  - 子 agent 消耗的 token 在消耗的同时就记到父 agent 这次运行上（按子 agent 的模型分开记，委派失败也照算）；`AgentTool::usage()` 另外单独给出子 agent 自己的那一份。
 - `update_plan`（已加入 `ToolRegistry::builtin`）让模型给多步任务维护一份计划清单。
   - 每次调用都带上完整计划并替换上一份，所以计划就保存在对话记录里，落盘、挂起恢复都不需要额外状态。
   - 终端里显示为 `[plan]` 清单。
 - 示例见 `examples/sub_agent.rs`。
+
+**链路追踪、用量与成本**：
+- **span**：每次运行都会产生按 OpenTelemetry GenAI 约定命名的 `tracing` span：
+  - 每次运行一个 `invoke_agent`，可以用 `Agent::with_name` 命名；
+  - 每次模型请求一个 `chat`，覆盖本 crate 发出的所有请求，记录用量和结束原因；
+  - 每次工具调用一个 `execute_tool`。
+  - 子 agent 的运行挂在发起它的那次工具调用下面。
+- **导出**：编译时加 `--features otel`，并设置 `OTEL_EXPORTER_OTLP_ENDPOINT`（例如 `http://localhost:4318`），span 就会通过 OTLP/HTTP 导出。`OTEL_SERVICE_NAME` 等标准变量同样生效。`telemetry::init()` 会返回一个守卫，要在整个程序生命周期内持有（`main` 开头写 `let _telemetry = telemetry::init()?;`）：它析构时会把最后一批 span 刷出去，所以 `?` 提前返回也会被覆盖。用 `std::process::exit` 结束的进程（例如 CLI 的信号处理）要先自己调用 `telemetry::shutdown()`。
+- **用量**：
+  - `ExecutionContext::usage` 是这次运行的总量，包括工具、钩子和子 agent 的消耗；`usage_by_model` 按模型拆分。
+  - 提供商报告了缓存命中和推理 token 时，也会一并记录。
+  - 自定义工具如果直接调用 `Provider::chat`，可以用 `agent::usage::charge` 把用量记到所在的运行上。
+- **成本**：把 `LLM_PRICING_FILE` 指向一个 JSON 价格表（按每百万 token 计价，格式见 `llm::pricing`），`PriceTable::estimate` 就能算出一次运行的费用。代码里不内置任何价格。
+- **显示**：CLI 每轮结束时打印一行暗色的 `[usage] … in · … out · ≈ … USD`，Web UI 在回答下方显示同样的信息。
 
 **取消与超时**：通过 `Conversation::with_cancellation(token)` 传入一个 `tokio_util::sync::CancellationToken`。取消后：
 - 正在进行的模型请求立即放弃；
@@ -425,6 +439,9 @@ agent.run_continuing(
 | `LLM_TOP_P` | 不发送 | 核采样 `top_p`，`0`–`1` |
 | `LLM_REASONING_EFFORT` | 不发送 | 推理强度：`none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` |
 | `LLM_REPLAY_REASONING` | `false` | 把历史 assistant 消息的推理内容以 `reasoning_content` 发回（DeepSeek 思考模式带 tools 时必须；部分其他提供商会拒绝） |
+| `LLM_PRICING_FILE` | - | 用于估算成本的 JSON 价格表（格式见 `llm::pricing`）；不设置则不显示成本 |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | - | 配合 `--features otel`：把 span 通过 OTLP/HTTP 导出到这个地址（例如 `http://localhost:4318`） |
+| `OTEL_SERVICE_NAME` | `agent` | 配合 `--features otel`：导出时使用的服务名 |
 | `MCP_CONFIG_PATH` | `mcp.json` | MCP Server 配置路径 |
 | `AGENT_CLI_SESSION_DIR` | `.agent/sessions` | CLI 会话落盘目录 |
 | `AGENT_CLI_APPROVAL_DIR` | `.agent/approvals` | 挂起轮次的落盘目录（与会话目录分开：两者生命周期相反，清空历史不该顺手丢掉一个待批准的操作） |

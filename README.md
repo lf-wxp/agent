@@ -315,7 +315,14 @@ let result = agent.run_continuing(history, "What time did I just ask you to note
 
 **Streaming output**: replace `run` with `agent.run_stream(input)` to get an `impl Stream<Item = AgentStreamEvent>` and forward it token by token — see [`examples/agent_stream.rs`](examples/agent_stream.rs).
 
-**Sub-agents and planning**: `AgentTool::new(name, description, agent)` offers an `Agent` to another agent as a tool. The parent model delegates a self-contained `task`; the sub-agent runs its own loop with its own model, prompt, tools and hooks, and only its final answer comes back, so its intermediate reads and searches never enter the parent's context. Each call starts fresh and sees nothing of the parent's conversation. The tool is safe to run alongside its siblings only when every one of the sub-agent's tools is; give long delegations more time with `.with_timeout(..)`; what the sub-agent spends is reported by `AgentTool::usage()`, not added to the parent's `usage`. `update_plan` (in `ToolRegistry::builtin`) lets the model keep a checklist for multi-step work: every call carries the whole plan and replaces the previous one, so the plan lives in the transcript and survives persistence and resume with no extra state; the terminal prints it as a `[plan]` checklist. See `examples/sub_agent.rs`.
+**Sub-agents and planning**: `AgentTool::new(name, description, agent)` offers an `Agent` to another agent as a tool. The parent model delegates a self-contained `task`; the sub-agent runs its own loop with its own model, prompt, tools and hooks, and only its final answer comes back, so its intermediate reads and searches never enter the parent's context. Each call starts fresh and sees nothing of the parent's conversation. The tool is safe to run alongside its siblings only when every one of the sub-agent's tools is; give long delegations more time with `.with_timeout(..)`; what the sub-agent spends is charged to the parent run as it is spent (so it appears in the parent's `usage`, under the sub-agent's model, even when the delegation fails), and `AgentTool::usage()` reports the sub-agent's share on its own. `update_plan` (in `ToolRegistry::builtin`) lets the model keep a checklist for multi-step work: every call carries the whole plan and replaces the previous one, so the plan lives in the transcript and survives persistence and resume with no extra state; the terminal prints it as a `[plan]` checklist. See `examples/sub_agent.rs`.
+
+**Tracing, usage and cost**:
+- **Spans** — every run emits `tracing` spans named after the OpenTelemetry GenAI conventions: `invoke_agent` per run (name it with `Agent::with_name`), `chat` per model request (every request the crate makes, with usage and finish reason), `execute_tool` per tool call; a sub-agent's run nests under the call that started it.
+- **Export** — build with `--features otel` and set `OTEL_EXPORTER_OTLP_ENDPOINT` (e.g. `http://localhost:4318`) to export them over OTLP/HTTP; `OTEL_SERVICE_NAME` and the other standard variables apply. Keep `telemetry::init()`'s guard alive for the whole program (`let _telemetry = telemetry::init()?;` at the top of `main`): dropping it flushes the last batch, so an early `?` return is covered too. A process that ends with `std::process::exit` calls `telemetry::shutdown()` first (the CLI's signal handler does).
+- **Usage** — `ExecutionContext::usage` is the run's total, including what its tools, hooks and sub-agents spent, and `usage_by_model` splits it by model; cached prompt tokens and reasoning tokens are recorded when the provider reports them. A custom tool that calls `Provider::chat` directly can bill its run with `agent::usage::charge`.
+- **Cost** — point `LLM_PRICING_FILE` at a JSON price list (per million tokens, see `llm::pricing`); `PriceTable::estimate` then prices a run. No prices are built in.
+- **Display** — the CLI ends each turn with a dim `[usage] … in · … out · ≈ … USD` line; the Web UI shows the same under the reply.
 
 **Cancellation and timeouts**: pass a `tokio_util::sync::CancellationToken` via `Conversation::with_cancellation(token)`. Once it fires, a model request in flight is abandoned, still-running tools are cut short and recorded as cancelled, and the run ends with an `agent::Cancelled` error carrying the transcript so far (downcast it and persist as usual). Use `AgentRunState::with_cancellation` when resuming. For a whole-run deadline, start a timer that calls `token.cancel()`. Per-tool timeout and concurrency: `Agent::with_tool_timeout` / `Agent::with_tool_concurrency`.
 
@@ -387,6 +394,9 @@ Everything is read from environment variables (single entry point: [`src/config.
 | `LLM_TOP_P` | not sent | Nucleus sampling `top_p`, `0`–`1` |
 | `LLM_REASONING_EFFORT` | not sent | `none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` |
 | `LLM_REPLAY_REASONING` | `false` | Send earlier assistant turns' chain of thought back as `reasoning_content` (required by DeepSeek's thinking mode with tools; rejected by some other providers) |
+| `LLM_PRICING_FILE` | - | JSON price list for cost estimates (see `llm::pricing`); unset means no cost is shown |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | - | With `--features otel`: export spans over OTLP/HTTP to this endpoint (e.g. `http://localhost:4318`) |
+| `OTEL_SERVICE_NAME` | `agent` | With `--features otel`: the exported service name |
 | `MCP_CONFIG_PATH` | `mcp.json` | Path to the MCP Server config |
 | `AGENT_CLI_SESSION_DIR` | `.agent/sessions` | Directory for persisted CLI sessions |
 | `AGENT_CLI_APPROVAL_DIR` | `.agent/approvals` | Directory for suspended turns (separate from sessions: the two have opposite lifecycles, and clearing history shouldn't also drop a pending operation) |
@@ -446,8 +456,8 @@ cargo make                  # = cargo make ci: fmt check + clippy (native + wasm
 |---|---|
 | `cargo make ci` | The full gate before opening a PR: `fmt-check` → `clippy` → `clippy-wasm` → `test` (default task) |
 | `cargo make dev` | Same, but formats instead of failing; the version to run while editing |
-| `cargo make check` / `check-wasm` | Type check only (includes `examples/`; the wasm one targets `crates/shared` + `crates/web-ui`) |
-| `cargo make test` | Unit + integration tests + doctests |
+| `cargo make check` / `check-wasm` | Type check only (includes `examples/` and every feature; the wasm one targets `crates/shared` + `crates/web-ui`) |
+| `cargo make test` | Unit + integration tests + doctests (with `--all-features`, as CI runs them) |
 | `cargo make fmt` / `fmt-check` | Format / check without rewriting |
 | `cargo make web` / `web-release` / `web-serve` | `trunk` builds the Web UI into `crates/web-ui/dist` / size-optimized / hot-reload dev server |
 | `cargo make build` | Release build: native binary + Web UI artifacts |

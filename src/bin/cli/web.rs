@@ -23,11 +23,14 @@ use std::{convert::Infallible, net::SocketAddr, path::Path as FsPath, pin::Pin, 
 
 use agent::{
   Agent, AgentStreamEvent,
-  agent::{ApprovalStore, ContentItem, Event, FileApprovalStore, ToolResultStatus},
+  agent::{
+    ApprovalStore, ContentItem, Event, ExecutionContext, FileApprovalStore, ToolResultStatus,
+  },
   callback::dual_approval::{
     ApprovalChannel, ApprovalMeta, ApprovalOutcome, ApprovalRegistry, DualApprovalCallback,
     PendingApproval,
   },
+  llm::pricing::PriceTable,
   session::{FileSessionStore, SessionStore},
 };
 use anyhow::Context;
@@ -46,7 +49,7 @@ use futures::{Stream, StreamExt};
 use shared::{
   ApprovalDecision, ChatAccepted, ChatEvent, ChatRequest, HistoryContentItem, HistoryEntry,
   MessageOrigin, PendingApprovalView, SuspendedRunView, ToolCallSummary, ToolResultSummary,
-  ToolStatus,
+  ToolStatus, TurnCost, TurnUsage,
 };
 use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc};
 use tower_http::{
@@ -148,6 +151,10 @@ impl WebState {
   /// [`StopReason::RoundInFlight`] is written *ahead* of a round that is, right now,
   /// running — and startup closes out any left by a previous process before this server
   /// serves anything, so at runtime one can only mean a live round.
+  ///
+  /// [`StopReason`]: agent::StopReason
+  /// [`StopReason::AwaitingDecision`]: agent::StopReason::AwaitingDecision
+  /// [`StopReason::RoundInFlight`]: agent::StopReason::RoundInFlight
   ///
   /// Reporting those as suspended put a "Paused, waiting for approval" card, complete
   /// with `Carry on`/`Give up`, next to the live approval prompt for the very same call
@@ -374,7 +381,8 @@ pub(crate) fn new_turn_id() -> String {
 /// broadcast an empty `UserMessage` and persist an empty user entry to the shared
 /// transcript that every front-end then has to render.
 ///
-/// An in-chat command (see [`commands`]) is handled inline instead of becoming a turn —
+/// An in-chat command (see `shared::commands`) is handled inline instead of becoming a
+/// turn —
 /// the same as the terminal does with it — so it neither reaches the model nor waits on
 /// the session's turn lock. The reply comes back as a [`ChatEvent::SystemNotice`] on the
 /// shared stream, so every view sees it, not just the tab that typed it.
@@ -451,6 +459,7 @@ pub(crate) async fn chat_handler(
     let _ = state.events.send(ChatEvent::Done {
       turn: turn.clone(),
       budget_exhausted: false,
+      usage: None,
     });
     return Ok((StatusCode::ACCEPTED, Json(ChatAccepted { turn })));
   }
@@ -469,6 +478,7 @@ pub(crate) async fn chat_handler(
     let _ = state.events.send(ChatEvent::Done {
       turn: turn.clone(),
       budget_exhausted: false,
+      usage: None,
     });
     return Ok((StatusCode::ACCEPTED, Json(ChatAccepted { turn })));
   }
@@ -769,6 +779,30 @@ fn to_history_content_item(item: ContentItem) -> HistoryContentItem {
   }
 }
 
+/// What a finished turn spent, for [`ChatEvent::Done`]: the run's usage across every
+/// model (its sub-agents' and tools' included), priced with the configured
+/// [`PriceTable`] when there is one. `None` when the provider reported no usage at all.
+pub(crate) fn turn_usage(context: &ExecutionContext) -> Option<TurnUsage> {
+  let usage = &context.usage;
+  if usage.is_empty() {
+    return None;
+  }
+  let cost = PriceTable::from_config()
+    .estimate(&context.usage_by_model)
+    .map(|estimate| TurnCost {
+      amount: estimate.amount,
+      currency: estimate.currency,
+      partial: !estimate.unpriced_models.is_empty(),
+    });
+  Some(TurnUsage {
+    input_tokens: usage.prompt_tokens,
+    output_tokens: usage.completion_tokens,
+    cached_input_tokens: usage.cached_prompt_tokens,
+    reasoning_tokens: usage.reasoning_tokens,
+    cost,
+  })
+}
+
 /// Every [`AgentStreamEvent`] variant maps to exactly one [`ChatEvent`], except
 /// [`AgentStreamEvent::ToolCallsStarted`]/[`AgentStreamEvent::ToolCallsFinished`], whose
 /// [`ContentItem`]s are always [`ContentItem::ToolCall`]/[`ContentItem::ToolResult`] by
@@ -804,10 +838,13 @@ pub(crate) fn to_chat_events(event: &AgentStreamEvent, turn: &str) -> Vec<ChatEv
         .collect(),
     }],
     AgentStreamEvent::Done {
-      budget_exhausted, ..
+      budget_exhausted,
+      context,
+      ..
     } => vec![ChatEvent::Done {
       turn: turn.to_owned(),
       budget_exhausted: *budget_exhausted,
+      usage: turn_usage(context),
     }],
     // Handled by the turn driver rather than here: announcing a suspension means first
     // storing the run it can be resumed from, which is a side effect this conversion

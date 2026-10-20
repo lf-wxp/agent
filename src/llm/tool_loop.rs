@@ -133,6 +133,11 @@ pub async fn run(
     .await?;
     // The full response can be long; only log metadata to inspect usage and trace id.
     tracing::debug!(id = %response.id, round, usage = ?response.usage, "completion finished");
+    // A no-op unless this loop runs inside an agent's run — e.g. in a custom tool — in
+    // which case that run is billed for it (see `crate::agent::usage`).
+    if let Some(spent) = &response.usage {
+      crate::agent::usage::charge(model, spent.into());
+    }
 
     let choice = first_choice(response)?;
 

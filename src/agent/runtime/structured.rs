@@ -54,6 +54,7 @@ use super::{
     event::{ContentItem, Event, ToolResultStatus},
   },
   Agent,
+  observe::RunScope,
 };
 
 /// Outcome of [`Agent::run_structured`] / [`Agent::run_structured_raw`].
@@ -167,7 +168,19 @@ impl Agent {
   ) -> anyhow::Result<StructuredAgentResult<T>> {
     let mut context = ExecutionContext::new();
     self.record_user_input(&mut context, user_input);
+    let scope = RunScope::new(self, &context);
+    let result = scope
+      .run(self.final_answer_rounds(context, final_answer))
+      .await;
+    scope.finish_structured(result)
+  }
 
+  /// The loop [`Self::run_final_answer_loop`] runs.
+  async fn final_answer_rounds<T: DeserializeOwned>(
+    &self,
+    mut context: ExecutionContext,
+    final_answer: ChatCompletionTools,
+  ) -> anyhow::Result<StructuredAgentResult<T>> {
     let mut tool_definitions = self.toolbox.definitions().to_vec();
     tool_definitions.push(final_answer.clone());
     let final_answer_only = std::slice::from_ref(&final_answer);
@@ -335,7 +348,21 @@ impl Agent {
   ) -> anyhow::Result<StructuredAgentResult<T>> {
     let mut context = ExecutionContext::new();
     self.record_user_input(&mut context, user_input);
+    let scope = RunScope::new(self, &context);
+    let result = scope
+      .run(self.response_format_rounds(context, mode, schema_hint, response_format))
+      .await;
+    scope.finish_structured(result)
+  }
 
+  /// The loop [`Self::run_response_format_loop`] runs.
+  async fn response_format_rounds<T: DeserializeOwned>(
+    &self,
+    mut context: ExecutionContext,
+    mode: StructuredMode,
+    schema_hint: Option<String>,
+    response_format: ResponseFormat,
+  ) -> anyhow::Result<StructuredAgentResult<T>> {
     loop {
       let (tools_allowed, budget_exhausted) = self.round_budget(&context);
 

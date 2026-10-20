@@ -7,7 +7,7 @@ use tiktoken_rs::cl100k_base;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  telemetry::init()?;
+  let _telemetry = telemetry::init()?;
 
   let web_search_args = WebSearchArgs {
     query: "2026美加墨世界杯最佳射手".to_string(),

@@ -192,8 +192,9 @@ impl ChatBackend for OpenAiCompatible {
 const REASONING_FIELDS: [&str; 2] = ["reasoning_content", "reasoning"];
 
 /// Split a raw response body into the standard response and its reasoning.
-pub fn parse_response(raw: Value) -> anyhow::Result<ChatResponse> {
+pub fn parse_response(mut raw: Value) -> anyhow::Result<ChatResponse> {
   let reasoning = reasoning_in(&raw, "message");
+  normalize_usage(&mut raw);
   // Deserialized from a borrow, not by value, so the body is still there to quote when
   // it does not fit: a bare serde message ("missing field `id`") says nothing about what
   // the provider actually sent.
@@ -210,8 +211,9 @@ pub fn parse_response(raw: Value) -> anyhow::Result<ChatResponse> {
 }
 
 /// Split a raw stream chunk into the standard chunk and its reasoning delta.
-pub fn parse_chunk(raw: Value) -> anyhow::Result<ChatChunk> {
+pub fn parse_chunk(mut raw: Value) -> anyhow::Result<ChatChunk> {
   let reasoning = reasoning_in(&raw, "delta");
+  normalize_usage(&mut raw);
   let chunk = CreateChatCompletionStreamResponse::deserialize(&raw).with_context(|| {
     format!(
       "a chat completion stream chunk has an unexpected shape: {}",
@@ -219,6 +221,28 @@ pub fn parse_chunk(raw: Value) -> anyhow::Result<ChatChunk> {
     )
   })?;
   Ok(ChatChunk { chunk, reasoning })
+}
+
+/// Put the provider's own name for a prompt-cache hit where the standard shape keeps it.
+///
+/// DeepSeek reports it as `usage.prompt_cache_hit_tokens` — a top-level field, and the
+/// only place it appears in responses from before it also sent the OpenAI-compatible
+/// `prompt_tokens_details` — while the standard shape, and so `TokenUsage`, reads
+/// `usage.prompt_tokens_details.cached_tokens`. Without this the hits are reported as
+/// ordinary prompt tokens, i.e. the run is shown as costing more than it did.
+fn normalize_usage(raw: &mut Value) {
+  let Some(usage) = raw.get_mut("usage").and_then(Value::as_object_mut) else {
+    return;
+  };
+  let Some(hits) = usage.get("prompt_cache_hit_tokens").cloned() else {
+    return;
+  };
+  let details = usage
+    .entry("prompt_tokens_details")
+    .or_insert_with(|| Value::Object(Default::default()));
+  if let Some(details) = details.as_object_mut() {
+    details.entry("cached_tokens").or_insert(hits);
+  }
 }
 
 fn body_preview(raw: &Value) -> String {
@@ -354,6 +378,63 @@ mod tests {
     .unwrap();
     assert!(parsed.reasoning.is_none());
     assert!(parsed.chunk.usage.is_some());
+  }
+
+  /// DeepSeek answers `prompt_cache_hit_tokens` instead of the standard
+  /// `prompt_tokens_details.cached_tokens`; read as-is, every hit would be billed as an
+  /// ordinary prompt token.
+  #[test]
+  fn a_cache_hit_reported_the_deepseek_way_is_read_as_a_cached_token() {
+    let mut body = response_with(json!({ "role": "assistant", "content": "42" }));
+    body["usage"] = json!({
+      "prompt_tokens": 100,
+      "completion_tokens": 10,
+      "total_tokens": 110,
+      "prompt_cache_hit_tokens": 64,
+      "prompt_cache_miss_tokens": 36,
+    });
+
+    let parsed = parse_response(body).unwrap();
+    let usage = crate::agent::TokenUsage::from(parsed.response.usage.as_ref().unwrap());
+    assert_eq!(usage.cached_prompt_tokens, 64);
+    assert_eq!(usage.prompt_tokens, 100);
+  }
+
+  /// A provider that sends both is read by the standard field, not overridden by it.
+  #[test]
+  fn the_standard_cached_tokens_field_wins_over_the_provider_specific_one() {
+    let mut body = response_with(json!({ "role": "assistant", "content": "42" }));
+    body["usage"] = json!({
+      "prompt_tokens": 100,
+      "completion_tokens": 10,
+      "total_tokens": 110,
+      "prompt_tokens_details": { "cached_tokens": 20 },
+      "prompt_cache_hit_tokens": 64,
+    });
+
+    let parsed = parse_response(body).unwrap();
+    let usage = crate::agent::TokenUsage::from(parsed.response.usage.as_ref().unwrap());
+    assert_eq!(usage.cached_prompt_tokens, 20);
+  }
+
+  /// The final chunk of a stream carries usage the same way.
+  #[test]
+  fn a_streamed_usage_chunk_is_normalized_too() {
+    let parsed = parse_chunk(json!({
+      "id": "chatcmpl-1",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "gpt-test",
+      "choices": [],
+      "usage": {
+        "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12,
+        "prompt_cache_hit_tokens": 7,
+      },
+    }))
+    .unwrap();
+
+    let usage = crate::agent::TokenUsage::from(parsed.chunk.usage.as_ref().unwrap());
+    assert_eq!(usage.cached_prompt_tokens, 7);
   }
 
   #[test]

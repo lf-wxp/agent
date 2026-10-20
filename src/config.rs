@@ -82,6 +82,9 @@ const ENV_TOKEN_LIMIT_FIELD: &str = "LLM_TOKEN_LIMIT_FIELD";
 /// Environment variable: send earlier turns' chain of thought back to the model.
 const ENV_REPLAY_REASONING: &str = "LLM_REPLAY_REASONING";
 
+/// Environment variable: path to a JSON price list, for cost estimates.
+const ENV_PRICING_FILE: &str = "LLM_PRICING_FILE";
+
 /// Environment variable: Tavily API key, used by the `web_search` tool.
 const ENV_TAVILY_API_KEY: &str = "TAVILY_API_KEY";
 
@@ -372,6 +375,12 @@ pub fn reasoning_effort_override() -> Option<String> {
 /// (`LLM_TOKEN_LIMIT_FIELD`). Raw, like [`reasoning_effort_override`].
 pub fn token_limit_field_override() -> Option<String> {
   non_empty_var(ENV_TOKEN_LIMIT_FIELD)
+}
+
+/// The price list cost estimates are made from (`LLM_PRICING_FILE`); see
+/// [`crate::llm::pricing`] for its format. `None` when unset, which means no estimates.
+pub fn pricing_file() -> Option<PathBuf> {
+  non_empty_var(ENV_PRICING_FILE).map(PathBuf::from)
 }
 
 /// Tavily API key used by the `web_search` tool. `None` when unset.

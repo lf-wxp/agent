@@ -11,7 +11,7 @@ const SYSTEM_PROMPT: &str = "You are a general-purpose assistant";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  telemetry::init()?;
+  let _telemetry = telemetry::init()?;
 
   let prompts = [
     "Explain Rust's ownership model in three sentences",

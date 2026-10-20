@@ -10,7 +10,7 @@ const SYSTEM_PROMPT: &str = "You are a general-purpose assistant. When you use s
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  telemetry::init()?;
+  let _telemetry = telemetry::init()?;
 
   // Needs fresh information, so the model has to reach for the web_search tool.
   let answer = chat_complete(

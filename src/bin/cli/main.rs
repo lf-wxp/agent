@@ -132,6 +132,7 @@ mod web;
 
 use std::{
   collections::{HashMap, VecDeque},
+  fmt::Write as _,
   io::{self, IsTerminal, Write},
   net::SocketAddr,
   pin::Pin,
@@ -227,7 +228,7 @@ const DEFAULT_SESSION_ID: &str = "default";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  telemetry::init()?;
+  let _telemetry = telemetry::init()?;
 
   let args = parse_args();
 
@@ -797,6 +798,7 @@ async fn main() -> anyhow::Result<()> {
           let _ = web_events_tx.send(ChatEvent::Done {
             turn,
             budget_exhausted: result.budget_exhausted,
+            usage: web::turn_usage(&result.context),
           });
         }
         AgentOutcome::Suspended(state) => {
@@ -828,6 +830,7 @@ async fn main() -> anyhow::Result<()> {
     }
   }
 
+  // The telemetry guard flushes on the way out of `main`, early `?` returns included.
   println!("Bye!");
   Ok(())
 }
@@ -954,6 +957,8 @@ fn spawn_interrupt_handler(approvals: Arc<ApprovalRegistry>, turn_lock: Arc<Asyn
       }
     }
 
+    // `exit` runs no destructors, so `main`'s telemetry guard never drops: flush here.
+    telemetry::shutdown();
     std::process::exit(signal.exit_code);
   });
 }
@@ -1349,7 +1354,20 @@ impl TerminalView {
     }
 
     self.in_reasoning = false;
-    let body = render_chat_event(event);
+    let body = match event {
+      // A turn that reports what it spent ends with one dim line saying so.
+      ChatEvent::Done {
+        usage: Some(usage), ..
+      } => {
+        let line = usage_line(&usage);
+        if self.color {
+          format!("\n{DIM}{line}{UNDIM}\n\n")
+        } else {
+          format!("\n{line}\n\n")
+        }
+      }
+      event => render_chat_event(event),
+    };
     if body.is_empty() {
       // Nothing printed, so the cursor is still where the last thought left it.
       return body;
@@ -1454,6 +1472,28 @@ fn render_plan(checklist: &str) -> String {
     out.push_str(&format!("       {line}\n"));
   }
   out
+}
+
+/// One turn's spend as a single line, e.g.
+/// `[usage] 1,234 in (1,000 cached) · 56 out (20 reasoning) · ≈ 0.0012 USD`. The
+/// breakdowns appear only when the provider reported them, the cost only when a price
+/// list covers the turn's models (`LLM_PRICING_FILE`).
+fn usage_line(usage: &shared::TurnUsage) -> String {
+  let mut line = format!("[usage] {} in", shared::group_digits(usage.input_tokens));
+  if usage.cached_input_tokens > 0 {
+    let cached = shared::group_digits(usage.cached_input_tokens);
+    let _ = write!(line, " ({cached} cached)");
+  }
+  let output = shared::group_digits(usage.output_tokens);
+  let _ = write!(line, " · {output} out");
+  if usage.reasoning_tokens > 0 {
+    let reasoning = shared::group_digits(usage.reasoning_tokens);
+    let _ = write!(line, " ({reasoning} reasoning)");
+  }
+  if let Some(cost) = &usage.cost {
+    let _ = write!(line, " · {}", cost.display_with("≈"));
+  }
+  line
 }
 
 /// Writes `text` to stdout, translating every bare `\n` into `\r\n` first, then flushes.
@@ -2303,8 +2343,60 @@ mod tests {
       view.render(ChatEvent::Done {
         turn: "t".to_owned(),
         budget_exhausted: false,
+        usage: None,
       }),
       "\n\n"
+    );
+  }
+
+  fn turn_usage(cost: Option<shared::TurnCost>) -> shared::TurnUsage {
+    shared::TurnUsage {
+      input_tokens: 12_345,
+      output_tokens: 678,
+      cached_input_tokens: 10_000,
+      reasoning_tokens: 0,
+      cost,
+    }
+  }
+
+  /// A turn that reports usage ends with one line of it; the breakdowns that were not
+  /// reported are left out rather than shown as zero.
+  #[test]
+  fn a_turn_with_usage_ends_with_a_usage_line() {
+    let mut view = TerminalView::new(false);
+    let printed = view.render(ChatEvent::Done {
+      turn: "t".to_owned(),
+      budget_exhausted: false,
+      usage: Some(turn_usage(None)),
+    });
+    assert_eq!(printed, "\n[usage] 12,345 in (10,000 cached) · 678 out\n\n");
+  }
+
+  #[test]
+  fn a_partial_estimate_is_shown_as_a_lower_bound_only() {
+    let line = usage_line(&turn_usage(Some(shared::TurnCost {
+      amount: 0.0123,
+      currency: "USD".to_owned(),
+      partial: true,
+    })));
+    assert!(line.ends_with(" · ≥0.0123 USD"), "got: {line}");
+  }
+
+  #[test]
+  fn the_usage_line_is_dimmed_when_colour_is_on() {
+    let mut view = TerminalView::new(true);
+    let printed = view.render(ChatEvent::Done {
+      turn: "t".to_owned(),
+      budget_exhausted: false,
+      usage: Some(turn_usage(None)),
+    });
+    assert!(
+      printed.starts_with(&format!("\n{DIM}[usage]")),
+      "got: {printed:?}"
+    );
+    assert!(
+      printed.ends_with(&format!("{UNDIM}\n\n")),
+      "got: {printed:?}"
     );
   }
 

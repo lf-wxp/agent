@@ -42,7 +42,7 @@ const DEMO_TOKEN: &str = "demo-token";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  telemetry::init()?;
+  let _telemetry = telemetry::init()?;
 
   // Port 0: the OS picks a free port, so concurrent runs never fight over one.
   let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();

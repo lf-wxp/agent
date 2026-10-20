@@ -5,7 +5,7 @@ use agent::{
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  telemetry::init()?;
+  let _telemetry = telemetry::init()?;
 
   let plan = chat_complete_structured::<ActionPlan>(
     Provider::shared(),

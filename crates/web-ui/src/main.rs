@@ -119,6 +119,13 @@ enum TimelineItem {
     id: u64,
     text: String,
   },
+  /// What the turn above it spent (see [`ChatEvent::Done`]'s `usage`). Kept as data and
+  /// formatted when rendered, so it follows the language picker like the rest of this
+  /// page's own wording.
+  Usage {
+    id: u64,
+    usage: shared::TurnUsage,
+  },
   /// The model's chain of thought for one round, streamed in ahead of that round's
   /// answer or tool calls (see [`ChatEvent::Reasoning`]). Also loaded from history when
   /// the agent replays reasoning and so records it in the transcript.
@@ -153,6 +160,7 @@ impl TimelineItem {
       | Self::ToolResult { id, .. }
       | Self::Approval { id, .. }
       | Self::Notice { id, .. }
+      | Self::Usage { id, .. }
       | Self::Reasoning { id, .. }
       | Self::Error { id, .. }
       | Self::Suspended { id, .. } => *id,
@@ -1000,6 +1008,10 @@ fn render_item(state: ChatState, item: TimelineItem) -> impl IntoView {
     }
     .into_any(),
     TimelineItem::Reasoning { block, .. } => render_reasoning(block).into_any(),
+    TimelineItem::Usage { usage, .. } => view! {
+      <div class="turn-usage">{move || i18n::turn_usage(lang.get(), &usage)}</div>
+    }
+    .into_any(),
     TimelineItem::Error { message, .. } => view! {
       <div class="notice error">
         <span class="notice-icon">"!"</span>
@@ -1728,6 +1740,7 @@ fn apply_chat_event(event: ChatEvent, state: ChatState) {
     ChatEvent::Done {
       turn,
       budget_exhausted,
+      usage,
     } => {
       // Flushed regardless of whose turn this was: only one turn runs at a time across
       // the whole process (see `turn_lock`'s docs in `src/bin/cli/main.rs`), so the text
@@ -1742,6 +1755,12 @@ fn apply_chat_event(event: ChatEvent, state: ChatState) {
       }
       state.streaming_text.set(String::new());
       state.turn_active.set(false);
+      if let Some(usage) = usage {
+        state.push(TimelineItem::Usage {
+          id: state.next_id(),
+          usage,
+        });
+      }
       if budget_exhausted {
         state.push(TimelineItem::Error {
           id: state.next_id(),

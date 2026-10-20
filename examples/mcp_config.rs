@@ -24,7 +24,7 @@ const SYSTEM_PROMPT: &str = "You are a general-purpose assistant. Prefer tools o
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  telemetry::init()?;
+  let _telemetry = telemetry::init()?;
 
   let path = std::env::args()
     .nth(1)

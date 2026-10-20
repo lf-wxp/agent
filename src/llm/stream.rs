@@ -56,6 +56,12 @@ fn chat_stream<'a>(
           tracing::warn!(max_rounds, "tool round budget spent; forcing a final answer");
         }
       }
+      // Asked for so the round's last chunk carries its usage; without it the stream has
+      // no token counts, and a caller running inside an agent's run goes unbilled.
+      builder.stream_options(async_openai::types::chat::ChatCompletionStreamOptions {
+        include_usage: Some(true),
+        include_obfuscation: None,
+      });
       let mut chunks = provider.chat_stream(builder.chat_request()?).await?;
 
       let mut accumulator = ToolCallAccumulator::default();
@@ -81,6 +87,12 @@ fn chat_stream<'a>(
           reasoning.push_str(text);
         }
         let chunk = chunk.chunk;
+
+        // The chunk that carries usage is the one with no choices, so this comes first.
+        // A no-op outside an agent's run; see `crate::agent::usage`.
+        if let Some(spent) = &chunk.usage {
+          crate::agent::usage::charge(model, spent.into());
+        }
 
         let Some(choice) = chunk.choices.first() else {
           continue;
@@ -289,5 +301,55 @@ mod tests {
       "got: {}",
       seen[1]
     );
+  }
+
+  /// Without `include_usage` the stream carries no token counts at all, so every round
+  /// would cost this crate's accounting nothing.
+  #[tokio::test]
+  async fn every_requested_stream_asks_for_its_usage() {
+    let seen = run_two_rounds(ModelSettings::default()).await;
+
+    for body in &seen {
+      assert_eq!(body["stream_options"]["include_usage"], true, "got: {body}");
+    }
+  }
+
+  /// The usage a streamed round does report is billed to the run the stream is polled
+  /// from, like every other request (see `crate::agent::usage`).
+  #[tokio::test]
+  async fn a_streamed_round_is_charged_to_the_enclosing_run() {
+    let backend = Arc::new(ScriptedStreams {
+      rounds: Mutex::new(VecDeque::from([vec![
+        chunk(json!({ "content": "5" })),
+        json!({
+          "id": "chatcmpl-1",
+          "object": "chat.completion.chunk",
+          "created": 0,
+          "model": "gpt-test",
+          "choices": [],
+          "usage": { "prompt_tokens": 40, "completion_tokens": 2, "total_tokens": 42 },
+        }),
+      ]])),
+      seen: Mutex::new(Vec::new()),
+    });
+    let provider = Provider::with_backend(Arc::clone(&backend) as Arc<dyn ChatBackend>, 1);
+    let registry = ToolRegistry::empty();
+    let settings = ModelSettings::default();
+
+    let ledger = crate::agent::usage::Ledger::for_new_run();
+    ledger
+      .scope(async {
+        let stream = chat_stream(&provider, "gpt-test", None, "hi", &registry, &settings);
+        futures::pin_mut!(stream);
+        while let Some(text) = stream.next().await {
+          text.unwrap();
+        }
+      })
+      .await;
+
+    let mut context = crate::agent::ExecutionContext::new();
+    ledger.settle(&mut context);
+    assert_eq!(context.usage_by_model["gpt-test"].prompt_tokens, 40);
+    assert_eq!(context.usage.completion_tokens, 2);
   }
 }

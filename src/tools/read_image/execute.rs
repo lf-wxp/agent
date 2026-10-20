@@ -83,6 +83,10 @@ pub async fn run(provider: &Provider, args_json: &str) -> anyhow::Result<String>
   )
   .await?
   .response;
+  // Billed to the run that called the tool (see `crate::agent::usage`).
+  if let Some(spent) = &response.usage {
+    crate::agent::usage::charge(&model, spent.into());
+  }
 
   first_choice(response)?
     .message

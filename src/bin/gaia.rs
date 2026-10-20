@@ -18,7 +18,7 @@ const GROUP_WITH_TOOLS: &str = "with_tools";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  telemetry::init()?;
+  let _telemetry = telemetry::init()?;
   gaia_level1_experiment().await
 }
 

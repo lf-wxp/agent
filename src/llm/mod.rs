@@ -1,10 +1,12 @@
 pub mod backend;
 pub mod client;
 pub mod complete;
+pub mod pricing;
 pub mod provider;
 pub mod retry;
 pub mod schema;
 pub mod settings;
+pub(crate) mod spans;
 pub mod stream;
 pub mod structured;
 #[cfg(test)]

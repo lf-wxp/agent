@@ -423,6 +423,70 @@ pub fn server_error_status(lang: Lang, status: u16, status_text: &str) -> String
   }
 }
 
+/// One turn's spend, shown under its reply (`main.rs`'s `TimelineItem::Usage`). The
+/// breakdowns appear only when reported, the cost only when one was estimated — never
+/// as zeros, which would claim something the provider did not say.
+pub fn turn_usage(lang: Lang, usage: &shared::TurnUsage) -> String {
+  use shared::group_digits as n;
+
+  let cached = (usage.cached_input_tokens > 0).then(|| n(usage.cached_input_tokens));
+  let reasoning = (usage.reasoning_tokens > 0).then(|| n(usage.reasoning_tokens));
+  let mut parts = match lang {
+    Lang::Zh => vec![
+      format!(
+        "输入 {}{}",
+        n(usage.input_tokens),
+        cached.map(|c| format!("（缓存 {c}）")).unwrap_or_default()
+      ),
+      format!(
+        "输出 {}{}",
+        n(usage.output_tokens),
+        reasoning
+          .map(|r| format!("（推理 {r}）"))
+          .unwrap_or_default()
+      ),
+    ],
+    Lang::En => vec![
+      format!(
+        "{} in{}",
+        n(usage.input_tokens),
+        cached.map(|c| format!(" ({c} cached)")).unwrap_or_default()
+      ),
+      format!(
+        "{} out{}",
+        n(usage.output_tokens),
+        reasoning
+          .map(|r| format!(" ({r} reasoning)"))
+          .unwrap_or_default()
+      ),
+    ],
+    Lang::Es => vec![
+      format!(
+        "{} de entrada{}",
+        n(usage.input_tokens),
+        cached
+          .map(|c| format!(" ({c} en caché)"))
+          .unwrap_or_default()
+      ),
+      format!(
+        "{} de salida{}",
+        n(usage.output_tokens),
+        reasoning
+          .map(|r| format!(" ({r} de razonamiento)"))
+          .unwrap_or_default()
+      ),
+    ],
+  };
+  if let Some(cost) = &usage.cost {
+    let about = match lang {
+      Lang::Zh => "约",
+      Lang::En | Lang::Es => "≈",
+    };
+    parts.push(cost.display_with(about));
+  }
+  parts.join(" · ")
+}
+
 /// The [`RwSignal<Lang>`] every rendering function reads via
 /// [`leptos::prelude::expect_context`] — see the module docs for why this is threaded
 /// through context rather than as a parameter. A thin wrapper purely so call sites read
@@ -524,6 +588,45 @@ mod tests {
       let hint = t(lang, Key::ComposerHint);
       assert!(hint.contains('/'), "{}", lang.code());
       assert!(!hint.contains("/help"), "{}", lang.code());
+    }
+  }
+
+  fn usage(cached: u32, reasoning: u32, cost: Option<shared::TurnCost>) -> shared::TurnUsage {
+    shared::TurnUsage {
+      input_tokens: 1234,
+      output_tokens: 56,
+      cached_input_tokens: cached,
+      reasoning_tokens: reasoning,
+      cost,
+    }
+  }
+
+  #[test]
+  fn turn_usage_shows_only_what_was_reported() {
+    assert_eq!(
+      turn_usage(Lang::En, &usage(0, 0, None)),
+      "1,234 in · 56 out"
+    );
+    assert_eq!(
+      turn_usage(Lang::En, &usage(1000, 20, None)),
+      "1,234 in (1,000 cached) · 56 out (20 reasoning)"
+    );
+    assert_eq!(
+      turn_usage(Lang::Zh, &usage(1000, 0, None)),
+      "输入 1,234（缓存 1,000） · 输出 56"
+    );
+  }
+
+  #[test]
+  fn turn_usage_appends_the_estimated_cost_in_every_language() {
+    let cost = shared::TurnCost {
+      amount: 0.0123,
+      currency: "USD".to_owned(),
+      partial: false,
+    };
+    for lang in ALL_LANGS {
+      let text = turn_usage(lang, &usage(0, 0, Some(cost.clone())));
+      assert!(text.ends_with("0.0123 USD"), "{}: {text}", lang.code());
     }
   }
 }

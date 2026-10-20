@@ -37,7 +37,7 @@ const ENV_BEARER_TOKEN: &str = "MCP_BEARER_TOKEN";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  telemetry::init()?;
+  let _telemetry = telemetry::init()?;
 
   let addr = std::env::args()
     .nth(1)

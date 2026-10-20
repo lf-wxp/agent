@@ -9,7 +9,7 @@ const SYSTEM_PROMPT: &str = "You are a general-purpose assistant";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  telemetry::init()?;
+  let _telemetry = telemetry::init()?;
 
   let model = config::model();
   let registry = ToolRegistry::builtin()?;

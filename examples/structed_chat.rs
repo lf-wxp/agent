@@ -8,7 +8,7 @@ use agent::{
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  telemetry::init()?;
+  let _telemetry = telemetry::init()?;
 
   let model = config::model();
   let plan = chat_complete_structured::<ActionPlan>(

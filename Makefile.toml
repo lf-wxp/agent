@@ -74,25 +74,32 @@ command = "cargo"
 # `--all-targets` matters more than usual here: the 19 files under `examples/` are part
 # of the documented API surface (the README points at them), so they have to keep
 # compiling, and they are not built by a plain `cargo check`.
-args = ["check", "--all-targets"]
+#
+# `--all-features` for the same reason `fmt-check` exists: CI runs it, so the optional
+# `otel` code must be checked here too, or "it passed locally" and "it passed in CI"
+# diverge exactly where it hurts.
+args = ["check", "--all-targets", "--all-features"]
 
 [tasks.clippy]
 description = "Lint the native package; any warning is an error"
 category = "CI"
 command = "cargo"
-args = ["clippy", "--all-targets", "--", "-D", "warnings"]
+# `--all-features`: see `check`.
+args = ["clippy", "--all-targets", "--all-features", "--", "-D", "warnings"]
 
 [tasks.test]
 description = "Run unit tests, integration tests and doctests"
 category = "CI"
 command = "cargo"
-args = ["test"]
+# `--all-features`: the `otel` tests and the exporter's own code only exist with it on,
+# and CI runs them.
+args = ["test", "--all-features"]
 
 [tasks.doc]
 description = "Build the API docs (private items included, see .cargo/config.toml)"
 category = "Development"
 command = "cargo"
-args = ["doc", "--no-deps"]
+args = ["doc", "--no-deps", "--all-features"]
 
 # ---------------------------------------------------------------------------
 # Wasm half: crates/shared + crates/web-ui

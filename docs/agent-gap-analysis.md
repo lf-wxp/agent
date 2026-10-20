@@ -34,7 +34,7 @@
 | 规划 / 反思 | ⚠️ | 有 `update_plan` 计划工具（`src/tools/plan/`）；没有反思 / 自检步骤 |
 | 多 agent | ⚠️ | 有 agent-as-tool（`AgentTool`，`src/agent/sub_agent.rs`）；handoff、workflow / graph 编排没有 |
 | 长期记忆 / RAG | ⚠️ | `knowledge_base` 只在内存中暴力检索，每次都重新计算 embedding；没有 `retrieve` 工具，也没有跨会话记忆 |
-| 可观测性 | ⚠️ | 只有 fmt 日志；没有 span 和 OpenTelemetry；`TokenUsage` 不计算成本 |
+| 可观测性 | ✅ | GenAI 约定的 span（`invoke_agent` / `chat` / `execute_tool`），`--features otel` 导出 OTLP；按模型统计用量（含缓存、推理 token），子 agent / 工具 / 摘要的消耗计入所在运行；按价格表估算成本。没有 metrics |
 | 类型化错误 | ❌ | 全部使用 `anyhow` |
 | Cargo features | ❌ | 没有 feature，MCP、web、gaia、CLI 相关依赖都会强制编译 |
 | 工具定义体验 | ⚠️ | `simple_tool!` 只在 crate 内可见，没有 `#[tool]` 过程宏；`Tool` trait 和 `async-openai` 耦合 |
@@ -91,8 +91,8 @@
 | 1 | 写入和执行类工具 | `write_file`、`edit_file`、`grep`、`run_command`；接入工作区沙箱、默认审批和上下文 compaction | ✅ 已完成 |
 | 2 | 工具超时和取消 | 单个工具统一超时、`CancellationToken`、工具并发上限、文件 IO 不再阻塞运行时 | ✅ 已完成 |
 | 3 | LLM Provider 抽象和模型参数 | Provider trait、reasoning、采样参数与 `max_tokens` 可配置、修复 `read_image` 绕过 `Provider` 的问题 | ✅ 已完成 |
-| 4 | 子 agent 与规划 | agent-as-tool、todo / plan 工具 | ✅ 已完成，待审批 |
-| 5 | 可观测性 | span 埋点、接入 OTel、成本统计 | ⏳ 待开始 |
+| 4 | 子 agent 与规划 | agent-as-tool、todo / plan 工具 | ✅ 已完成 |
+| 5 | 可观测性 | span 埋点、接入 OTel、成本统计 | ✅ 已完成，待审批 |
 | 6 | 持久化检索和长期记忆 | 持久化向量库、`retrieve` 工具、跨会话记忆 | ⏳ 待开始 |
 | 7 | 工程化 | `thiserror`、Cargo features、MCP 补全、公开工具宏等（可以按需再拆分） | ⏳ 待开始 |
 
@@ -244,5 +244,62 @@
   - 子 agent 的中间过程（它的 token、工具调用）不会出现在父 agent 的流式事件里，前端只能看到一次工具调用和它的结果。
   - 没有 handoff（把对话控制权转交给另一个 agent），也没有 workflow / graph 编排。
   - 没有反思 / 自检步骤。
-  - 子 agent 的用量没有合并进父 agent 的 `usage`，失败运行的用量也没有统计，留给第 5 项。
+  - 子 agent 的用量没有合并进父 agent 的 `usage`，失败运行的用量也没有统计，留给第 5 项。（第 5 项已解决。）
   - 加入 `update_plan` 改变了 `builtin()` 的工具列表，但不会让升级前挂起的运行失效：`RunFingerprint::mismatch` 只检查记录里的工具是否还在，新增的工具不算差异（见 `an_added_tool_still_matches`）。
+
+#### 第 5 项：可观测性
+
+- **span**（`src/llm/spans.rs`、`src/agent/runtime/observe.rs`）：
+  - 按 OpenTelemetry GenAI 语义约定命名，一共三种：
+    - `invoke_agent`：一次 `Agent` 运行；
+    - `chat`：一次模型请求；
+    - `execute_tool`：一次工具调用，包括审批钩子。
+  - `chat` span 加在 `Provider::chat` / `chat_stream` 上，所以本 crate 发出的每个请求都有，重试的每次尝试各算一个。
+    - 记录模型、响应 id、结束原因（使用 API 原名，如 `tool_calls`）、输入 / 输出 / 缓存 / 推理 token。
+    - 出错时设置 `otel.status_code=error`，`error.type` 取 HTTP 状态码或错误类别。
+    - 流式请求的 span 持续到流结束，用量取自最后一个 chunk。
+  - `invoke_agent` 覆盖普通、流式、可恢复、恢复后的运行和两条结构化路线。
+    - 记录结果（done / suspended / cancelled / error）、轮次和这次运行的 token 用量。
+    - 新增 `Agent::with_name`，用作 `gen_ai.agent.name`。
+  - 嵌套关系：子 agent 的 `invoke_agent` 挂在父 agent 的 `execute_tool` 下面。
+  - token 计数以 `i64` 记录。`tracing-opentelemetry` 会把 `u64` 导出成字符串，导出端无法求和。
+- **OTel 导出**（`--features otel`，可选依赖）：
+  - 依赖版本：`opentelemetry` / `opentelemetry_sdk` / `opentelemetry-otlp` 0.33，`tracing-opentelemetry` 0.34。
+  - 走 OTLP/HTTP protobuf，用 blocking reqwest 客户端，配合 SDK 在独立线程里运行的批处理器；不引入 gRPC 依赖。
+  - 只有设置了 `OTEL_EXPORTER_OTLP_ENDPOINT`（或 `..._TRACES_ENDPOINT`）时才启用；`OTEL_SDK_DISABLED=true` 可以关闭。
+  - 服务名默认是 `agent`，可以用 `OTEL_SERVICE_NAME` / `OTEL_RESOURCE_ATTRIBUTES` 覆盖。
+  - 导出端固定接收 INFO 及以上级别，不受 `RUST_LOG` 影响。
+  - `telemetry::init()` 返回一个守卫，析构时 flush 最后一批数据；`std::process::exit` 的路径（CLI 信号处理）显式调用 `telemetry::shutdown()`，最多等 2 秒。
+  - 控制台日志的 span 前缀只保留识别性字段（agent / tool / model 名），导出专用字段（状态码、token 数、id）不上屏。
+- **用量统计**：
+  - `TokenUsage` 新增 `cached_prompt_tokens` 和 `reasoning_tokens` 两个字段，读取旧数据时默认为 0。
+  - `ExecutionContext` 新增 `usage_by_model`，按模型拆分用量；序列化时为空则省略，旧数据可以正常读取。
+  - **记账机制**（`src/agent/usage.rs`）：每次运行设置一个 task-local 账本。
+    - `charge(model, usage)` 把用量记到当前运行上；子运行的账本挂在父账本上，每笔都同时向上传递。
+    - 结果：子 agent 的消耗按它自己的模型计入父运行，失败或被中止的委派也照算；不会重复计数。
+    - 已经接入的地方：agent 自己的请求、`AgentTool`（通过嵌套账本）、`read_image`、摘要请求、无状态的 `tool_loop`。
+    - 在 `spawn` 出去的其他 task 上调用 `charge` 不会生效，返回 `false`。
+  - `AgentTool::usage()` 保留，单独给出子 agent 自己的那一份。
+- **成本**（`src/llm/pricing.rs`）：
+  - `LLM_PRICING_FILE` 指向一个 JSON 价格表（每百万 token 的 `input` / `cached_input` / `output` 价格）。代码里不内置价格，因为价格会变，而且因提供商和合同而异。
+  - 价格表格式严格校验：字段名拼错、价格为负都会报错；文件读不了时只打 warn，不影响运行。
+  - `PriceTable::estimate` 按模型计算；有模型缺价格时结果标记为部分估算（下限）；一个模型都没有价格时返回 `None`，不会显示成 0。
+- **显示**：
+  - `ChatEvent::Done` 新增可选字段 `usage: Option<TurnUsage>`，包含 token 数和可选的成本；新旧版本前后端互相兼容。
+  - 终端每轮结束时打印一行暗色的 `[usage] 2,700 in (1,000 cached) · 60 out · ≈ 0.0044 USD`。
+  - Web UI 在回答下方显示同样的一行小字，跟随语言切换（中、英、西）。
+- **验证**：
+  - 单测覆盖：账本（嵌套、被丢弃的子运行、同一 task 上的并发运行）、用量字段和旧数据兼容、价格计算和文件校验、错误分类、结束原因名称、终端和 i18n 的格式化。
+  - 运行时级别的测试：
+    - 父 agent 委派给子 agent 时，父运行按模型拆分的用量（普通、流式、委派失败三种情况）；
+    - 一次委派运行产生的完整 span 树及各字段；
+    - 失败请求的 span 状态。
+  - 端到端：用本地假 LLM 服务和假 OTLP 接收端，以 `--features otel` 跑真实 CLI，解码导出的 protobuf。
+    - 确认 span 树、服务名、整数类型的 token 属性、`tool_calls` 结束原因都正确，终端 usage 行和成本也正确。
+    - Web UI 在浏览器里检查了 usage 行和中英切换，控制台没有报错。
+- **未做 / 遗留**：
+  - 没有 OTel metrics（计数器、直方图），只有 trace。
+  - span 默认不记录提示词和回答内容，GenAI 约定里的这部分是可选的，而且涉及隐私。
+  - Web 历史记录不保存每轮用量，页面刷新后之前轮次的 usage 行不再显示。
+  - 结构化入口和一次性的 `llm::*` 辅助函数在运行之外调用时，用量不会记到任何地方，只出现在 `chat` span 上。
+  - 恢复（`resume`）后的第一次重试与之后的循环共用一个 `invoke_agent` span；`run_continuing` 里每次重新进入 `drive` 各算一个 span，所以一次挂起-恢复的运行在 trace 里可能有多段。

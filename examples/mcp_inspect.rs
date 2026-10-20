@@ -38,7 +38,7 @@ const ENV_HEADERS: &str = "MCP_HEADERS";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  telemetry::init()?;
+  let _telemetry = telemetry::init()?;
 
   let connection = connect().await?;
 

@@ -446,8 +446,8 @@ enum UnreadableArguments {
 
 /// Whether `tool_call`'s arguments are unfit for a predicate, and why.
 ///
-/// [`ToolCallView::arguments`] alone cannot answer this: it is [`Value::Null`] both when
-/// the model genuinely sent `null` and when its payload failed to parse (see
+/// [`ToolCallView::arguments`] alone cannot answer this: it is [`serde_json::Value::Null`]
+/// both when the model genuinely sent `null` and when its payload failed to parse (see
 /// `Agent::execute_tool_calls`, which builds the view with
 /// `serde_json::from_str(..).unwrap_or(Value::Null)`). Telling those apart needs
 /// [`ToolCallView::raw_arguments`] — which is also the only faithful record of what was
@@ -822,6 +822,8 @@ impl DualApprovalCallback {
   /// are recorded as [`ToolResultStatus::Error`] — from the model's side a refusal is
   /// simply a tool call that did not succeed, and it needs no concept of "approval" to
   /// carry on.
+  ///
+  /// [`ToolResultStatus::Error`]: crate::agent::ToolResultStatus::Error
   ///
   /// # Why the explanation is always prefixed
   ///

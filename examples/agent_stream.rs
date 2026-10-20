@@ -19,7 +19,7 @@ const SYSTEM_PROMPT: &str = "You are a general-purpose assistant.";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  telemetry::init()?;
+  let _telemetry = telemetry::init()?;
 
   let toolbox = Arc::new(ToolRegistry::builtin()?);
   let agent = Agent::new(

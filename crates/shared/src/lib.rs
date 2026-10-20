@@ -236,6 +236,11 @@ pub enum ChatEvent {
   Done {
     turn: String,
     budget_exhausted: bool,
+    /// What the turn spent, when it ran a model and the provider reported usage. `None`
+    /// for the immediate `Done` that closes out a command or a refused turn, and in
+    /// frames from a server that predates this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    usage: Option<TurnUsage>,
   },
   /// The turn failed outrightly (as opposed to an individual tool call failing, which
   /// surfaces as a normal `ToolCallsFinished { status: Error, .. }` and does not stop
@@ -248,6 +253,78 @@ pub enum ChatEvent {
     turn: Option<String>,
     message: String,
   },
+}
+
+/// What one turn spent, carried on [`ChatEvent::Done`]: the turn's own requests plus
+/// whatever its tools and sub-agents spent on its behalf.
+///
+/// The breakdowns are subsets: `cached_input_tokens` of `input_tokens` (prompt-cache
+/// hits), `reasoning_tokens` of `output_tokens`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnUsage {
+  pub input_tokens: u32,
+  pub output_tokens: u32,
+  #[serde(default)]
+  pub cached_input_tokens: u32,
+  #[serde(default)]
+  pub reasoning_tokens: u32,
+  /// Present only when a price list is configured and covers at least one model the
+  /// turn used.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub cost: Option<TurnCost>,
+}
+
+/// An estimated cost; see [`TurnUsage::cost`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnCost {
+  pub amount: f64,
+  pub currency: String,
+  /// Some model the turn used has no price, so `amount` is a lower bound.
+  #[serde(default)]
+  pub partial: bool,
+}
+
+impl TurnCost {
+  /// `amount` and currency, readable at the small scale a single turn usually costs:
+  /// four decimals below one unit, two above.
+  ///
+  /// The bound is part of this: a partial estimate is a *lower* bound and is shown with
+  /// `≥`, which already says it is approximate. [`Self::display_with`] adds a language's
+  /// own "approximately" in front of a complete one.
+  pub fn display(&self) -> String {
+    let amount = if self.amount > 0.0 && self.amount < 0.0001 {
+      "<0.0001".to_owned()
+    } else if self.amount < 1.0 {
+      format!("{:.4}", self.amount)
+    } else {
+      format!("{:.2}", self.amount)
+    };
+    let bound = if self.partial { "≥" } else { "" };
+    format!("{bound}{amount} {}", self.currency)
+  }
+
+  /// [`Self::display`] behind `about` (a language's "≈" / "约"), which a lower bound
+  /// leaves out: `≈ ≥0.0123 USD` says "roughly at least 0.0123", which is not a thing.
+  pub fn display_with(&self, about: &str) -> String {
+    if self.partial {
+      self.display()
+    } else {
+      format!("{about} {}", self.display())
+    }
+  }
+}
+
+/// `n` with `,` between groups of three digits, e.g. `12,345`.
+pub fn group_digits(n: u32) -> String {
+  let digits = n.to_string();
+  let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+  for (i, digit) in digits.chars().enumerate() {
+    if i > 0 && (digits.len() - i).is_multiple_of(3) {
+      out.push(',');
+    }
+    out.push(digit);
+  }
+  out
 }
 
 /// One entry of the transcript returned by `GET /api/history`. Mirrors
@@ -290,6 +367,67 @@ pub enum HistoryContentItem {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Either side may be the older build: a `Done` without usage must still parse, and
+  /// one with usage must still parse for a reader that ignores it.
+  #[test]
+  fn done_reads_with_or_without_usage() {
+    let old: ChatEvent =
+      serde_json::from_str(r#"{"type":"done","turn":"t1","budget_exhausted":false}"#).unwrap();
+    assert!(matches!(old, ChatEvent::Done { usage: None, .. }));
+
+    let event = ChatEvent::Done {
+      turn: "t1".to_owned(),
+      budget_exhausted: false,
+      usage: Some(TurnUsage {
+        input_tokens: 1200,
+        output_tokens: 34,
+        cached_input_tokens: 0,
+        reasoning_tokens: 0,
+        cost: None,
+      }),
+    };
+    let json = serde_json::to_value(&event).unwrap();
+    assert_eq!(json["usage"]["input_tokens"], 1200);
+    let back: ChatEvent = serde_json::from_value(json).unwrap();
+    assert!(matches!(back, ChatEvent::Done { usage: Some(u), .. } if u.output_tokens == 34));
+  }
+
+  #[test]
+  fn digits_are_grouped_by_thousands() {
+    assert_eq!(group_digits(0), "0");
+    assert_eq!(group_digits(999), "999");
+    assert_eq!(group_digits(1000), "1,000");
+    assert_eq!(group_digits(1_234_567), "1,234,567");
+  }
+
+  #[test]
+  fn a_cost_is_shown_at_a_scale_a_turn_can_be_read_at() {
+    let cost = |amount, partial| TurnCost {
+      amount,
+      currency: "USD".to_owned(),
+      partial,
+    };
+    assert_eq!(cost(0.00123, false).display(), "0.0012 USD");
+    assert_eq!(cost(0.00001, false).display(), "<0.0001 USD");
+    assert_eq!(cost(0.0, false).display(), "0.0000 USD");
+    assert_eq!(cost(12.345, false).display(), "12.35 USD");
+    assert_eq!(cost(0.5, true).display(), "≥0.5000 USD");
+  }
+
+  /// A lower bound is already marked as approximate; adding "≈" in front of it would
+  /// claim a precision the estimate does not have.
+  #[test]
+  fn a_lower_bound_does_not_get_an_approximately_prefix() {
+    let cost = |amount, partial| TurnCost {
+      amount,
+      currency: "USD".to_owned(),
+      partial,
+    };
+    assert_eq!(cost(0.5, true).display_with("≈"), "≥0.5000 USD");
+    assert_eq!(cost(0.5, false).display_with("≈"), "≈ 0.5000 USD");
+    assert_eq!(cost(0.5, false).display_with("约"), "约 0.5000 USD");
+  }
 
   #[test]
   fn chat_event_round_trips_through_json_with_the_tagged_shape() {

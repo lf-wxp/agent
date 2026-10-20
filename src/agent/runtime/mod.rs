@@ -31,6 +31,7 @@
 //! same private fields and the same event-recording/request-building helpers defined
 //! here.
 
+mod observe;
 mod structured;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -46,6 +47,7 @@ use async_stream::stream;
 use futures::{Stream, StreamExt, future::join_all};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::{
   agent::{
@@ -70,9 +72,10 @@ use crate::{
 };
 
 use super::{
-  context::{Conversation, ExecutionContext},
+  context::{Conversation, ExecutionContext, TokenUsage},
   event::{ContentItem, Event, ToolResultStatus},
   fingerprint::RunFingerprint,
+  usage,
 };
 
 pub use structured::StructuredAgentResult;
@@ -547,6 +550,8 @@ pub struct Agent {
   tool_concurrency: usize,
   /// How the model is asked to answer; see [`Self::with_model_settings`].
   settings: ModelSettings,
+  /// A label for traces; see [`Self::with_name`].
+  name: Option<String>,
 }
 
 impl Agent {
@@ -585,6 +590,7 @@ impl Agent {
       tool_timeout: config::tool_timeout(),
       tool_concurrency: config::tool_max_concurrency(),
       settings: ModelSettings::from_config(),
+      name: None,
     }
   }
 
@@ -616,6 +622,27 @@ impl Agent {
   /// The tools this agent offers its model.
   pub fn toolbox(&self) -> &ToolRegistry {
     &self.toolbox
+  }
+
+  /// The model this agent sends its requests to.
+  pub fn model(&self) -> &str {
+    &self.model
+  }
+
+  /// Name this agent in traces: its runs' `invoke_agent` spans carry it as
+  /// `gen_ai.agent.name` (see [`crate::telemetry`]), which is what tells a parent's run
+  /// apart from its sub-agents' in a trace view.
+  ///
+  /// A label only: it is not sent to the model and not part of [`Self::fingerprint`].
+  #[must_use]
+  pub fn with_name(mut self, name: impl Into<String>) -> Self {
+    self.name = Some(name.into());
+    self
+  }
+
+  /// See [`Self::with_name`].
+  pub fn name(&self) -> Option<&str> {
+    self.name.as_deref()
   }
 
   /// Whether any before-tool hook is registered — the place a workspace sandbox
@@ -980,7 +1007,27 @@ impl Agent {
   }
 
   /// Re-attempt `pending` with `decisions` in hand, then carry on with the ordinary loop.
+  ///
+  /// The re-attempt and the loop after it are one leg of the run, so they share one
+  /// `invoke_agent` span and usage ledger (see [`observe::RunScope`]): what a re-attempted
+  /// call spends — a sub-agent the approval was for — is billed to this leg, and its
+  /// `execute_tool` span nests under it.
   async fn drive_from_round(
+    &self,
+    context: ExecutionContext,
+    pending: &[SuspendedToolCall],
+    decisions: &HashMap<String, ResumedDecision>,
+    budget_exhausted: bool,
+  ) -> anyhow::Result<AgentOutcome> {
+    let scope = observe::RunScope::new(self, &context);
+    let result = scope
+      .run(self.resume_rounds(context, pending, decisions, budget_exhausted))
+      .await;
+    scope.finish(result)
+  }
+
+  /// The body of [`Self::drive_from_round`], inside its scope.
+  async fn resume_rounds(
     &self,
     mut context: ExecutionContext,
     pending: &[SuspendedToolCall],
@@ -1013,7 +1060,8 @@ impl Agent {
     // Every call in the round now has a result, so the round is spent.
     self.clear_checkpoint(&context).await;
     context.increment_step();
-    self.drive(context).await
+    // The rounds, not `drive`: this leg already has its span and ledger.
+    self.drive_rounds(context).await
   }
 
   /// The tool-calling loop itself, shared by every plain-text entry point.
@@ -1033,7 +1081,17 @@ impl Agent {
   /// control flow rather than by filtering a bad request afterwards — which is worth
   /// preferring, because a filter can be forgotten by the next entry point while this
   /// cannot: there is nowhere else to issue a request from.
-  async fn drive(&self, mut context: ExecutionContext) -> anyhow::Result<AgentOutcome> {
+  ///
+  /// Runs inside an `invoke_agent` span and the run's usage ledger; see
+  /// [`observe::RunScope`].
+  async fn drive(&self, context: ExecutionContext) -> anyhow::Result<AgentOutcome> {
+    let scope = observe::RunScope::new(self, &context);
+    let result = scope.run(self.drive_rounds(context)).await;
+    scope.finish(result)
+  }
+
+  /// The loop [`Self::drive`] runs.
+  async fn drive_rounds(&self, mut context: ExecutionContext) -> anyhow::Result<AgentOutcome> {
     loop {
       let (tools_allowed, budget_exhausted) = self.round_budget(&context);
 
@@ -1266,7 +1324,29 @@ impl Agent {
   ///
   /// `carried_budget_exhausted` is folded into whatever this run concludes, so a run
   /// resumed after its budget ran out still reports having been cut short.
+  ///
+  /// Polled inside an `invoke_agent` span and the run's usage ledger; see
+  /// [`observe::RunScope`].
   fn drive_stream<'a>(
+    &'a self,
+    context: ExecutionContext,
+    pending: Vec<SuspendedToolCall>,
+    decisions: HashMap<String, ResumedDecision>,
+    on_suspend: OnSuspend,
+    carried_budget_exhausted: bool,
+  ) -> impl Stream<Item = anyhow::Result<AgentStreamEvent>> + 'a {
+    let scope = observe::RunScope::new(self, &context);
+    scope.wrap_stream(self.drive_stream_rounds(
+      context,
+      pending,
+      decisions,
+      on_suspend,
+      carried_budget_exhausted,
+    ))
+  }
+
+  /// The loop [`Self::drive_stream`] runs.
+  fn drive_stream_rounds<'a>(
     &'a self,
     mut context: ExecutionContext,
     pending: Vec<SuspendedToolCall>,
@@ -1410,6 +1490,11 @@ impl Agent {
             yield Ok(AgentStreamEvent::Token(text.clone()));
           }
         }
+
+        // Read to the end: drop the stream now, not at the end of the round. It holds this
+        // request's `chat` span open, and the tools below would otherwise count as part of
+        // the request's duration.
+        drop(chunks);
 
         // No tool calls means the model produced its final answer.
         if accumulator.is_empty() {
@@ -1621,13 +1706,24 @@ impl Agent {
     context.final_result = Some(content.to_owned());
   }
 
+  /// Record what one of this agent's own requests spent, under its model.
+  ///
+  /// Charged through the run's ledger rather than written straight into `context`, so it
+  /// also reaches any run this one is nested in (a parent agent, when this is a
+  /// sub-agent) — see [`crate::agent::usage`]. The ledger is then settled, which also
+  /// brings in whatever the run's tools and hooks have charged since the last request.
   fn record_usage(&self, context: &mut ExecutionContext, response: &CreateChatCompletionResponse) {
     if let Some(usage) = &response.usage {
-      context.usage.add(
-        usage.prompt_tokens,
-        usage.completion_tokens,
-        usage.total_tokens,
-      );
+      self.charge_own(context, usage.into());
+    }
+    usage::settle_current(context);
+  }
+
+  /// Charge one of this agent's own requests. Outside a run's ledger — which every entry
+  /// point sets up, so this is only a safety net — it is recorded directly instead.
+  fn charge_own(&self, context: &mut ExecutionContext, spent: TokenUsage) {
+    if !usage::charge(&self.model, spent) {
+      context.record_usage(&self.model, spent);
     }
   }
 
@@ -1647,11 +1743,8 @@ impl Agent {
     chunk: &CreateChatCompletionStreamResponse,
   ) {
     if let Some(usage) = &chunk.usage {
-      context.usage.add(
-        usage.prompt_tokens,
-        usage.completion_tokens,
-        usage.total_tokens,
-      );
+      self.charge_own(context, usage.into());
+      usage::settle_current(context);
     }
   }
 
@@ -1846,181 +1939,190 @@ impl Agent {
       .collect();
 
     // Every call resolves to either a result or a suspension; `join_all` keeps them in
-    // call order, which both lists below inherit.
+    // call order, which both lists below inherit. Each runs in its own `execute_tool`
+    // span, so a sub-agent's run nests under the call that started it.
     let settled = join_all(function_calls.into_iter().zip(schedule::plan(&safety)).map(
-      |(function_call, mut gate)| async move {
-        let function_name = &function_call.function.name;
-        let arguments = &function_call.function.arguments;
+      |(function_call, mut gate)| {
+        let span = observe::tool_span(&function_call.function.name, &function_call.id);
+        let call = async move {
+          let function_name = &function_call.function.name;
+          let arguments = &function_call.function.arguments;
 
-        // Cancelled before this call got a slot: nothing has run, so say exactly that —
-        // and do not raise an approval prompt for a run that is already over.
-        if token.is_cancelled() {
-          return Err(ContentItem::ToolResult {
-            tool_call_id: function_call.id.clone(),
-            name: function_name.clone(),
-            status: ToolResultStatus::Error,
-            content: format!(
-              "Tool execution cancelled: the run was cancelled before {function_name} \
+          // Cancelled before this call got a slot: nothing has run, so say exactly that —
+          // and do not raise an approval prompt for a run that is already over.
+          if token.is_cancelled() {
+            return Err(ContentItem::ToolResult {
+              tool_call_id: function_call.id.clone(),
+              name: function_name.clone(),
+              status: ToolResultStatus::Error,
+              content: format!(
+                "Tool execution cancelled: the run was cancelled before {function_name} \
                started, so it did not run."
-            ),
-          });
-        }
-
-        tracing::debug!(
-          tool = %function_name,
-          arguments = %truncate_chars(arguments, TOOL_LOG_PREVIEW_CHARS),
-          "executing tool"
-        );
-
-        // Run every before-hook in registration order; the first not to let the call
-        // through ends the chain. A short-circuit picks its own status, since it is not
-        // always a denial (e.g. a cache hit substituting a real result is `Success`), so
-        // it is not this call site's place to guess.
-        for before in &self.before_tool_callbacks {
-          // Both forms are handed over: parsed for callbacks that inspect a field, raw
-          // for those that show the call to a human, since a payload that fails to parse
-          // would otherwise be rendered as a bare `null`.
-          let parsed_arguments: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
-          let view = ToolCallView {
-            tool_call_id: &function_call.id,
-            name: function_name,
-            arguments: &parsed_arguments,
-            raw_arguments: arguments,
-          };
-          match before.call(context_ref, view).await {
-            ToolCallDecision::Proceed => {}
-            ToolCallDecision::ShortCircuit(status, content) => {
-              tracing::debug!(
-                tool = %function_name,
-                status = ?status,
-                "tool call short-circuited by before-tool callback"
-              );
-              return Err(ContentItem::ToolResult {
-                tool_call_id: function_call.id.clone(),
-                name: function_name.clone(),
-                status,
-                content,
-              });
-            }
-            ToolCallDecision::Suspend => {
-              // An answer obtained since this call last suspended stands in for the
-              // decision the hook still cannot make. Only the suspension is replaced:
-              // `Approved` falls through to the rest of the chain and then the tool, so a
-              // sandbox or guard registered after this hook still gets its say.
-              match resumed.get(&function_call.id) {
-                Some(ResumedDecision::Approved) => {
-                  tracing::debug!(
-                    tool = %function_name,
-                    "a supplied decision approved a previously suspended call"
-                  );
-                }
-                Some(ResumedDecision::Refused(reason)) => {
-                  tracing::debug!(
-                    tool = %function_name,
-                    "a supplied decision refused a previously suspended call"
-                  );
-                  return Err(ContentItem::ToolResult {
-                    tool_call_id: function_call.id.clone(),
-                    name: function_name.clone(),
-                    status: ToolResultStatus::Error,
-                    content: reason.clone(),
-                  });
-                }
-                None => {
-                  tracing::debug!(
-                    tool = %function_name,
-                    "tool call suspended by before-tool callback, awaiting a decision"
-                  );
-                  return Ok(SuspendedToolCall {
-                    tool_call_id: function_call.id.clone(),
-                    name: function_name.clone(),
-                    raw_arguments: arguments.clone(),
-                  });
-                }
-              }
-            }
+              ),
+            });
           }
-        }
 
-        let (mut status, mut content) = match self.toolbox.get(function_name) {
-          Some(tool) => {
-            // `biased`: a token that fired while the hooks ran — or while this call
-            // waited for its turn or a slot — wins before the tool is even polled once.
-            let outcome = tokio::select! {
-              biased;
-              () = token.cancelled() => None,
-              result = async {
-                // After the hooks, not before: only the tool's own execution queues
-                // behind earlier calls, so approval prompts still go out together.
-                gate.turn().await;
-                // Never closed, so `acquire` cannot fail; a failure would only mean
-                // running unbounded, which is still correct.
-                let _slot = slots.acquire().await.ok();
-                execute_with_timeout(tool.as_ref(), arguments, self.tool_timeout).await
-              } => Some(result),
+          tracing::debug!(
+            tool = %function_name,
+            arguments = %truncate_chars(arguments, TOOL_LOG_PREVIEW_CHARS),
+            "executing tool"
+          );
+
+          // Run every before-hook in registration order; the first not to let the call
+          // through ends the chain. A short-circuit picks its own status, since it is not
+          // always a denial (e.g. a cache hit substituting a real result is `Success`), so
+          // it is not this call site's place to guess.
+          for before in &self.before_tool_callbacks {
+            // Both forms are handed over: parsed for callbacks that inspect a field, raw
+            // for those that show the call to a human, since a payload that fails to parse
+            // would otherwise be rendered as a bare `null`.
+            let parsed_arguments: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
+            let view = ToolCallView {
+              tool_call_id: &function_call.id,
+              name: function_name,
+              arguments: &parsed_arguments,
+              raw_arguments: arguments,
             };
-            // The tool is done (or was cut short): let the calls queued behind it go
-            // now rather than after this call's after-hooks.
-            gate.finish();
-            match outcome {
-              Some(Ok(result)) => {
+            match before.call(context_ref, view).await {
+              ToolCallDecision::Proceed => {}
+              ToolCallDecision::ShortCircuit(status, content) => {
                 tracing::debug!(
                   tool = %function_name,
-                  result = %truncate_chars(&result, TOOL_LOG_PREVIEW_CHARS),
-                  "tool finished"
+                  status = ?status,
+                  "tool call short-circuited by before-tool callback"
                 );
-                (ToolResultStatus::Success, result)
+                return Err(ContentItem::ToolResult {
+                  tool_call_id: function_call.id.clone(),
+                  name: function_name.clone(),
+                  status,
+                  content,
+                });
               }
-              Some(Err(err)) => {
-                let msg = format!("Tool execution error: {err}");
-                tracing::warn!("{msg}");
-                (ToolResultStatus::Error, msg)
-              }
-              None => {
-                tracing::info!(tool = %function_name, "tool call cancelled mid-run");
-                (
-                  ToolResultStatus::Error,
-                  format!(
-                    "Tool execution cancelled: the run was cancelled while {function_name} \
-                     was running, so it may have partly taken effect. Check the current \
-                     state before trying again."
-                  ),
-                )
+              ToolCallDecision::Suspend => {
+                // An answer obtained since this call last suspended stands in for the
+                // decision the hook still cannot make. Only the suspension is replaced:
+                // `Approved` falls through to the rest of the chain and then the tool, so a
+                // sandbox or guard registered after this hook still gets its say.
+                match resumed.get(&function_call.id) {
+                  Some(ResumedDecision::Approved) => {
+                    tracing::debug!(
+                      tool = %function_name,
+                      "a supplied decision approved a previously suspended call"
+                    );
+                  }
+                  Some(ResumedDecision::Refused(reason)) => {
+                    tracing::debug!(
+                      tool = %function_name,
+                      "a supplied decision refused a previously suspended call"
+                    );
+                    return Err(ContentItem::ToolResult {
+                      tool_call_id: function_call.id.clone(),
+                      name: function_name.clone(),
+                      status: ToolResultStatus::Error,
+                      content: reason.clone(),
+                    });
+                  }
+                  None => {
+                    tracing::debug!(
+                      tool = %function_name,
+                      "tool call suspended by before-tool callback, awaiting a decision"
+                    );
+                    return Ok(SuspendedToolCall {
+                      tool_call_id: function_call.id.clone(),
+                      name: function_name.clone(),
+                      raw_arguments: arguments.clone(),
+                    });
+                  }
+                }
               }
             }
           }
-          None => {
-            let msg = format!("Tool execution error: unknown tool {function_name}");
-            tracing::warn!("{msg}");
-            (ToolResultStatus::Error, msg)
+
+          let (mut status, mut content) = match self.toolbox.get(function_name) {
+            Some(tool) => {
+              // `biased`: a token that fired while the hooks ran — or while this call
+              // waited for its turn or a slot — wins before the tool is even polled once.
+              let outcome = tokio::select! {
+                biased;
+                () = token.cancelled() => None,
+                result = async {
+                  // After the hooks, not before: only the tool's own execution queues
+                  // behind earlier calls, so approval prompts still go out together.
+                  gate.turn().await;
+                  // Never closed, so `acquire` cannot fail; a failure would only mean
+                  // running unbounded, which is still correct.
+                  let _slot = slots.acquire().await.ok();
+                  execute_with_timeout(tool.as_ref(), arguments, self.tool_timeout).await
+                } => Some(result),
+              };
+              // The tool is done (or was cut short): let the calls queued behind it go
+              // now rather than after this call's after-hooks.
+              gate.finish();
+              match outcome {
+                Some(Ok(result)) => {
+                  tracing::debug!(
+                    tool = %function_name,
+                    result = %truncate_chars(&result, TOOL_LOG_PREVIEW_CHARS),
+                    "tool finished"
+                  );
+                  (ToolResultStatus::Success, result)
+                }
+                Some(Err(err)) => {
+                  let msg = format!("Tool execution error: {err}");
+                  tracing::warn!("{msg}");
+                  (ToolResultStatus::Error, msg)
+                }
+                None => {
+                  tracing::info!(tool = %function_name, "tool call cancelled mid-run");
+                  (
+                    ToolResultStatus::Error,
+                    format!(
+                      "Tool execution cancelled: the run was cancelled while {function_name} \
+                     was running, so it may have partly taken effect. Check the current \
+                     state before trying again."
+                    ),
+                  )
+                }
+              }
+            }
+            None => {
+              let msg = format!("Tool execution error: unknown tool {function_name}");
+              tracing::warn!("{msg}");
+              (ToolResultStatus::Error, msg)
+            }
+          };
+
+          // Run every after-hook in registration order, threading the (possibly rewritten)
+          // result from one into the next, so e.g. a redaction hook and a compression hook
+          // can both apply to the same result without knowing about each other.
+          for after in &self.after_tool_callbacks {
+            if let Some((new_status, new_content)) = after
+              .call(
+                context_ref,
+                &function_call.id,
+                function_name,
+                status,
+                &content,
+              )
+              .await
+            {
+              status = new_status;
+              content = new_content;
+            }
           }
+
+          Err(ContentItem::ToolResult {
+            tool_call_id: function_call.id.clone(),
+            name: function_name.clone(),
+            status,
+            content,
+          })
         };
-
-        // Run every after-hook in registration order, threading the (possibly rewritten)
-        // result from one into the next, so e.g. a redaction hook and a compression hook
-        // can both apply to the same result without knowing about each other.
-        for after in &self.after_tool_callbacks {
-          if let Some((new_status, new_content)) = after
-            .call(
-              context_ref,
-              &function_call.id,
-              function_name,
-              status,
-              &content,
-            )
-            .await
-          {
-            status = new_status;
-            content = new_content;
-          }
+        async move {
+          let settled = call.instrument(span.clone()).await;
+          observe::record_tool_outcome(&span, &settled);
+          settled
         }
-
-        Err(ContentItem::ToolResult {
-          tool_call_id: function_call.id.clone(),
-          name: function_name.clone(),
-          status,
-          content,
-        })
       },
     ))
     .await;

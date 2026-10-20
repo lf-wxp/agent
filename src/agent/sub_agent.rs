@@ -66,13 +66,13 @@
 //!
 //! # Token usage
 //!
-//! A tool call has no access to the parent's [`crate::agent::ExecutionContext`], so what
-//! the sub-agent spends is *not* added to the parent's `usage`. It is accumulated on the
-//! tool instead — read it with [`AgentTool::usage`] — and logged per call.
-//!
-//! Only calls that finish are counted. A run that fails or is dropped (cancelled, timed
-//! out) loses its transcript with it, and with the transcript the usage it had recorded, so
-//! what such a call spent is in the provider's bill and not in [`AgentTool::usage`].
+//! What the sub-agent spends is charged to the parent's run as it is spent (see
+//! [`crate::agent::usage`]), so it shows up in the parent's `usage` / `usage_by_model` —
+//! under the sub-agent's model, which is what pricing needs — even for a delegation that
+//! fails or is cut off. It is also accumulated on the tool itself, across calls, for a
+//! caller that wants the sub-agent's share on its own: [`AgentTool::usage`]. That one
+//! only counts calls that finish, since a run that fails or is dropped loses the
+//! transcript its usage was recorded in.
 
 use std::{
   sync::{Arc, Mutex},
@@ -209,8 +209,8 @@ impl AgentTool {
     self
   }
 
-  /// Tokens the sub-agent has spent across every call so far. See the module docs for
-  /// why this is not part of the parent's usage.
+  /// Tokens the sub-agent has spent across every call that finished. The same tokens
+  /// are also in the parent run's usage; see the module docs.
   pub fn usage(&self) -> TokenUsage {
     *self
       .usage
@@ -256,11 +256,7 @@ impl Tool for AgentTool {
       .usage
       .lock()
       .unwrap_or_else(|poisoned| poisoned.into_inner())
-      .add(
-        spent.prompt_tokens,
-        spent.completion_tokens,
-        spent.total_tokens,
-      );
+      .merge(&spent);
     tracing::info!(
       sub_agent = %self.name,
       steps = result.context.current_step,

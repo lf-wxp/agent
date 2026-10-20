@@ -39,7 +39,7 @@ const SYSTEM_PROMPT: &str = "You are a filesystem assistant. Use the tools rathe
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  telemetry::init()?;
+  let _telemetry = telemetry::init()?;
 
   let workspace = workspace_dir();
   setup_workspace(&workspace)?;

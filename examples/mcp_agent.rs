@@ -29,7 +29,7 @@ const SERVER_LABEL: &str = "demo";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  telemetry::init()?;
+  let _telemetry = telemetry::init()?;
 
   let mut command = Command::new("cargo");
   command.args(["run", "--quiet", "--example", "mcp_server"]);

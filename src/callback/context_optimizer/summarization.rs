@@ -408,6 +408,10 @@ impl Summarization {
       is_transient,
     )
     .await?;
+    // Billed to the run whose history is being summarized (see `crate::agent::usage`).
+    if let Some(spent) = &response.usage {
+      crate::agent::usage::charge(&self.model, spent.into());
+    }
 
     let summary = response
       .choices

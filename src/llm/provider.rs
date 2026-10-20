@@ -43,11 +43,16 @@
 use std::sync::{Arc, LazyLock};
 
 use async_openai::config::OpenAIConfig;
+use futures::StreamExt;
 use tokio::sync::{AcquireError, Semaphore, SemaphorePermit};
+use tracing::Instrument;
 
 use crate::{
   config,
-  llm::backend::{ChatBackend, ChatChunkStream, ChatRequest, ChatResponse, OpenAiCompatible},
+  llm::{
+    backend::{ChatBackend, ChatChunkStream, ChatRequest, ChatResponse, OpenAiCompatible},
+    spans,
+  },
 };
 
 /// Backend and concurrency budget for one tenant.
@@ -128,17 +133,48 @@ impl Provider {
   /// Takes a [`ChatRequest`] rather than the typed request so that a caller replaying
   /// reasoning cannot lose it by passing the wrong one; a request with nothing to replay
   /// converts with `.into()`.
+  ///
+  /// Traced as a `chat` span (see [`crate::telemetry`]), waiting for the budget slot
+  /// included — time spent queued behind other requests is part of what the caller waited.
   pub async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-    let _permit = self.acquire().await?;
-    self.backend.create(request).await
+    let span = spans::chat_span(&request.request.model, false);
+    let result = async {
+      let _permit = self.acquire().await?;
+      self.backend.create(request).await
+    }
+    .instrument(span.clone())
+    .await;
+    match &result {
+      Ok(response) => spans::record_response(&span, response),
+      Err(err) => spans::record_error(&span, err),
+    }
+    result
   }
 
   /// Open a streamed response, holding a slot of this tenant's budget only while the
   /// stream is being opened — not while it is consumed, which can take as long as the
   /// caller spends between chunks (running tools, waiting on a human).
+  ///
+  /// The `chat` span lives as long as the returned stream, so it covers the whole
+  /// response and records the usage the final chunk carries.
   pub async fn chat_stream(&self, request: ChatRequest) -> anyhow::Result<ChatChunkStream> {
-    let _permit = self.acquire().await?;
-    self.backend.create_stream(request).await
+    let span = spans::chat_span(&request.request.model, true);
+    let opened = async {
+      let _permit = self.acquire().await?;
+      self.backend.create_stream(request).await
+    }
+    .instrument(span.clone())
+    .await;
+    match opened {
+      Ok(chunks) => Ok(Box::pin(chunks.inspect(move |item| match item {
+        Ok(chunk) => spans::record_chunk(&span, chunk),
+        Err(err) => spans::record_error(&span, err),
+      }))),
+      Err(err) => {
+        spans::record_error(&span, &err);
+        Err(err)
+      }
+    }
   }
 }
 

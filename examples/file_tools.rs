@@ -29,7 +29,7 @@ const SYSTEM_PROMPT: &str = "You are a general-purpose assistant with access to 
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  telemetry::init()?;
+  let _telemetry = telemetry::init()?;
 
   let workspace = workspace_dir();
   setup_workspace(&workspace)?;

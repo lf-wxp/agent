@@ -71,6 +71,19 @@ tokio-util = "0.7.20"
 tower-http = { version = "0.7.1", features = ["cors", "fs", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
+# OpenTelemetry export (`--features otel`). Optional because it is a sizeable dependency
+# tree that only a deployment shipping traces to a collector needs; the spans themselves
+# are plain `tracing` spans and exist either way. OTLP over HTTP with the blocking client,
+# which is what the SDK's batch processor (its own thread) is meant to be paired with —
+# no gRPC stack, and no dependence on the caller's async runtime.
+opentelemetry = { version = "0.33.0", default-features = false, features = ["trace"], optional = true }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"], optional = true }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = [
+  "http-proto",
+  "reqwest-blocking-client",
+  "trace",
+], optional = true }
+tracing-opentelemetry = { version = "0.34.0", optional = true }
 uuid = { version = "1.28.0", features = ["v4"] }
 walkdir = "2.5.0"
 zip = "9.0"
@@ -78,6 +91,17 @@ zip = "9.0"
 # `run_command` signals its child's whole process group, which std/tokio do not expose.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.191"
+
+[features]
+default = []
+# Export spans over OTLP/HTTP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set; see
+# `telemetry`'s module docs.
+otel = [
+  "dep:opentelemetry",
+  "dep:opentelemetry_sdk",
+  "dep:opentelemetry-otlp",
+  "dep:tracing-opentelemetry",
+]
 
 [profile.release]
 codegen-units = 1

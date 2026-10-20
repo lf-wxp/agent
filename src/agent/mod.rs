@@ -7,6 +7,7 @@ pub mod llm_request;
 pub mod runtime;
 pub mod session;
 pub mod sub_agent;
+pub mod usage;
 
 pub use approval_store::{ApprovalStore, FileApprovalStore, SuspendedRunView};
 pub use callback::{

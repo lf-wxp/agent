@@ -46,7 +46,7 @@ const BUDGET: usize = 3_000;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  telemetry::init()?;
+  let _telemetry = telemetry::init()?;
 
   let context = long_run_transcript(24);
   println!(

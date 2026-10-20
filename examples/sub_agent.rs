@@ -31,7 +31,7 @@ const EXPLORER_PROMPT: &str = "You explore a codebase to answer one question. Us
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  telemetry::init()?;
+  let _telemetry = telemetry::init()?;
 
   // Read-only on purpose: with no tool that changes anything, the explorer needs no
   // approval step, and the lead may run several explorations at once. Read-only is not
