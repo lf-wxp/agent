@@ -735,16 +735,15 @@ fn to_history_entry(event: Event) -> HistoryEntry {
     content: event
       .content
       .into_iter()
-      .filter_map(to_history_content_item)
+      .map(to_history_content_item)
       .collect(),
   }
 }
 
-/// `None` for a [`ContentItem::Reasoning`]: like [`AgentStreamEvent::Reasoning`], it is not
-/// shown in either front-end yet (there is no `HistoryContentItem` for it), and the
-/// transcript only holds it when `LLM_REPLAY_REASONING` is on.
-fn to_history_content_item(item: ContentItem) -> Option<HistoryContentItem> {
-  Some(match item {
+/// A [`ContentItem::Reasoning`] is only in the transcript when `LLM_REPLAY_REASONING` is
+/// on; when it is, it is shown like the live [`ChatEvent::Reasoning`] it streamed as.
+fn to_history_content_item(item: ContentItem) -> HistoryContentItem {
+  match item {
     ContentItem::Message { role, content } => HistoryContentItem::Message { role, content },
     ContentItem::ToolCall {
       tool_call_id,
@@ -766,12 +765,11 @@ fn to_history_content_item(item: ContentItem) -> Option<HistoryContentItem> {
       status: to_tool_status(status),
       content,
     },
-    ContentItem::Reasoning { .. } => return None,
-  })
+    ContentItem::Reasoning { text } => HistoryContentItem::Reasoning { text },
+  }
 }
 
 /// Every [`AgentStreamEvent`] variant maps to exactly one [`ChatEvent`], except
-/// [`AgentStreamEvent::Reasoning`], which maps to none (see its arm), and
 /// [`AgentStreamEvent::ToolCallsStarted`]/[`AgentStreamEvent::ToolCallsFinished`], whose
 /// [`ContentItem`]s are always [`ContentItem::ToolCall`]/[`ContentItem::ToolResult`] by
 /// construction (see `Agent::record_tool_calls`/`Agent::execute_tool_calls`) — returning
@@ -790,10 +788,7 @@ fn to_history_content_item(item: ContentItem) -> Option<HistoryContentItem> {
 pub(crate) fn to_chat_events(event: &AgentStreamEvent, turn: &str) -> Vec<ChatEvent> {
   match event {
     AgentStreamEvent::Token(text) => vec![ChatEvent::Token { text: text.clone() }],
-    // Not shown in either front-end yet: there is no `ChatEvent` for it, and adding one
-    // means a front-end rebuild for every open tab (see `crates/shared`). Dropping it
-    // here loses nothing persistent — reasoning is never part of the transcript.
-    AgentStreamEvent::Reasoning(_) => Vec::new(),
+    AgentStreamEvent::Reasoning(text) => vec![ChatEvent::Reasoning { text: text.clone() }],
     AgentStreamEvent::ToolCallsStarted(items) => vec![ChatEvent::ToolCallsStarted {
       calls: items
         .iter()
@@ -911,6 +906,36 @@ mod tests {
     std::fs::write(dir.join("app.wasm"), b"not the entry point").expect("write");
     let warning = dist_warning(&dir).expect("a build with no index.html should warn");
     assert!(warning.contains("index.html"), "{warning}");
+  }
+
+  /// Reasoning has to reach the browser as its own frame — folding it into `Token` would
+  /// render the chain of thought as part of the answer.
+  #[test]
+  fn reasoning_is_forwarded_as_its_own_frame() {
+    let frames = to_chat_events(&AgentStreamEvent::Reasoning("thinking".to_owned()), "t1");
+    assert_eq!(frames.len(), 1);
+    assert!(matches!(&frames[0], ChatEvent::Reasoning { text } if text == "thinking"));
+  }
+
+  /// With reasoning replayed it is in the transcript, and a reloaded page should show it
+  /// where it streamed: ahead of the item it belongs to.
+  #[test]
+  fn recorded_reasoning_survives_into_history_in_order() {
+    let items: Vec<HistoryContentItem> = vec![
+      ContentItem::Reasoning {
+        text: "hmm".to_owned(),
+      },
+      ContentItem::Message {
+        role: "assistant".to_owned(),
+        content: "42".to_owned(),
+      },
+    ]
+    .into_iter()
+    .map(to_history_content_item)
+    .collect();
+
+    assert!(matches!(&items[0], HistoryContentItem::Reasoning { text } if text == "hmm"));
+    assert!(matches!(&items[1], HistoryContentItem::Message { .. }));
   }
 
   #[test]

@@ -55,6 +55,9 @@
 //!   match the old one.
 //! - [`crate::tools::calculator`] — its result is already shorter than any note
 //!   describing it.
+//! - [`crate::tools::plan`] (`update_plan`) — its result is a short echo of the call's own
+//!   arguments, and the usual note ("call it again to get this back") would be an
+//!   instruction to *change* the plan, since every call replaces it.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -384,7 +387,7 @@ mod tests {
   use crate::{
     agent::ToolResultStatus,
     callback::context_optimizer::tokens,
-    tools::{calculator, file_delete, file_edit, file_upzip, file_write, read_image, shell},
+    tools::{calculator, file_delete, file_edit, file_upzip, file_write, plan, read_image, shell},
   };
 
   fn call(id: &str, name: &str, arguments: Value) -> ContentItem {
@@ -730,6 +733,7 @@ mod tests {
       shell::NAME,
       read_image::NAME,
       calculator::NAME,
+      plan::NAME,
     ] {
       assert!(
         !compaction.describers.contains_key(name),

@@ -31,8 +31,8 @@
 | Reasoning / thinking | ✅ | 读取 `reasoning_content` / `reasoning`（`AgentResult::reasoning`、`AgentStreamEvent::Reasoning`），支持 `reasoning_effort`，可选回传（`LLM_REPLAY_REASONING`，DeepSeek 思考模式带 tools 时需要）；推理 token 数尚未统计 |
 | 采样参数 | ✅ | `ModelSettings`：`max_tokens`（可选 `max_completion_tokens` 字段）、`temperature`、`top_p`、`reasoning_effort` |
 | 多模态输入 | ⚠️ | 用户消息只能是 `String`；MCP 返回的图片会被丢弃（`read_image` 已改走 `Provider`） |
-| 规划 / 反思 | ❌ | 只有 ReAct 式的循环，没有 todo 工具，也没有自检步骤 |
-| 多 agent | ❌ | 子 agent、agent-as-tool、handoff、workflow / graph 都没有 |
+| 规划 / 反思 | ⚠️ | 有 `update_plan` 计划工具（`src/tools/plan/`）；没有反思 / 自检步骤 |
+| 多 agent | ⚠️ | 有 agent-as-tool（`AgentTool`，`src/agent/sub_agent.rs`）；handoff、workflow / graph 编排没有 |
 | 长期记忆 / RAG | ⚠️ | `knowledge_base` 只在内存中暴力检索，每次都重新计算 embedding；没有 `retrieve` 工具，也没有跨会话记忆 |
 | 可观测性 | ⚠️ | 只有 fmt 日志；没有 span 和 OpenTelemetry；`TokenUsage` 不计算成本 |
 | 类型化错误 | ❌ | 全部使用 `anyhow` |
@@ -90,8 +90,8 @@
 |---|---|---|---|
 | 1 | 写入和执行类工具 | `write_file`、`edit_file`、`grep`、`run_command`；接入工作区沙箱、默认审批和上下文 compaction | ✅ 已完成 |
 | 2 | 工具超时和取消 | 单个工具统一超时、`CancellationToken`、工具并发上限、文件 IO 不再阻塞运行时 | ✅ 已完成 |
-| 3 | LLM Provider 抽象和模型参数 | Provider trait、reasoning、采样参数与 `max_tokens` 可配置、修复 `read_image` 绕过 `Provider` 的问题 | ✅ 已完成，待审批 |
-| 4 | 子 agent 与规划 | agent-as-tool、todo / plan 工具 | ⏳ 待开始 |
+| 3 | LLM Provider 抽象和模型参数 | Provider trait、reasoning、采样参数与 `max_tokens` 可配置、修复 `read_image` 绕过 `Provider` 的问题 | ✅ 已完成 |
+| 4 | 子 agent 与规划 | agent-as-tool、todo / plan 工具 | ✅ 已完成，待审批 |
 | 5 | 可观测性 | span 埋点、接入 OTel、成本统计 | ⏳ 待开始 |
 | 6 | 持久化检索和长期记忆 | 持久化向量库、`retrieve` 工具、跨会话记忆 | ⏳ 待开始 |
 | 7 | 工程化 | `thiserror`、Cargo features、MCP 补全、公开工具宏等（可以按需再拆分） | ⏳ 待开始 |
@@ -162,7 +162,7 @@
   - **回传开关** `ModelSettings::replay_reasoning`（`LLM_REPLAY_REASONING`，默认关闭）。依据 DeepSeek 官方文档：思考模式下请求带 `tools` 时，历史 assistant 消息必须带回 `reasoning_content`（同一次运行的工具轮次和之后的轮次都要），否则返回 400；而 OpenAI 等提供商不接受这个字段，所以不能默认开启。
   - 开启后：`Agent` 在 transcript 里记录新增的 `ContentItem::Reasoning`（位于它所属消息之前），`build_messages` 把它挂到后面的 assistant 消息上，`OpenAiCompatible` 把它写成该消息的 `reasoning_content`；`tool_loop::run` 和流式 `llm::stream` 在一次调用内的各轮之间同样回传。非流式、流式、结构化的两条路线都覆盖。
   - 为保证推理内容不和所属消息分开：`find_safe_start` 和驱逐的头部边界不会把二者切开；摘要的文本里不包含推理；孤立的（所属消息已被裁掉的）推理在构建请求时丢弃，不会挂到别的消息上；关闭开关后，transcript 里已有的推理也不再发送。
-  - Web 历史接口不返回 `Reasoning` 项。
+  - Web 历史接口返回 `Reasoning` 项（`HistoryContentItem::Reasoning`），页面刷新后以折叠状态显示；只有开启回传时 transcript 里才有。
   - 无状态的 `tool_loop::Completion` 也新增了 `reasoning` 字段。
   - 注意：开启 `byot` 后，原始的流式调用不会再自动设置 `stream: true`，现在由 `OpenAiCompatible` 自己设置。`tests/openai_backend.rs` 有端到端测试覆盖这一点。
 - **模型参数**（`src/llm/settings.rs`）：
@@ -184,6 +184,65 @@
 - **未做 / 遗留**：
   - 没有原生的 Anthropic / Gemini 适配器，接口已经留好。
   - 没有模型能力表，`tool_choice` 和 `json_schema` 的支持仍按模型名关键字判断。
-  - Web UI 和终端还不显示推理内容：`AgentStreamEvent::Reasoning` 在 `to_chat_events` 中映射为空，要显示需要新增 `ChatEvent` 并重新构建前端。
   - 推理 token 数没有计入 `TokenUsage`，留给第 5 项。
   - `StructuredAgentResult` 没有 `reasoning` 字段。
+
+#### 第 3 项补充：在 CLI 和 Web UI 显示推理过程
+
+- **线上协议**（`crates/shared`）：新增 `ChatEvent::Reasoning { text }` 和 `HistoryContentItem::Reasoning { text }`。`to_chat_events` 把 `AgentStreamEvent::Reasoning` 映射为前者。`--no-stream` 模式下，最终回答那一轮的推理会在答案之前单独广播。
+- **终端**：
+  - `print_chat_events` 的渲染逻辑抽成纯函数 `TerminalView::render`，它记录当前是否处在一段推理里。
+  - 每段推理只在开头打一次 `[thinking]` 标签，之后的每个 chunk 用 ANSI 暗色（SGR 2/22）单独包裹。
+  - 推理结束后，下一帧另起一行开始；如果这一帧本身就以换行开头，就不再额外加空行。
+  - 设置了 `NO_COLOR` 时不输出颜色。
+- **Web UI**：
+  - 新增时间线项 `TimelineItem::Reasoning`。推理流入时展开、左边框为琥珀色、显示「思考中…」；同一轮的推理 chunk 都追加到同一张卡片里。
+  - 收到任何非推理帧（第一个 token、工具调用、本轮结束等）时，卡片结束并自动折叠，可以点击展开。
+  - 推理流入期间隐藏原来的三点「处理中」动画，页面滚动也会跟随推理文本。
+  - 从历史加载的推理默认折叠。界面文案支持中、英、西三种语言。
+- **验证**：
+  - 单测：终端渲染 5 个（标签只出现一次、自动换行、每轮单独标签、颜色开关、其他帧输出不变）、`to_chat_events` 映射、历史映射、`shared` 的序列化往返。
+  - 端到端：用本地 SSE 假服务模拟 DeepSeek 风格的推理模型，两轮推理中间夹一次 `calculator` 调用。
+    - Web 端用浏览器检查了推理中、折叠后、展开后三种状态；页面没有报"unrecognized event"错误。
+    - 终端在伪终端里实际运行了一次，确认了输出排版和暗色转义序列是成对的。
+- **限制**：
+  - 默认（不开回传）推理不进入 transcript，刷新页面后看不到之前轮次的推理。
+  - 中途打开的标签页只能看到之后流入的推理。
+  - 推理按纯文本显示，不渲染 markdown。
+
+#### 第 4 项：子 agent 与规划
+
+- **子 agent（`AgentTool`，`src/agent/sub_agent.rs`）**：
+  - `AgentTool::new(name, description, agent)` 把一个 `Agent` 包装成 `Tool`，参数只有一个 `task`。父 agent 的模型调用它，等于把一个自成一体的任务交出去；子 agent 跑完自己的工具循环后，只把最终回答作为工具结果交回。
+  - 每次调用都是一次全新的 `Agent::run`，子 agent 看不到父 agent 的对话，两次调用之间也互不记忆。`task` 参数的 schema 说明里提醒模型把需要的信息都写进去。
+  - 名称在构造时校验（1–64 个 ASCII 字母、数字、`_`、`-`，即提供商接受的工具名），描述不能为空。
+  - **并发**：只有子 agent 的工具全部是 `concurrency_safe` 时，它才是；有一个带副作用或行为未知的工具（例如 MCP 工具），整个委派就按顺序执行。
+  - **超时与取消**：默认沿用父 agent 的工具超时，可以用 `with_timeout` 放宽。父 agent 取消或超时时，子 agent 的运行被直接丢弃，正在进行的模型请求和工具一起中止。
+  - **审批与沙箱**：子 agent 自己的钩子只作用于它自己的工具调用，父 agent 的沙箱和审批不会继承。`AgentTool::new` 发现子 agent 有非只读工具又没有任何 before-tool 钩子时会打 warn（新增 `Agent::has_before_tool_callbacks()`）。没人回应的审批按 `Agent::run` 的方式记为未回应后继续，不会让父 agent 挂起。
+  - **限制是子 agent 自己的**：父 agent 的轮次预算把整次委派算作一轮，子 agent 按它自己的 `with_max_steps` 运行，并发委派会成倍放大，需要调用方自己约束。
+  - **轮次预算用尽**：回答末尾追加一句说明，提醒父 agent 这个回答可能不完整。
+  - **错误**：子 agent 失败时，错误信息带上完整原因链（父 agent 的模型只看得到最外层那条消息），但截断到 1000 字符，避免把整段响应体带进父 agent 的上下文。
+  - **token 用量**：工具拿不到父 agent 的 `ExecutionContext`，所以子 agent 的用量不计入父 agent 的 `usage`，而是在工具实例上累计（`AgentTool::usage()`），每次调用另打一条 info 日志。只统计成功完成的调用：失败或被丢弃的运行连同 transcript 一起丢了，用量也就丢了。
+  - **不会成环**：`Agent` 的工具集在构造时固定，`AgentTool` 只能包装已经存在的 agent，所以构造不出循环；嵌套深度由调用方决定。
+  - 新增 `Agent::toolbox()` 和 `ToolRegistry::iter()` 两个访问方法。
+- **计划工具（`update_plan`，`src/tools/plan/`）**：
+  - 参数是完整的计划（`plan: [{step, status}]`，状态为 `pending` / `in_progress` / `completed`）和可选的 `explanation`。每次调用都替换上一份计划，空列表表示清空。
+  - **无状态**：工具本身不保存任何东西，当前计划就是对话记录里最后一次调用的参数。所以一个实例可以被多个 agent、多个会话共用，计划也能跟着对话记录一起落盘、挂起恢复。
+  - **校验**：步骤描述不能为空，最多 50 步，单步不超过 200 字符，`explanation` 不超过 500 字符，`in_progress` 最多一个。不符合时返回错误，让模型自己改正，不做静默截断。清空计划时带的 `explanation` 会保留在返回里。
+  - 返回渲染好的清单，例如 `Plan updated (1/3 completed):` 加上 `[x]` / `[>]` / `[ ]` 各行。
+  - 已加入 `ToolRegistry::builtin()` 和 `select`，CLI 默认可用；GAIA 评测用的是固定工具列表，不受影响。工作区沙箱的分类测试里把它列为不涉及路径的工具。
+  - 上下文压缩不处理它：结果只是参数的回显，而通常的提示语（"再调用一次即可取回"）对它来说等于让模型修改计划。
+  - **裁剪的边界**：请求副本按 token 预算裁剪时，很久没更新的计划可能不在模型视野内。工具描述要求每次状态变化都重发计划，使最新副本靠近末尾；一个步骤本身就占满预算的情形仍可能丢失，对话记录和前端里仍有。
+  - **终端显示**：不再打印 `update_plan` 那一行原始 JSON 调用，改为把结果打印成缩进的 `[plan]` 清单；校验失败时和其他工具一样显示 `-> Error`。Web UI 不变，结果卡片里就是这份清单。
+- **测试辅助**：把 `model_tests.rs` 里的脚本化假后端移到 `src/llm/testing.rs`（仅测试编译），子 agent 测试和运行时测试共用。
+- **示例**：`examples/sub_agent.rs`，主 agent 用 `update_plan` 规划，并把读代码的工作交给只读的 explorer 子 agent。
+- **验证**：
+  - 子 agent 14 个单测：任务委派、父 agent 端到端委派（确认父 agent 的对话没有传给子 agent）、预算用尽提示、用量累计、空任务、失败原因、原因链截断、并发判定、名称校验、超时、工具定义，以及两个取消 / 超时会丢弃子 agent 模型请求的测试和一个无钩子副作用工具的识别测试。
+  - `update_plan` 13 个单测（含长度上限、清空保留原因），另有一个经脚本化模型走完整 agent 运行的端到端测试；终端渲染 2 个。
+  - 没有用真实模型跑过示例，也没有在 CLI 里实际跑过 `update_plan`。
+- **未做 / 遗留**：
+  - 子 agent 的中间过程（它的 token、工具调用）不会出现在父 agent 的流式事件里，前端只能看到一次工具调用和它的结果。
+  - 没有 handoff（把对话控制权转交给另一个 agent），也没有 workflow / graph 编排。
+  - 没有反思 / 自检步骤。
+  - 子 agent 的用量没有合并进父 agent 的 `usage`，失败运行的用量也没有统计，留给第 5 项。
+  - 加入 `update_plan` 改变了 `builtin()` 的工具列表，但不会让升级前挂起的运行失效：`RunFingerprint::mismatch` 只检查记录里的工具是否还在，新增的工具不算差异（见 `an_added_tool_still_matches`）。

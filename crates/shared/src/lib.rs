@@ -150,6 +150,15 @@ pub enum ChatEvent {
   UserMessage { text: String, origin: MessageOrigin },
   /// A chunk of assistant text.
   Token { text: String },
+  /// A chunk of the model's chain of thought, for a model that reasons and a provider
+  /// that returns it. Arrives ahead of the [`Self::Token`]s (or tool calls) of the same
+  /// round; consecutive chunks belong to one block, and any other frame ends it.
+  ///
+  /// Display only: reasoning is not written to the transcript unless the agent is set to
+  /// replay it (`LLM_REPLAY_REASONING`), so by default it is absent from
+  /// `GET /api/history` and a reloaded tab will not show it again. When it is recorded,
+  /// it comes back as [`HistoryContentItem::Reasoning`].
+  Reasoning { text: String },
   /// Output that came from the process itself rather than the model — a `/help` listing,
   /// a confirmation that history was cleared. Broadcast like anything else so every view
   /// sees it, including views that did not issue the command.
@@ -271,6 +280,11 @@ pub enum HistoryContentItem {
     status: ToolStatus,
     content: String,
   },
+  /// A chain of thought, recorded only when the agent replays reasoning. Precedes the
+  /// message or tool call it belongs to, the same order it streamed in.
+  Reasoning {
+    text: String,
+  },
 }
 
 #[cfg(test)]
@@ -290,6 +304,19 @@ mod tests {
 
     let back: ChatEvent = serde_json::from_value(json).unwrap();
     assert!(matches!(back, ChatEvent::ApprovalRequired { id, .. } if id == "call-1"));
+  }
+
+  #[test]
+  fn reasoning_travels_as_its_own_tagged_frame() {
+    let event = ChatEvent::Reasoning {
+      text: "let me think".to_owned(),
+    };
+    let json = serde_json::to_value(&event).unwrap();
+    assert_eq!(json["type"], "reasoning");
+    assert_eq!(json["text"], "let me think");
+
+    let back: ChatEvent = serde_json::from_value(json).unwrap();
+    assert!(matches!(back, ChatEvent::Reasoning { text } if text == "let me think"));
   }
 
   #[test]

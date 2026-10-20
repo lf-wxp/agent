@@ -154,7 +154,7 @@ use agent::{
   llm::provider::Provider,
   session::{FileSessionStore, SessionStore},
   telemetry,
-  tools::{ToolRegistry, file_delete, file_edit, file_write, shell},
+  tools::{ToolRegistry, file_delete, file_edit, file_write, plan, shell},
 };
 use anyhow::Context;
 use async_stream::stream;
@@ -166,7 +166,8 @@ use reedline::{
   default_vi_normal_keybindings, default_vi_visual_keybindings,
 };
 use shared::{
-  ChatEvent, MessageOrigin, PendingApprovalView, ToolResultSummary, commands as command_set,
+  ChatEvent, MessageOrigin, PendingApprovalView, ToolResultSummary, ToolStatus,
+  commands as command_set,
 };
 use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc};
 
@@ -784,7 +785,12 @@ async fn main() -> anyhow::Result<()> {
           // No per-round `ToolCallsStarted`/`Finished` to broadcast here (this branch
           // never sees them at all — see `run_turn`'s docs), just the final text and
           // completion, so a browser watching along at least sees *something* for a
-          // non-streaming turn instead of silence until the next streaming one.
+          // non-streaming turn instead of silence until the next streaming one. The final
+          // round's reasoning, when there is one, goes first — the order a streaming turn
+          // would have shown it in.
+          if let Some(text) = result.reasoning {
+            let _ = web_events_tx.send(ChatEvent::Reasoning { text });
+          }
           let _ = web_events_tx.send(ChatEvent::Token {
             text: result.output,
           });
@@ -1259,74 +1265,168 @@ fn approval_prompt(tool: &str, raw_arguments: &str) -> String {
 /// briefly fell behind should keep printing what comes next, not stop rendering
 /// entirely.
 async fn print_chat_events(mut events: broadcast::Receiver<ChatEvent>) {
+  let mut view = TerminalView::new(color_enabled());
   loop {
     let event = match events.recv().await {
       Ok(event) => event,
       Err(broadcast::error::RecvError::Lagged(_)) => continue,
       Err(broadcast::error::RecvError::Closed) => break,
     };
-    print_chat_event(event);
+    term_write(&view.render(event));
   }
 }
 
-fn print_chat_event(event: ChatEvent) {
-  match event {
-    ChatEvent::UserMessage { text, origin } => {
-      match origin {
-        // Already visible: `reedline` echoed it to this terminal as it was typed, and
-        // re-printing it here would just duplicate it.
-        MessageOrigin::Terminal => {}
-        // Not otherwise visible here at all — this is the one thing this task prints
-        // that a web-originated turn would not show up without.
-        MessageOrigin::Web => term_write(&format!("\n[web] {text}\n")),
-      }
-      term_write("Agent> ");
+/// Whether to style this terminal's output with ANSI escapes.
+///
+/// Only when stdout is a terminal — redirected to a file or a pipe, the escapes would end
+/// up in the log as literal garbage — and `NO_COLOR` is unset or empty, the
+/// <https://no-color.org> convention.
+fn color_enabled() -> bool {
+  color_wanted(
+    io::stdout().is_terminal(),
+    std::env::var_os("NO_COLOR").as_deref(),
+  )
+}
+
+/// The decision behind [`color_enabled`], with its two inputs passed in so it can be
+/// tested without touching the process environment or a real terminal.
+fn color_wanted(stdout_is_terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
+  stdout_is_terminal && no_color.is_none_or(|value| value.is_empty())
+}
+
+/// SGR "faint" on. Applied per chunk together with [`UNDIM`] rather than once around a
+/// whole block, so nothing else this terminal prints can end up dimmed by a block that
+/// has not closed yet.
+const DIM: &str = "\x1b[2m";
+
+/// SGR "normal intensity": undoes [`DIM`].
+const UNDIM: &str = "\x1b[22m";
+
+/// What [`print_chat_events`] needs to remember between frames.
+///
+/// [`ChatEvent::Reasoning`] arrives in chunks, so it has to know whether a block is open
+/// (only the first chunk prints a label) and whether the last thing printed was a thought
+/// that left the cursor mid-line (whatever comes next has to start on its own line).
+struct TerminalView {
+  /// A reasoning block is open: the previous frame was a reasoning chunk.
+  in_reasoning: bool,
+  /// The last thing printed was reasoning, and no output has started a new line since.
+  /// Outlasts the block itself: a frame that prints nothing ends the block but leaves
+  /// the cursor where it was.
+  line_open: bool,
+  color: bool,
+}
+
+impl TerminalView {
+  fn new(color: bool) -> Self {
+    Self {
+      in_reasoning: false,
+      line_open: false,
+      color,
     }
+  }
+
+  /// The text to print for `event`, closing an open reasoning block first if `event`
+  /// is anything else.
+  fn render(&mut self, event: ChatEvent) -> String {
+    if let ChatEvent::Reasoning { text } = event {
+      let label = if self.in_reasoning {
+        ""
+      } else if self.line_open {
+        // A new block right after one whose line was never closed (the frames in
+        // between printed nothing).
+        "\n[thinking] "
+      } else {
+        "[thinking] "
+      };
+      self.in_reasoning = true;
+      self.line_open = true;
+      return if self.color {
+        format!("{label}{DIM}{text}{UNDIM}")
+      } else {
+        format!("{label}{text}")
+      };
+    }
+
+    self.in_reasoning = false;
+    let body = render_chat_event(event);
+    if body.is_empty() {
+      // Nothing printed, so the cursor is still where the last thought left it.
+      return body;
+    }
+    if std::mem::take(&mut self.line_open) && !body.starts_with('\n') {
+      // The answer (or whatever follows) starts on its own line, not glued to the end
+      // of the last thought.
+      format!("\n{body}")
+    } else {
+      body
+    }
+  }
+}
+
+/// The text for every frame except [`ChatEvent::Reasoning`], which needs
+/// [`TerminalView`]'s state.
+fn render_chat_event(event: ChatEvent) -> String {
+  match event {
+    ChatEvent::UserMessage { text, origin } => match origin {
+      // Already visible: `reedline` echoed it to this terminal as it was typed, and
+      // re-printing it here would just duplicate it.
+      MessageOrigin::Terminal => "Agent> ".to_owned(),
+      // Not otherwise visible here at all — this is the one thing this task prints
+      // that a web-originated turn would not show up without.
+      MessageOrigin::Web => format!("\n[web] {text}\nAgent> "),
+    },
     // Chunks are meant to be concatenated as they arrive, hence no trailing newline of
     // its own here — but `text` itself can still contain one or more bare `\n`s (a
     // multi-line assistant reply is normal), which is exactly what `term_write` exists
     // to handle correctly.
-    ChatEvent::Token { text } => term_write(&text),
-    ChatEvent::ToolCallsStarted { calls } => {
-      for call in calls {
-        term_write(&format!("\n[tool] {}({})\n", call.name, call.arguments));
-      }
-    }
-    ChatEvent::ToolCallsFinished { results } => {
-      for result in results {
-        term_write(&format!("[tool] {} -> {:?}\n", result.name, result.status));
-      }
-    }
-    ChatEvent::SystemNotice { text } => term_write(&format!("\n{text}\n")),
+    ChatEvent::Token { text } => text,
+    // Normally handled by `TerminalView::render` before this is reached; plain text is
+    // the right fallback if it ever is.
+    ChatEvent::Reasoning { text } => text,
+    // `update_plan` is left out here and shown by its result below instead: its arguments
+    // are the plan as raw JSON, and the result is the same plan as a readable checklist.
+    ChatEvent::ToolCallsStarted { calls } => calls
+      .into_iter()
+      .filter(|call| call.name != plan::NAME)
+      .map(|call| format!("\n[tool] {}({})\n", call.name, call.arguments))
+      .collect(),
+    ChatEvent::ToolCallsFinished { results } => results
+      .into_iter()
+      .map(|result| {
+        if result.name == plan::NAME && result.status == ToolStatus::Success {
+          render_plan(&result.content)
+        } else {
+          format!("[tool] {} -> {:?}\n", result.name, result.status)
+        }
+      })
+      .collect(),
+    ChatEvent::SystemNotice { text } => format!("\n{text}\n"),
+    // The single place an approval prompt is rendered on this terminal, whichever view
+    // raised it — see `approval_prompt`. The turn driver does not print one of its own;
+    // it only broadcasts, and this arm (a subscriber like any other) draws it.
     ChatEvent::ApprovalRequired {
       tool, arguments, ..
-    } => {
-      // The single place an approval prompt is rendered on this terminal, whichever view
-      // raised it — see `approval_prompt`. The turn driver does not print one of its own;
-      // it only broadcasts, and this arm (a subscriber like any other) draws it.
-      term_write(&approval_prompt(&tool, &arguments));
-    }
-    ChatEvent::ApprovalResolved { approved, .. } => {
-      term_write(&format!(
-        "\n[approval] {}\n",
-        if approved {
-          "✅ 已批准，继续执行..."
-        } else {
-          "❌ 已拒绝，跳过执行"
-        }
-      ));
-    }
+    } => approval_prompt(&tool, &arguments),
+    ChatEvent::ApprovalResolved { approved, .. } => format!(
+      "\n[approval] {}\n",
+      if approved {
+        "✅ 已批准，继续执行..."
+      } else {
+        "❌ 已拒绝，跳过执行"
+      }
+    ),
     // Nothing to take down here: this terminal renders the suspension as a one-off
     // printed notice, not as a card that stays on screen. The web UI is the one with
     // persistent state to unwind.
-    ChatEvent::SuspendedRunCleared => {}
-    ChatEvent::Done { .. } => term_write("\n\n"),
+    ChatEvent::SuspendedRunCleared => String::new(),
+    ChatEvent::Done { .. } => "\n\n".to_owned(),
     ChatEvent::TurnSuspended { pending, .. } => {
       // Rendered here rather than by the turn driver for the same reason an approval
       // prompt is: this is the one renderer for the terminal, so a suspension caused by
       // a browser-submitted turn shows up here too.
       let tools: Vec<&str> = pending.iter().map(|call| call.tool.as_str()).collect();
-      term_write(&format!(
+      format!(
         "\n\n[suspended] 无人审批，本轮已暂停并保存（待批准: {}）。\n\
          输入 /resume 继续并重新询问，或 /discard 放弃本轮。\n\n",
         if tools.is_empty() {
@@ -1334,13 +1434,26 @@ fn print_chat_event(event: ChatEvent) {
         } else {
           tools.join(", ")
         }
-      ));
+      )
     }
     // `turn` is ignored here, unlike in a browser tab: this terminal has no per-turn UI
     // state to unwind (it prints as events arrive and blocks on its own turns), so which
     // turn an error belongs to changes nothing about how it is shown.
-    ChatEvent::Error { message, .. } => term_write(&format!("\n[error] {message}\n")),
+    ChatEvent::Error { message, .. } => format!("\n[error] {message}\n"),
   }
+}
+
+/// `update_plan`'s result — a header line, then one `[x]`/`[>]`/`[ ]` line per step —
+/// as a labelled, indented block. Starts with its own newline because its call printed
+/// nothing (see the `ToolCallsStarted` arm), so whatever the model said just before may
+/// still be on the current line.
+fn render_plan(checklist: &str) -> String {
+  let mut lines = checklist.lines();
+  let mut out = format!("\n[plan] {}\n", lines.next().unwrap_or_default());
+  for line in lines {
+    out.push_str(&format!("       {line}\n"));
+  }
+  out
 }
 
 /// Writes `text` to stdout, translating every bare `\n` into `\r\n` first, then flushes.
@@ -1349,7 +1462,7 @@ fn print_chat_event(event: ChatEvent) {
 /// terminal in raw mode for as long as this process is blocked inside it waiting for a
 /// human to type — which, once a web-originated turn can run concurrently with that wait
 /// (`--mode both`, or even `--mode web` while a human is sitting at the terminal without
-/// typing anything), is exactly when [`print_chat_event`] is printing *this* task's
+/// typing anything), is exactly when [`print_chat_events`] is printing *this* task's
 /// output. Raw mode disables the terminal driver's usual behavior of translating a bare
 /// `\n` into a full "return to column 0, then move down one row" — so a plain
 /// `println!` there only moves the cursor down while leaving it at whatever column it
@@ -2064,5 +2177,179 @@ mod tests {
   #[test]
   fn normalize_line_endings_is_a_no_op_without_any_newline() {
     assert_eq!(normalize_line_endings("Agent> "), "Agent> ");
+  }
+
+  fn reasoning(text: &str) -> ChatEvent {
+    ChatEvent::Reasoning {
+      text: text.to_owned(),
+    }
+  }
+
+  fn token(text: &str) -> ChatEvent {
+    ChatEvent::Token {
+      text: text.to_owned(),
+    }
+  }
+
+  /// A block is labelled once, however many chunks it arrives in, and the answer after
+  /// it starts on its own line.
+  #[test]
+  fn a_reasoning_block_is_labelled_once_and_ends_on_its_own_line() {
+    let mut view = TerminalView::new(false);
+    let printed: String = [reasoning("let me "), reasoning("think"), token("42")]
+      .into_iter()
+      .map(|event| view.render(event))
+      .collect();
+    assert_eq!(printed, "[thinking] let me think\n42");
+  }
+
+  /// A frame that already starts on a fresh line must not gain a blank one.
+  #[test]
+  fn a_frame_that_starts_with_a_newline_is_not_given_another() {
+    let mut view = TerminalView::new(false);
+    view.render(reasoning("hmm"));
+    assert_eq!(
+      view.render(ChatEvent::SystemNotice {
+        text: "x".to_owned()
+      }),
+      "\nx\n"
+    );
+  }
+
+  /// The next round's reasoning is a new block, so it gets its own label.
+  #[test]
+  fn each_block_gets_its_own_label() {
+    let mut view = TerminalView::new(false);
+    let printed: String = [
+      reasoning("first"),
+      ChatEvent::ToolCallsFinished { results: vec![] },
+      reasoning("second"),
+    ]
+    .into_iter()
+    .map(|event| view.render(event))
+    .collect();
+    assert_eq!(printed.matches("[thinking]").count(), 2, "got: {printed:?}");
+  }
+
+  /// A frame that prints nothing (`update_plan`'s call, a cleared suspension) must not
+  /// add a blank line of its own, nor swallow the line break the next output needs.
+  #[test]
+  fn a_silent_frame_after_reasoning_neither_breaks_the_line_nor_loses_it() {
+    let mut view = TerminalView::new(false);
+    let mut printed = view.render(reasoning("hmm"));
+    printed += &view.render(ChatEvent::SuspendedRunCleared);
+    assert_eq!(printed, "[thinking] hmm", "a silent frame prints nothing");
+    assert_eq!(view.render(token("ok")), "\nok", "one line break, once");
+    assert_eq!(view.render(token("!")), "!", "and not again");
+  }
+
+  /// A plan update's call prints nothing and its result starts with its own newline, so
+  /// the thought before it is followed by exactly one line break.
+  #[test]
+  fn a_plan_update_after_reasoning_adds_no_blank_line() {
+    let mut view = TerminalView::new(false);
+    let mut printed = view.render(reasoning("planning"));
+    printed += &view.render(ChatEvent::ToolCallsStarted {
+      calls: vec![shared::ToolCallSummary {
+        id: "call_1".to_owned(),
+        name: plan::NAME.to_owned(),
+        arguments: serde_json::json!({ "plan": [] }),
+      }],
+    });
+    printed += &view.render(plan_result(ToolStatus::Success, "Plan cleared."));
+    assert_eq!(printed, "[thinking] planning\n[plan] Plan cleared.\n");
+  }
+
+  /// Escapes only belong on a terminal that has not opted out.
+  #[test]
+  fn colour_needs_a_terminal_and_no_opt_out() {
+    use std::ffi::OsStr;
+
+    assert!(color_wanted(true, None));
+    assert!(
+      color_wanted(true, Some(OsStr::new(""))),
+      "empty NO_COLOR is unset"
+    );
+    assert!(!color_wanted(true, Some(OsStr::new("1"))));
+    assert!(!color_wanted(false, None), "redirected output stays plain");
+  }
+
+  /// Dimmed chunk by chunk, so the label and anything printed afterwards are not.
+  #[test]
+  fn reasoning_is_dimmed_only_when_colour_is_on() {
+    let mut colour = TerminalView::new(true);
+    assert_eq!(
+      colour.render(reasoning("hmm")),
+      format!("[thinking] {DIM}hmm{UNDIM}")
+    );
+    assert_eq!(colour.render(token("ok")), "\nok");
+
+    let mut plain = TerminalView::new(false);
+    assert!(!plain.render(reasoning("hmm")).contains('\x1b'));
+  }
+
+  #[test]
+  fn other_frames_render_as_before() {
+    let mut view = TerminalView::new(true);
+    assert_eq!(
+      view.render(ChatEvent::UserMessage {
+        text: "hi".to_owned(),
+        origin: MessageOrigin::Web,
+      }),
+      "\n[web] hi\nAgent> "
+    );
+    assert_eq!(view.render(token("a\nb")), "a\nb");
+    assert_eq!(
+      view.render(ChatEvent::Done {
+        turn: "t".to_owned(),
+        budget_exhausted: false,
+      }),
+      "\n\n"
+    );
+  }
+
+  fn plan_result(status: ToolStatus, content: &str) -> ChatEvent {
+    ChatEvent::ToolCallsFinished {
+      results: vec![ToolResultSummary {
+        id: "call_1".to_owned(),
+        name: plan::NAME.to_owned(),
+        status,
+        content: content.to_owned(),
+      }],
+    }
+  }
+
+  /// The plan is shown once, as a checklist: its call (raw JSON) is skipped, its result
+  /// printed in full.
+  #[test]
+  fn a_plan_update_prints_the_checklist_instead_of_the_call() {
+    let mut view = TerminalView::new(false);
+    let call = view.render(ChatEvent::ToolCallsStarted {
+      calls: vec![shared::ToolCallSummary {
+        id: "call_1".to_owned(),
+        name: plan::NAME.to_owned(),
+        arguments: serde_json::json!({ "plan": [] }),
+      }],
+    });
+    assert_eq!(call, "", "the raw JSON call is not printed");
+
+    let printed = view.render(plan_result(
+      ToolStatus::Success,
+      "Plan updated (1/2 completed):\n[x] Read\n[>] Write",
+    ));
+    assert_eq!(
+      printed,
+      "\n[plan] Plan updated (1/2 completed):\n       [x] Read\n       [>] Write\n"
+    );
+  }
+
+  /// A rejected plan has no checklist to show; it reads like any failed call.
+  #[test]
+  fn a_rejected_plan_update_reads_like_any_failed_call() {
+    let mut view = TerminalView::new(false);
+    assert_eq!(
+      view.render(plan_result(ToolStatus::Error, "2 steps are in_progress")),
+      "[tool] update_plan -> Error\n"
+    );
   }
 }

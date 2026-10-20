@@ -119,6 +119,13 @@ enum TimelineItem {
     id: u64,
     text: String,
   },
+  /// The model's chain of thought for one round, streamed in ahead of that round's
+  /// answer or tool calls (see [`ChatEvent::Reasoning`]). Also loaded from history when
+  /// the agent replays reasoning and so records it in the transcript.
+  Reasoning {
+    id: u64,
+    block: ReasoningBlock,
+  },
   Error {
     id: u64,
     message: String,
@@ -146,6 +153,7 @@ impl TimelineItem {
       | Self::ToolResult { id, .. }
       | Self::Approval { id, .. }
       | Self::Notice { id, .. }
+      | Self::Reasoning { id, .. }
       | Self::Error { id, .. }
       | Self::Suspended { id, .. } => *id,
     }
@@ -154,6 +162,19 @@ impl TimelineItem {
   fn is_suspended(&self) -> bool {
     matches!(self, Self::Suspended { .. })
   }
+}
+
+/// The live parts of one [`TimelineItem::Reasoning`]. Signals rather than plain fields
+/// because the block keeps growing after it is on the timeline — chunk by chunk, while
+/// [`ChatState::live_reasoning`] still points at it — and then collapses once it ends.
+#[derive(Clone, Copy, Debug)]
+struct ReasoningBlock {
+  text: RwSignal<String>,
+  /// `true` while chunks may still arrive; drives the "thinking…" label.
+  live: RwSignal<bool>,
+  /// Open while the model is thinking, so it can be watched; collapsed once it is done,
+  /// so a long chain of thought does not push the answer off screen.
+  expanded: RwSignal<bool>,
 }
 
 /// This tab's own submission, tracked separately from everything else on the shared
@@ -190,6 +211,10 @@ struct ChatState {
   /// half-finished sentence has no [`TimelineItem::key`] of its own yet, and does not
   /// need one; it is always exactly the most recent thing on screen.
   streaming_text: RwSignal<String>,
+  /// The reasoning block still receiving chunks, if any. Every [`ChatEvent::Reasoning`]
+  /// appends to it; any other frame ends it (see [`Self::close_reasoning`]), which is
+  /// what splits one round's thinking from the next round's.
+  live_reasoning: RwSignal<Option<ReasoningBlock>>,
   /// Whether *some* turn — this tab's own, another tab's, or the terminal's — is
   /// currently running, purely to drive the "thinking" indicator shown before the first
   /// token of a reply arrives (see [`render_thinking_indicator`]). Sound because only
@@ -216,6 +241,7 @@ impl ChatState {
     Self {
       timeline: RwSignal::new(Vec::new()),
       streaming_text: RwSignal::new(String::new()),
+      live_reasoning: RwSignal::new(None),
       turn_active: RwSignal::new(false),
       pending: RwSignal::new(PendingTurn::Idle),
       next_id: RwSignal::new(0),
@@ -231,6 +257,36 @@ impl ChatState {
 
   fn push(&self, item: TimelineItem) {
     self.timeline.update(|items| items.push(item));
+  }
+
+  /// Add a reasoning chunk: to the open block if there is one, else as a new block at the
+  /// bottom of the timeline. Appending through the block's own signal re-renders only
+  /// that block, not the whole timeline, which matters at one call per streamed chunk.
+  fn append_reasoning(&self, text: &str) {
+    if let Some(block) = self.live_reasoning.get_untracked() {
+      block.text.update(|current| current.push_str(text));
+      return;
+    }
+    let block = ReasoningBlock {
+      text: RwSignal::new(text.to_owned()),
+      live: RwSignal::new(true),
+      expanded: RwSignal::new(true),
+    };
+    self.push(TimelineItem::Reasoning {
+      id: self.next_id(),
+      block,
+    });
+    self.live_reasoning.set(Some(block));
+  }
+
+  /// End the open reasoning block, if any, and fold it away. A no-op otherwise, so it is
+  /// safe to call ahead of every frame that is not itself reasoning.
+  fn close_reasoning(&self) {
+    if let Some(block) = self.live_reasoning.get_untracked() {
+      block.live.set(false);
+      block.expanded.set(false);
+      self.live_reasoning.set(None);
+    }
   }
 
   /// Whether this tab is waiting on a turn of its own (reactive: this is what disables
@@ -481,6 +537,11 @@ fn App() -> impl IntoView {
   Effect::new(move |_| {
     state.timeline.with(|_| ());
     state.streaming_text.with(|_| ());
+    // A reasoning block grows through its own signal rather than the timeline's, so it
+    // has to be followed explicitly or the page stops scrolling while the model thinks.
+    if let Some(block) = state.live_reasoning.get() {
+      block.text.with(|_| ());
+    }
     if let Some(el) = timeline_ref.get() {
       el.set_scroll_top(el.scroll_height());
     }
@@ -661,8 +722,13 @@ fn App() -> impl IntoView {
   let timeline_is_empty = move || {
     state.timeline.with(|items| items.is_empty()) && state.streaming_text.with(String::is_empty)
   };
-  let show_thinking =
-    move || state.turn_active.get() && state.streaming_text.with(String::is_empty);
+  // Not while a reasoning block is streaming: that block already says "thinking…", and
+  // the bouncing dots underneath it would say the same thing twice.
+  let show_thinking = move || {
+    state.turn_active.get()
+      && state.streaming_text.with(String::is_empty)
+      && state.live_reasoning.with(Option::is_none)
+  };
 
   view! {
     <div class="app-shell">
@@ -933,6 +999,7 @@ fn render_item(state: ChatState, item: TimelineItem) -> impl IntoView {
       <div class="notice" style="white-space: pre-wrap">{text}</div>
     }
     .into_any(),
+    TimelineItem::Reasoning { block, .. } => render_reasoning(block).into_any(),
     TimelineItem::Error { message, .. } => view! {
       <div class="notice error">
         <span class="notice-icon">"!"</span>
@@ -941,6 +1008,38 @@ fn render_item(state: ChatState, item: TimelineItem) -> impl IntoView {
     }
     .into_any(),
     TimelineItem::Suspended { pending, acted, .. } => render_suspended(state, pending, acted),
+  }
+}
+
+/// One round's chain of thought: a collapsible block, dimmed so it never reads as part
+/// of the answer. Plain text rather than markdown — it is re-rendered on every chunk,
+/// and reasoning is a scratchpad, not something formatted for a reader.
+fn render_reasoning(block: ReasoningBlock) -> impl IntoView {
+  let lang = i18n::current_lang();
+  let ReasoningBlock {
+    text,
+    live,
+    expanded,
+  } = block;
+  let toggle = move |_| expanded.update(|value| *value = !*value);
+
+  view! {
+    <div class=move || if live.get() { "reasoning live" } else { "reasoning" }>
+      <button type="button" class="reasoning-header" on:click=toggle>
+        <span class="reasoning-badge">{move || t(lang.get(), Key::ReasoningBadge)}</span>
+        <Show when=move || live.get()>
+          <span class="reasoning-live">{move || t(lang.get(), Key::ReasoningLive)}</span>
+        </Show>
+        <span class="tool-toggle">
+          {move || {
+            t(lang.get(), if expanded.get() { Key::ToolCollapse } else { Key::ToolExpand })
+          }}
+        </span>
+      </button>
+      <Show when=move || expanded.get()>
+        <pre class="reasoning-body">{move || text.get()}</pre>
+      </Show>
+    </div>
   }
 }
 
@@ -1324,6 +1423,16 @@ fn push_entries(state: ChatState, entries: Vec<shared::HistoryEntry>) {
             expanded,
           }
         }
+        // Folded, like a live block once it has finished: history is read for the
+        // answers, and the thinking behind them is one click away.
+        HistoryContentItem::Reasoning { text } => TimelineItem::Reasoning {
+          id,
+          block: ReasoningBlock {
+            text: RwSignal::new(text),
+            live: RwSignal::new(false),
+            expanded: RwSignal::new(false),
+          },
+        },
       };
       state.push(timeline_item);
     }
@@ -1467,8 +1576,9 @@ fn error_status(response: &gloo_net::http::Response, lang: Lang) -> Option<Strin
 /// the entire mechanism behind "a message typed in the terminal shows up here without
 /// this tab sending anything": nothing about this function is specific to messages this
 /// tab itself submitted — it just listens. `connection` is updated from `onopen`/
-/// `onerror` purely for the header's status dot (see [`ConnectionState`]'s docs) — it
-/// does not otherwise affect anything here.
+/// `onerror` for the header's status dot (see [`ConnectionState`]'s docs); a drop also
+/// folds a reasoning block that was still open, since the frame that would have ended it
+/// may never arrive.
 ///
 /// The server tags every frame with the SSE event name `chat` (see `to_sse_event` in
 /// `src/bin/cli/web.rs`), so this listens on `"chat"` specifically —
@@ -1510,6 +1620,11 @@ fn listen_stream(state: ChatState, connection: RwSignal<ConnectionState>) {
   });
   let on_error = Closure::<dyn FnMut(DomEvent)>::new(move |_: DomEvent| {
     connection.set(ConnectionState::Retrying);
+    // The stream is not replayed after a reconnect, so a block still receiving chunks
+    // may never get another one — or the frame that would have ended it. Folding it now
+    // keeps it from sitting on "thinking…" for good, and from swallowing the next
+    // round's reasoning, which opens a block of its own.
+    state.close_reasoning();
   });
 
   let listeners = [
@@ -1529,7 +1644,18 @@ fn listen_stream(state: ChatState, connection: RwSignal<ConnectionState>) {
 }
 
 fn apply_chat_event(event: ChatEvent, state: ChatState) {
+  // Reasoning streams ahead of whatever the same round produces next, so the first frame
+  // that is not reasoning — the answer's first token, a tool call, the turn ending — is
+  // what ends the block.
+  if let ChatEvent::Reasoning { text } = &event {
+    state.append_reasoning(text);
+    return;
+  }
+  state.close_reasoning();
+
   match event {
+    // Handled above, ahead of the block being closed.
+    ChatEvent::Reasoning { .. } => {}
     ChatEvent::UserMessage { text, .. } => {
       // `origin` is ignored here: unlike the terminal's own renderer (which skips
       // re-printing a `Terminal`-origin message because `reedline` already echoed it),

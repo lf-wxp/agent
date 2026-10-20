@@ -15,6 +15,7 @@ use crate::tools::{
   file_write::{self, WriteFileTool},
   grep::{self, GrepTool},
   mcp::{McpConfig, McpConnection},
+  plan::{self, UpdatePlanTool},
   read_image::{self, ReadImageTool},
   shell::{self, RunCommandTool},
   tool::{Tool, execute_with_timeout},
@@ -43,7 +44,8 @@ impl ToolRegistry {
   /// The built-in tools that cannot write an arbitrary file or run a program, and need
   /// no external process to construct.
   ///
-  /// `calculator`, `web_search`, and the filesystem tools that read (`list_files`,
+  /// `calculator`, `web_search`, `update_plan` (the model's own checklist, see
+  /// [`crate::tools::plan`]), and the filesystem tools that read (`list_files`,
   /// `read_file`, `read_image`, `grep`) plus the two that already existed before the
   /// write/execute tools did (`delete_file`, `unzip_file`). This is what a caller gets
   /// when it reaches for "the defaults" without having set up a sandbox and an approval
@@ -84,6 +86,7 @@ impl ToolRegistry {
     registry.add(Arc::new(UnzipFileTool))?;
     registry.add(Arc::new(ReadImageTool::default()))?;
     registry.add(Arc::new(GrepTool))?;
+    registry.add(Arc::new(UpdatePlanTool))?;
     Ok(registry)
   }
 
@@ -125,6 +128,7 @@ impl ToolRegistry {
         file_edit::NAME => Arc::new(EditFileTool),
         grep::NAME => Arc::new(GrepTool),
         shell::NAME => Arc::new(RunCommandTool),
+        plan::NAME => Arc::new(UpdatePlanTool),
         other => anyhow::bail!("unknown tool `{other}`"),
       };
       registry.add(tool)?;
@@ -205,6 +209,11 @@ impl ToolRegistry {
     self.tools.iter().find(|tool| tool.name() == name)
   }
 
+  /// Every registered tool, in registration order.
+  pub fn iter(&self) -> impl Iterator<Item = &Arc<dyn Tool>> {
+    self.tools.iter()
+  }
+
   /// Register one tool.
   ///
   /// Rejects an already-taken name: dispatch resolves by name, so a duplicate would make
@@ -277,7 +286,7 @@ impl std::fmt::Debug for ToolRegistry {
 mod tests {
   use super::*;
   use crate::tools::{
-    calculator, file_delete, file_edit, file_list, file_read, file_upzip, file_write, grep,
+    calculator, file_delete, file_edit, file_list, file_read, file_upzip, file_write, grep, plan,
     read_image, shell, web_search,
   };
 
@@ -301,6 +310,7 @@ mod tests {
       file_upzip::NAME,
       read_image::NAME,
       grep::NAME,
+      plan::NAME,
     ] {
       assert!(registry.contains(name), "missing built-in tool `{name}`");
     }

@@ -10,6 +10,7 @@ pub mod file_write;
 pub mod grep;
 pub(crate) mod macros;
 pub mod mcp;
+pub mod plan;
 pub mod read_image;
 pub mod registry;
 pub mod schedule;

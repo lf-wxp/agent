@@ -613,6 +613,19 @@ impl Agent {
     &self.settings
   }
 
+  /// The tools this agent offers its model.
+  pub fn toolbox(&self) -> &ToolRegistry {
+    &self.toolbox
+  }
+
+  /// Whether any before-tool hook is registered — the place a workspace sandbox
+  /// ([`WorkspaceGuardCallback`](crate::callback::path_guard::WorkspaceGuardCallback)) or
+  /// an approval step ([`DualApprovalCallback`](crate::callback::dual_approval::DualApprovalCallback))
+  /// sits. An agent without one runs every tool call it is asked for.
+  pub fn has_before_tool_callbacks(&self) -> bool {
+    !self.before_tool_callbacks.is_empty()
+  }
+
   /// How long one tool call may run before it is abandoned and reported to the model as
   /// timed out, for tools that do not declare their own limit ([`Tool::timeout`]).
   /// Defaults to [`config::tool_timeout`].

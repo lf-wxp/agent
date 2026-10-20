@@ -7,5 +7,7 @@ pub mod schema;
 pub mod settings;
 pub mod stream;
 pub mod structured;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod tool_calls;
 pub mod tool_loop;

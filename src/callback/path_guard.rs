@@ -270,7 +270,7 @@ mod tests {
 
   use super::*;
   use crate::agent::ToolResultStatus;
-  use crate::tools::{ToolRegistry, calculator, web_search};
+  use crate::tools::{ToolRegistry, calculator, plan, web_search};
 
   /// A freshly created directory under the OS temp dir that no other test can collide
   /// with; not cleaned up afterwards, same tradeoff as `agent::session`'s tests.
@@ -407,7 +407,7 @@ mod tests {
   /// than silently bypassing the sandbox.
   #[test]
   fn every_builtin_tool_is_classified_for_the_guard() {
-    let path_free_tools = [calculator::NAME, web_search::NAME];
+    let path_free_tools = [calculator::NAME, web_search::NAME, plan::NAME];
     let registry = ToolRegistry::builtin_all().unwrap();
     for name in registry.names() {
       let guarded = !WorkspaceGuardCallback::guarded_fields(name).is_empty();

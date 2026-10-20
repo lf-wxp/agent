@@ -661,6 +661,88 @@ button {
   flex-shrink: 0;
 }
 
+/* A model's chain of thought: dimmer than a tool card and than the answer, so it never
+   reads as something the agent said to the user. */
+.reasoning {
+  align-self: stretch;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--text-faint);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  overflow: hidden;
+  animation: fade-in-up 0.25s ease both;
+}
+
+.reasoning.live {
+  border-left-color: var(--amber);
+}
+
+.reasoning-header {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.45rem 0.7rem;
+  background: none;
+  border: none;
+  color: inherit;
+  text-align: left;
+  font-family: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.reasoning-badge {
+  font-size: 0.65rem;
+  letter-spacing: 0.04em;
+  padding: 0.12rem 0.45rem;
+  border-radius: 999px;
+  font-weight: 600;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.reasoning-live {
+  flex: 1;
+  font-size: 0.72rem;
+  color: var(--amber);
+  animation: pulse-text 1.6s ease-in-out infinite;
+}
+
+/* Pushes the toggle to the right edge whether or not the live label is shown. */
+.reasoning-header .tool-toggle {
+  margin-left: auto;
+}
+
+.reasoning-body {
+  margin: 0;
+  padding: 0 0.7rem 0.65rem;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+/* While it is still streaming, let it grow with the page (which follows the newest
+   content) instead of scrolling inside a box whose top is all the reader would see. */
+.reasoning.live .reasoning-body {
+  max-height: none;
+}
+
+@keyframes pulse-text {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
 .tool-body {
   margin: 0;
   padding: 0 0.7rem 0.65rem;

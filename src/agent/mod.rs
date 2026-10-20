@@ -6,6 +6,7 @@ pub mod fingerprint;
 pub mod llm_request;
 pub mod runtime;
 pub mod session;
+pub mod sub_agent;
 
 pub use approval_store::{ApprovalStore, FileApprovalStore, SuspendedRunView};
 pub use callback::{
@@ -22,3 +23,4 @@ pub use runtime::{
   ResumedDecision, RunCheckpoint, StopReason, StructuredAgentResult, SuspendedToolCall,
 };
 pub use session::{FileSessionStore, SessionStore};
+pub use sub_agent::AgentTool;

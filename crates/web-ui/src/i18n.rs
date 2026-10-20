@@ -168,6 +168,8 @@ pub enum Key {
   ApprovalApproved,
   ApprovalDenied,
   ThinkingAria,
+  ReasoningBadge,
+  ReasoningLive,
   CopyLabel,
   CopiedLabel,
   BudgetExhausted,
@@ -291,6 +293,14 @@ pub fn t(lang: Lang, key: Key) -> &'static str {
     (ThinkingAria, Zh) => "agent 正在处理",
     (ThinkingAria, En) => "agent is processing",
     (ThinkingAria, Es) => "agent está procesando",
+
+    (ReasoningBadge, Zh) => "思考过程",
+    (ReasoningBadge, En) => "Reasoning",
+    (ReasoningBadge, Es) => "Razonamiento",
+
+    (ReasoningLive, Zh) => "思考中…",
+    (ReasoningLive, En) => "Thinking…",
+    (ReasoningLive, Es) => "Pensando…",
 
     (CopyLabel, Zh) => "复制",
     (CopyLabel, En) => "Copy",
@@ -470,6 +480,8 @@ mod tests {
       Key::ApprovalApproved,
       Key::ApprovalDenied,
       Key::ThinkingAria,
+      Key::ReasoningBadge,
+      Key::ReasoningLive,
       Key::CopyLabel,
       Key::CopiedLabel,
       Key::BudgetExhausted,

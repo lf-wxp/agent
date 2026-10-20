@@ -1,105 +1,20 @@
-use std::{
-  collections::VecDeque,
-  sync::{Arc, Mutex},
-};
-
 use futures::StreamExt;
 use serde_json::{Value, json};
 
 use super::*;
 use crate::llm::{
-  backend::{ChatBackend, ChatChunkStream, ChatRequest, ChatResponse, parse_chunk, parse_response},
   settings::{ModelSettings, TokenLimitField},
+  testing::{ScriptedBackend, chunk, reply},
 };
-
-/// Answers each request with the next scripted reply, and records every request body.
-#[derive(Default)]
-struct ScriptedBackend {
-  replies: Mutex<VecDeque<Value>>,
-  streams: Mutex<VecDeque<Vec<Value>>>,
-  seen: Mutex<Vec<Value>>,
-}
-
-impl ScriptedBackend {
-  fn replying(replies: Vec<Value>) -> Arc<Self> {
-    Arc::new(Self {
-      replies: Mutex::new(replies.into()),
-      ..Self::default()
-    })
-  }
-
-  fn streaming(streams: Vec<Vec<Value>>) -> Arc<Self> {
-    Arc::new(Self {
-      streams: Mutex::new(streams.into()),
-      ..Self::default()
-    })
-  }
-
-  fn seen(&self) -> Vec<Value> {
-    self.seen.lock().unwrap().clone()
-  }
-
-  /// Records the body exactly as it would go on the wire, replayed reasoning included.
-  fn record(&self, request: &ChatRequest) {
-    self.seen.lock().unwrap().push(request.to_body().unwrap());
-  }
-}
-
-#[async_trait::async_trait]
-impl ChatBackend for ScriptedBackend {
-  async fn create(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-    self.record(&request);
-    let reply = self
-      .replies
-      .lock()
-      .unwrap()
-      .pop_front()
-      .expect("the test scripted a reply for every request");
-    parse_response(reply)
-  }
-
-  async fn create_stream(&self, request: ChatRequest) -> anyhow::Result<ChatChunkStream> {
-    self.record(&request);
-    let chunks = self
-      .streams
-      .lock()
-      .unwrap()
-      .pop_front()
-      .expect("the test scripted a stream for every request");
-    Ok(Box::pin(futures::stream::iter(
-      chunks.into_iter().map(parse_chunk),
-    )))
-  }
-}
 
 fn agent_on(backend: Arc<ScriptedBackend>, toolbox: ToolRegistry) -> Agent {
   Agent::new(
-    Provider::with_backend(backend as Arc<dyn crate::llm::backend::ChatBackend>, 1),
+    backend.provider(),
     "gpt-test",
     Option::<String>::None,
     Arc::new(toolbox),
   )
   .with_model_settings(ModelSettings::default())
-}
-
-fn reply(message: Value) -> Value {
-  json!({
-    "id": "chatcmpl-1",
-    "object": "chat.completion",
-    "created": 0,
-    "model": "gpt-test",
-    "choices": [{ "index": 0, "message": message, "finish_reason": "stop" }],
-  })
-}
-
-fn chunk(delta: Value) -> Value {
-  json!({
-    "id": "chatcmpl-1",
-    "object": "chat.completion.chunk",
-    "created": 0,
-    "model": "gpt-test",
-    "choices": [{ "index": 0, "delta": delta, "finish_reason": null }],
-  })
 }
 
 fn calculator_call(id: &str) -> Value {
@@ -300,10 +215,7 @@ async fn structured_routes_raise_the_cap_but_never_lower_it() {
     // A model name that forces the response-format route, which is the one that applies
     // the structured budget.
     let agent = Agent::new(
-      Provider::with_backend(
-        Arc::clone(&backend) as Arc<dyn crate::llm::backend::ChatBackend>,
-        1,
-      ),
+      backend.provider(),
       "deepseek-test",
       Option::<String>::None,
       Arc::new(ToolRegistry::empty()),

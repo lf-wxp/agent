@@ -26,12 +26,12 @@
 | 🔁 **对话循环** | 纯文本 / 流式 / 结构化输出（JSON Schema 自动推断）三种模式的工具调用循环 |
 | 💬 **交互式 CLI** | `cargo run --bin cli`：多轮聊天 + 永不过期的会话持久化（`--list`/`--rm` 管理）+ 自动接入 `mcp.json` 的 MCP 工具 + `--no-stream` 切换非流式 + `--workspace` 钉定目录并沙箱化内置文件工具（`WorkspaceGuardCallback`）+ 默认 vi 键位的行编辑器（`--no-vi-mode` 切回 Emacs 键位） |
 | ⌨️ **斜杠命令菜单** | 输入 `/` 即弹出可用命令列表供选择（`Tab` 重开、`↑`/`↓` 选择、`Enter` 确认），终端与网页共用同一份命令表（[`shared::commands`](crates/shared/src/commands.rs)），无需记忆命令名 |
-| 🌐 **本地 Web UI** | `--mode web`/`--mode both`：在同一进程里额外起一个绑定 `127.0.0.1` 的 Web 前端（[Leptos](crates/web-ui)），与终端共享同一份 `Agent`/会话状态，SSE 实时展示 token 流 + 工具调用过程时间线 + 高危操作审批弹窗，详见下方「Web UI」小节 |
+| 🌐 **本地 Web UI** | `--mode web`/`--mode both`：在同一进程里额外起一个绑定 `127.0.0.1` 的 Web 前端（[Leptos](crates/web-ui)），与终端共享同一份 `Agent`/会话状态，SSE 实时展示 token 流 + 推理过程（可折叠）+ 工具调用过程时间线 + 高危操作审批弹窗，详见下方「Web UI」小节 |
 | 🙋 **高危操作审批** | `delete_file` 等默认需人工确认。审批属于**会话**而非发起端：终端与所有浏览器标签页同时看到同一条待审，任一处应答即生效（[`DualApprovalCallback`](src/callback/dual_approval.rs)）。支持按参数动态判定是否需审批、"本会话总是允许/拒绝"的记忆、附带拒绝理由；**无人应答时该轮会挂起并落盘**，进程重启后仍可 `/resume` 继续 |
 | 🔍 **搜索结果压缩** | `web_search` 结果自动分块 + 向量检索压缩后再写入历史（[`SearchCompressorCallback`](src/callback/search_compressor.rs)），避免长文本占满上下文 |
 | 🧠 **`Agent` 运行时** | 完整事件记录（`ExecutionContext`）+ 无状态多轮续接（`run_continuing`）+ 流式输出（`run_stream`，含工具调用过程事件），每轮请求副本按 token 预算自动裁剪（`context.events` 保持完整） |
 | 💾 **会话持久化** | 落盘的 `FileSessionStore`（按 `(scope, sessionId)` 存 JSON 文件），CLI 与 Web UI 共用，`SessionStore` trait 可替换为其他后端 |
-| 🧰 **工具生态** | 内置 `calculator`、`web_search`（Tavily）、文件工具（`read_file` / `list_files` / `write_file` / `edit_file` / `delete_file` / `unzip_file` / `read_image`）、`grep` 代码搜索与 `run_command` shell 执行（超时 + 进程组清理），并通过 `mcp.json` 接入任意 MCP Server（stdio / Streamable HTTP 两种传输） |
+| 🧰 **工具生态** | 内置 `calculator`、`web_search`（Tavily）、文件工具（`read_file` / `list_files` / `write_file` / `edit_file` / `delete_file` / `unzip_file` / `read_image`）、`grep` 代码搜索、`run_command` shell 执行（超时 + 进程组清理）和 `update_plan`（模型给多步任务列的计划清单）；任何 `Agent` 都能包装成另一个 agent 的工具（`AgentTool`，即子 agent）；并通过 `mcp.json` 接入任意 MCP Server（stdio / Streamable HTTP 两种传输） |
 | 🏢 **多租户（库内）** | `Provider` 封装每租户凭据 + 并发限流，互不干扰（见 [`examples/multi_tenant.rs`](examples/multi_tenant.rs)） |
 | 📚 **向量检索** | 文本分块 / embedding / 余弦相似度检索，适配 RAG 场景 |
 | 📊 **基准评测** | 内置 GAIA 数据集评测，量化模型 + 工具组合效果 |
@@ -241,7 +241,7 @@ cargo make web            # 产物输出到 crates/web-ui/dist
 > will 404 — run `trunk build --release` in `crates/web-ui` ...
 > ```
 >
-> **修改 `crates/shared` 或 `crates/web-ui` 后必须重新构建**，否则浏览器加载的是旧 wasm：前后端共用的 `ChatEvent` 一旦新增变体，旧产物会在反序列化时静默丢弃该事件（表现为「某个功能没反应，控制台却很干净」）。现在这种情况会在浏览器控制台打出一条明确的错误，提示页面比服务端旧。`cargo test` 不覆盖 wasm，发现不了这类问题。
+> **修改 `crates/shared` 或 `crates/web-ui` 后必须重新构建**，否则浏览器加载的是旧 wasm：前后端共用的 `ChatEvent` 一旦新增变体，旧产物会在反序列化时静默丢弃该事件（表现为「某个功能没反应，控制台却很干净」）。现在这种情况会在浏览器控制台打出一条明确的错误，提示页面比服务端旧。`cargo test` 不覆盖 wasm，发现不了这类问题。历史记录里的新变体后果更重：开启 `LLM_REPLAY_REASONING` 后，`GET /api/history` 会带上 `reasoning` 项，旧产物解析不了，整段历史都加载失败，而不只是丢掉这一项——升级到加入推理显示的版本后务必重新构建。
 
 `cli` 的 Web 服务器会把这个 `dist/` 目录当静态资源伺服（`AGENT_CLI_WEB_DIST_DIR` 可覆盖路径）；开发前端时也可以单独 `trunk serve` 起热重载的开发服务器，接口请求转发到 `cli` 的 `/api/*` 路由。页面加载后会依次拉取 `GET /api/history` 展示已有会话、`GET /api/approvals` 补上此刻仍在等待的审批、`GET /api/suspended` 补上被挂起还没处理的那一轮，随后打开一条持久的 `GET /api/stream` 长连接（浏览器原生 `EventSource`），终端和浏览器发起的每一轮对话都会广播到这条连接上——因此终端里打的字也会实时出现在网页里，反过来也一样；`POST /api/chat` 只负责提交这一轮的输入本身。展示内容包括 token 流、工具调用/结果时间线，遇到高危操作会弹出确认卡片，点击后调用 `POST /api/approve/{id}` 提交决策，决策结果也会广播给所有打开的标签页。
 
@@ -315,6 +315,18 @@ let result = agent.run_continuing(history, "我刚才让你记的是什么时间
 
 **流式输出**：用 `agent.run_stream(input)` 替代 `run`，得到 `impl Stream<Item = AgentStreamEvent>`，逐 token 转发，见 [`examples/agent_stream.rs`](examples/agent_stream.rs)。
 
+**子 agent 与计划**：
+- `AgentTool::new(名称, 描述, agent)` 把一个 `Agent` 包装成另一个 agent 的工具。
+  - 父 agent 的模型传入一个自成一体的 `task`；子 agent 用自己的模型、提示词、工具和钩子跑完整个循环，只把最终回答交回去。它中间读的文件、做的搜索都不进入父 agent 的上下文。
+  - 每次调用都是全新的一次运行，看不到父 agent 的对话。
+  - 只有子 agent 的工具全部可以并发时，这个工具才会和同一轮的其他调用并发执行。
+  - 耗时长的任务可以用 `.with_timeout(..)` 放宽时间上限。
+  - 子 agent 消耗的 token 记在 `AgentTool::usage()` 里，不计入父 agent 的 `usage`。
+- `update_plan`（已加入 `ToolRegistry::builtin`）让模型给多步任务维护一份计划清单。
+  - 每次调用都带上完整计划并替换上一份，所以计划就保存在对话记录里，落盘、挂起恢复都不需要额外状态。
+  - 终端里显示为 `[plan]` 清单。
+- 示例见 `examples/sub_agent.rs`。
+
 **取消与超时**：通过 `Conversation::with_cancellation(token)` 传入一个 `tokio_util::sync::CancellationToken`。取消后：
 - 正在进行的模型请求立即放弃；
 - 仍在执行的工具被中断，并记录为"已取消"；
@@ -344,6 +356,7 @@ if let Err(err) = &result
   - 流式：以 `AgentStreamEvent::Reasoning` 事件在回答之前推送。
   - 推理内容默认**不写入对话记录**，也不会在后续请求里发回给模型。
   - 有的提供商要求回传：DeepSeek 思考模式在请求带 `tools` 时，如果历史 assistant 消息没有带回 `reasoning_content`，会返回 400。此时设置 `LLM_REPLAY_REASONING=true`（或 `ModelSettings { replay_reasoning: true, .. }`）：对话记录会保存推理内容（`ContentItem::Reasoning`），每次请求把它连同所属的 assistant 消息一起发回去，同一次运行内、跨轮次、以及无状态的 `llm::*` 辅助函数都一样。对不接受该字段的提供商请保持关闭。
+  - CLI 会显示推理过程：终端里以 `[thinking]` 开头、暗色显示（设置 `NO_COLOR` 可关闭颜色）；Web UI 里显示为可折叠的「思考过程」卡片，思考时展开，结束后自动折叠。默认推理内容不写入对话记录，所以刷新页面后看不到之前轮次的推理；开启 `LLM_REPLAY_REASONING` 后会随历史一起加载。
 - 对接非 OpenAI 兼容的后端时，实现 `llm::backend::ChatBackend`，再用 `Provider::with_backend(backend, 并发上限)` 包装；`Agent` 和其余代码无需改动。
 
 **结构化输出**（反序列化为 Rust 类型）：
