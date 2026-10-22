@@ -59,7 +59,7 @@
 //!
 //! `--mode` picks which front-end(s) this invocation drives, all sharing the exact same
 //! `Agent`/session state — the browser is not a separate deployment, it is another way
-//! to interact with *this* process (see `docs/web-ui-plan.md`):
+//! to interact with *this* process (see `docs/web-ui.md`):
 //!
 //! - `cli` (default): terminal only, unchanged from before this flag existed.
 //! - `web`: no terminal REPL; only the local web server (see [`mod@web`]) runs, until it
@@ -86,6 +86,8 @@
 //! cargo run --bin cli -- --no-search-compression   # keep web_search results uncompressed
 //! cargo run --bin cli -- --no-sandbox               # let filesystem tools roam anywhere
 //! cargo run --bin cli -- --no-vi-mode               # use Emacs keybindings instead
+//! cargo run --bin cli -- --memory                   # remember facts across sessions
+//! cargo run --bin cli -- --memory --reindex-memory  # ...and re-embed facts after changing EMBED_MODEL
 //! cargo run --bin cli -- --mode both                # terminal + browser at once
 //! cargo run --bin cli -- --mode web --web-port 4000 # browser only, custom port
 //! ```
@@ -117,6 +119,18 @@
 //! its result and exits immediately, without starting a chat or touching the configured
 //! LLM provider (see [`list_sessions`], [`remove_session_command`]).
 //!
+//! `--memory` turns on long-term memory (see [`agent::memory`]): the model gets
+//! `remember` / `forget` / `recall`, and the facts relevant to each message are put in
+//! front of it automatically. One store per workspace
+//! ([`agent::config::cli_memory_path`], `AGENT_CLI_MEMORY_PATH` — an absolute path shares
+//! one store across workspaces), shared by every `--session` there and untouched by
+//! `/reset`; `/memory` lists it. `forget` is put to a human like the other destructive
+//! tools, and takes the memory's text along with its number so the prompt shows what will
+//! be deleted; `remember` is declined in a turn that read something a third party could
+//! have written (see [`agent::memory::tools::RememberGuard`]). Needs `EMBED_MODEL`; after changing it, start once with `--reindex-memory` to
+//! re-embed what was saved under the old one (never done silently — it overwrites the old
+//! vectors).
+//!
 //! There is no multi-tenant/multi-user concept here: every session on this machine lives
 //! under one constant scope ([`LOCAL_SCOPE`]) and is distinguished purely by `--session`.
 //! Session files live under [`agent::config::cli_session_dir`] (`AGENT_CLI_SESSION_DIR`)
@@ -124,7 +138,7 @@
 //! ago can be resumed; only `--fresh` / `/reset` clears one. The web server (`--mode
 //! web`/`both`) binds `127.0.0.1` only and has no authentication of its own for the same
 //! reason: there is no second user to keep out on this machine (see
-//! `docs/web-ui-plan.md`'s "非目标" section).
+//! `docs/web-ui.md`'s "非目标" section).
 
 mod commands;
 mod completer;
@@ -145,14 +159,19 @@ use agent::{
   callback::{
     dual_approval::{
       ApprovalChannel, ApprovalMeta, ApprovalOutcome, ApprovalRegistry, DualApprovalCallback,
-      PendingApproval, parse_approval_answer, with_approval_channel,
+      PendingApproval, approval_choices, parse_approval_answer, with_approval_channel,
     },
     mcp_guard::McpGuardCallback,
     path_guard::WorkspaceGuardCallback,
     search_compressor::SearchCompressorCallback,
   },
   config,
+  knowledge_base::embed::OpenAiEmbedder,
   llm::provider::Provider,
+  memory::{
+    MemoryStore, RecallCallback,
+    tools::{GATED as MEMORY_GATED_TOOLS, RememberGuard, memory_tools},
+  },
   session::{FileSessionStore, SessionStore},
   telemetry,
   tools::{ToolRegistry, file_delete, file_edit, file_write, plan, shell},
@@ -225,6 +244,12 @@ impl Prompt for ChatPrompt {
 const LOCAL_SCOPE: &str = "local";
 
 const DEFAULT_SESSION_ID: &str = "default";
+
+/// How long `--reindex-memory` may spend re-embedding before it gives up. The rewrite is
+/// one transaction at the very end, so abandoning it earlier leaves the store untouched;
+/// what this bounds is a hung embedding endpoint holding up startup, which the retry
+/// policy alone would let run for much longer.
+const MEMORY_REINDEX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -308,7 +333,7 @@ async fn main() -> anyhow::Result<()> {
   // `--tools` opts out of MCP entirely (see the module docs): it names an explicit
   // built-in subset, and MCP tools have no fixed names to list before they are
   // discovered from the server, so the two are mutually exclusive by construction.
-  let (registry, mcp_connections) = match args.get("tools").filter(|value| !value.is_empty()) {
+  let (mut registry, mcp_connections) = match args.get("tools").filter(|value| !value.is_empty()) {
     Some(names) => (
       ToolRegistry::select(&names.split(',').map(str::to_owned).collect::<Vec<_>>())?,
       Vec::new(),
@@ -321,18 +346,94 @@ async fn main() -> anyhow::Result<()> {
     }
   };
 
+  // `--memory`: off unless asked for, since it keeps what the model learns about the user
+  // on disk across sessions (see `agent::memory`). One store per workspace — `.agent/`
+  // under `--workspace`, alongside the sessions — shared by every `--session`, so facts
+  // carry from one conversation to the next. `AGENT_CLI_MEMORY_PATH` pointing somewhere
+  // outside the workspace is how one store is shared across workspaces. Its tools are
+  // added on top of whatever `--tools` picked, since asking for memory is asking for them.
+  anyhow::ensure!(
+    args.contains_key("memory") || !args.contains_key("reindex-memory"),
+    "--reindex-memory only makes sense together with --memory"
+  );
+  let memory = if args.contains_key("memory") {
+    let embedder = OpenAiEmbedder::from_config()
+      .context("--memory needs an embedding model: set EMBED_MODEL")?;
+    let path = config::cli_memory_path();
+    let memory = MemoryStore::open(&path, Arc::new(embedder), LOCAL_SCOPE)
+      .with_context(|| format!("failed to open long-term memory at `{}`", path.display()))?;
+    // Facts saved before `EMBED_MODEL` changed are still listed by `/memory` but invisible
+    // to recall. Fixing that means overwriting their vectors with the new model's — which
+    // costs an API call per fact and cannot be undone (going back to the old model would
+    // mean doing it again) — so it is something the user asks for with
+    // `--reindex-memory`, not something a changed environment variable (or a typo in one)
+    // triggers on its own. Their numbers are kept either way. A failure is reported and
+    // then ignored: the memories that are readable still are, and refusing to start would
+    // be worse than a feature that is partially unavailable.
+    match memory.stale_count().await {
+      Ok(0) => {}
+      Ok(stale) if args.contains_key("reindex-memory") => {
+        println!("Long-term memory: re-embedding {stale} facts saved with another model...");
+        match commands::reindex_memory(&memory, MEMORY_REINDEX_TIMEOUT).await {
+          commands::Reindexed::Done(reindexed) => {
+            println!("Long-term memory: re-embedded {reindexed} facts.\n");
+          }
+          commands::Reindexed::Failed(err) => {
+            eprintln!("warning: could not re-embed older memories: {err:#}");
+          }
+          // The rewrite is a single transaction, so the answer is all or nothing — and
+          // the store is asked which, rather than the message guessing.
+          commands::Reindexed::TimedOut { remaining: Some(0) } => println!(
+            "Long-term memory: re-embedding finished just as the {}s limit ran out; \
+             nothing is left to do.\n",
+            MEMORY_REINDEX_TIMEOUT.as_secs()
+          ),
+          commands::Reindexed::TimedOut { remaining } => eprintln!(
+            "warning: re-embedding older memories took longer than {}s and was abandoned; \
+             {} still need it. Try again, or check the embedding endpoint.",
+            MEMORY_REINDEX_TIMEOUT.as_secs(),
+            remaining.map_or_else(|| "they".to_owned(), |count| format!("{count} of them"))
+          ),
+        }
+      }
+      Ok(stale) => eprintln!(
+        "warning: {stale} remembered facts were saved with a different embedding model and \
+         cannot be recalled. Start once with --reindex-memory to re-embed them (their old \
+         vectors are overwritten, so going back to the old model means re-embedding again), \
+         or set EMBED_MODEL back.\n"
+      ),
+      Err(err) => eprintln!("warning: could not check long-term memory: {err:#}"),
+    }
+    for tool in memory_tools(&memory) {
+      registry.add(tool).context(
+        "--memory adds `remember` / `forget` / `recall`, but a tool already has that name",
+      )?;
+    }
+    Some(memory)
+  } else {
+    None
+  };
+
   // By default every built-in tool that changes something outside this process:
   // `delete_file`, `write_file`, `edit_file` and `run_command` (the last one especially —
   // the workspace guard can only check its `workdir`, never the command itself).
   // `--dangerous-tools` overrides the list (comma-separated; an empty value
   // disables prompting for everything), and `--no-approval` is shorthand for the same
   // regardless of what `--dangerous-tools` would otherwise pick.
-  let default_dangerous_tools = [
+  //
+  // `forget` joins them only when memory is on: it deletes what the user asked the agent
+  // to keep, and one injected instruction could otherwise empty the store. `remember`
+  // stays ungated — it is frequent and reversible, and `/memory` shows exactly what it
+  // saved.
+  let mut default_dangerous_tools = vec![
     file_delete::NAME,
     file_write::NAME,
     file_edit::NAME,
     shell::NAME,
   ];
+  if memory.is_some() {
+    default_dangerous_tools.extend_from_slice(MEMORY_GATED_TOOLS);
+  }
   let dangerous_tools: Vec<String> = if args.contains_key("no-approval") {
     Vec::new()
   } else {
@@ -343,7 +444,10 @@ async fn main() -> anyhow::Result<()> {
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
         .collect(),
-      None => default_dangerous_tools.map(str::to_owned).to_vec(),
+      None => default_dangerous_tools
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect(),
     }
   };
 
@@ -353,7 +457,8 @@ async fn main() -> anyhow::Result<()> {
   // narrowed is worse than one that was never there, because it is still being trusted.
   if args.contains_key("dangerous-tools") && !args.contains_key("no-approval") {
     let ungated: Vec<&str> = default_dangerous_tools
-      .into_iter()
+      .iter()
+      .copied()
       .filter(|name| registry.contains(name) && !dangerous_tools.iter().any(|gated| gated == name))
       .collect();
     if !ungated.is_empty() {
@@ -386,6 +491,16 @@ async fn main() -> anyhow::Result<()> {
     let agent = agent.with_before_tool_callback(Arc::new(WorkspaceGuardCallback::new(&workspace)?));
     agent.with_before_tool_callback(Arc::new(McpGuardCallback::new()))
   };
+  // `remember` is declined for the rest of a turn that has read something a third party
+  // could have written (a page, a file, an MCP reply): a memory outlives the conversation,
+  // and this is what keeps a planted "remember that …" from becoming a standing instruction.
+  // Before the approval callback for the same reason as the sandbox above — a refusal needs
+  // no human in the loop.
+  let agent = if memory.is_some() {
+    agent.with_before_tool_callback(Arc::new(RememberGuard::new()))
+  } else {
+    agent
+  };
   // Held onto rather than handed straight to the agent: the callback owns the "always
   // allow/deny this tool" answers a human gave (see `DualApprovalCallback`'s `sticky`
   // field), and `/reset`/`--fresh` have to be able to clear them. `Arc<DualApproval-
@@ -397,9 +512,14 @@ async fn main() -> anyhow::Result<()> {
   //
   // `run_command` never gets a standing "always allow": one yes to a shell is a yes to
   // every command that follows, including whatever a later prompt injection asks for.
-  // The other gated tools keep it.
+  // `forget` is the same shape of risk at a smaller scale — one yes should not license
+  // emptying the store — so it is once-only too. The other gated tools keep it.
   let approval_callback = (!dangerous_tools.is_empty()).then(|| {
-    Arc::new(DualApprovalCallback::new(dangerous_tools).without_standing_approval(shell::NAME))
+    let callback = MEMORY_GATED_TOOLS.iter().fold(
+      DualApprovalCallback::new(dangerous_tools).without_standing_approval(shell::NAME),
+      |callback, name| callback.without_standing_approval(*name),
+    );
+    Arc::new(callback)
   });
   let agent = match &approval_callback {
     // The explicit coercion is the point of holding an `Arc<DualApprovalCallback>`: the
@@ -420,6 +540,14 @@ async fn main() -> anyhow::Result<()> {
     agent
   } else {
     agent.with_after_tool_callback(Arc::new(SearchCompressorCallback))
+  };
+
+  // After the default context optimizer (hooks run in registration order): recalled
+  // memories are added to a request already trimmed to fit, so they are not what gets
+  // trimmed away.
+  let agent = match &memory {
+    Some(memory) => agent.with_before_llm_callback(Arc::new(RecallCallback::new(memory.clone()))),
+    None => agent,
   };
 
   // Write-ahead, so a turn survives the process being killed rather than only being
@@ -502,6 +630,7 @@ async fn main() -> anyhow::Result<()> {
       Arc::clone(&approvals),
       approval_callback.clone(),
       Arc::clone(&approvals_store),
+      memory.clone(),
       web_events_tx.clone(),
     ));
     let dist_dir = config::cli_web_dist_dir();
@@ -597,6 +726,23 @@ async fn main() -> anyhow::Result<()> {
     },
     command_set::hint()
   );
+  if let Some(memory) = &memory {
+    // The path is printed, not assumed: it is relative to `--workspace` by default, so
+    // which store this actually is depends on where the process was started.
+    let stored = match memory.count().await {
+      Ok(count) => count.to_string(),
+      // Not "0": a store that cannot be read is a different situation from an empty one,
+      // and saying "0 facts" would hide it until something else failed.
+      Err(err) => format!("unreadable ({err:#})"),
+    };
+    println!(
+      "Long-term memory: on — {stored} facts in `{}`. /memory lists them.\n\
+       Each fact is sent to the embedding endpoint ({}) when saved, and the start of every \
+       message when recalling.\n",
+      memory.vector_store().location(),
+      config::embed_endpoint_label()
+    );
+  }
 
   // A suspended run is invisible otherwise: it produced no answer and, deliberately,
   // left nothing in the session history. Announcing it here is what makes "come back
@@ -685,12 +831,15 @@ async fn main() -> anyhow::Result<()> {
         commands::execute(
           command,
           input,
-          MessageOrigin::Terminal,
-          &store,
-          approval_callback.as_deref(),
-          &approvals_store,
-          &session_id,
-          &web_events_tx,
+          commands::CommandContext {
+            origin: MessageOrigin::Terminal,
+            store: &store,
+            approvals: approval_callback.as_deref(),
+            approvals_store: &approvals_store,
+            memory: memory.as_ref(),
+            session_id: &session_id,
+            events: &web_events_tx,
+          },
         )
         .await;
         continue;
@@ -1063,6 +1212,7 @@ async fn drive_terminal_turn(
           id: meta.id.clone(),
           tool: meta.tool.clone(),
           arguments: meta.raw_arguments.clone(),
+          once_only: meta.once_only,
         };
         // Registered before the announcement goes out, matching the other two drivers:
         // registration is what makes the prompt answerable from any view and visible to
@@ -1194,6 +1344,7 @@ async fn publish_approvals(
       id: meta.id.clone(),
       tool: meta.tool.clone(),
       arguments: meta.raw_arguments.clone(),
+      once_only: meta.once_only,
     };
     // Registered before the announcement goes out, so a view that reacts to it by
     // immediately asking `GET /api/approvals` cannot see an empty list.
@@ -1225,10 +1376,15 @@ fn resolve_pending_approval(
   };
 
   let Some(outcome) = parse_approval_answer(line) else {
-    term_write(
-      "\n[approval] 有待处理的审批，请输入 y（本次允许）/ n（本次拒绝）/ \
-       a（本会话总是允许）/ d（本会话总是拒绝），可加「: 理由」\n",
-    );
+    let once_only = approvals
+      .pending_snapshot()
+      .iter()
+      .find(|meta| meta.id == id)
+      .is_some_and(|meta| meta.once_only);
+    term_write(&format!(
+      "\n[approval] 有待处理的审批，请输入 {}，可加「: 理由」\n",
+      approval_choices(once_only)
+    ));
     return true;
   };
 
@@ -1250,10 +1406,13 @@ fn resolve_pending_approval(
 ///
 /// Raw arguments rather than parsed ones: a payload that failed to parse would render as
 /// `null`, and approving a call you cannot see is worse than not being asked.
-fn approval_prompt(tool: &str, raw_arguments: &str) -> String {
+///
+/// `once_only` leaves "always allow" out of the options for a tool the callback will not
+/// remember it for (see [`agent::callback::dual_approval::approval_choices`]).
+fn approval_prompt(tool: &str, raw_arguments: &str, once_only: bool) -> String {
   format!(
-    "\n⚠️  即将执行高危操作\n工具: {tool}\n参数: {raw_arguments}\n\
-     是否执行？(y=本次允许 / n=本次拒绝 / a=本会话总是允许 / d=本会话总是拒绝): "
+    "\n⚠️  即将执行高危操作\n工具: {tool}\n参数: {raw_arguments}\n是否执行？({}): ",
+    approval_choices(once_only)
   )
 }
 
@@ -1424,8 +1583,11 @@ fn render_chat_event(event: ChatEvent) -> String {
     // raised it — see `approval_prompt`. The turn driver does not print one of its own;
     // it only broadcasts, and this arm (a subscriber like any other) draws it.
     ChatEvent::ApprovalRequired {
-      tool, arguments, ..
-    } => approval_prompt(&tool, &arguments),
+      tool,
+      arguments,
+      once_only,
+      ..
+    } => approval_prompt(&tool, &arguments, once_only),
     ChatEvent::ApprovalResolved { approved, .. } => format!(
       "\n[approval] {}\n",
       if approved {
@@ -1705,6 +1867,7 @@ fn pending_views(state: &AgentRunState) -> Vec<PendingApprovalView> {
       tool: call.name.clone(),
       arguments: call.raw_arguments.clone(),
       requested_at,
+      once_only: false,
     })
     .collect()
 }
@@ -2107,7 +2270,7 @@ mod tests {
   /// the arguments to judge it by, and how to answer.
   #[test]
   fn the_approval_prompt_shows_the_tool_arguments_and_options() {
-    let prompt = approval_prompt("delete_file", r#"{"path":"notes.txt"}"#);
+    let prompt = approval_prompt("delete_file", r#"{"path":"notes.txt"}"#, false);
 
     assert!(prompt.contains("delete_file"));
     assert!(
@@ -2124,6 +2287,21 @@ mod tests {
     }
   }
 
+  /// A tool that will not remember "always allow" must not offer it: the answer would
+  /// approve the call and the next one would ask again, which looks like the choice being
+  /// ignored. "Always deny" is remembered for every tool, so it stays.
+  #[test]
+  fn a_once_only_tool_does_not_offer_always_allow() {
+    let prompt = approval_prompt("forget", r#"{"id":7,"text":"x"}"#, true);
+
+    assert!(!prompt.contains("a="), "got: {prompt}");
+    assert!(prompt.contains("d="), "always deny is remembered: {prompt}");
+    for key in ["y", "n"] {
+      assert!(prompt.contains(&format!("{key}=")), "got: {prompt}");
+    }
+    assert!(prompt.contains("每次都会询问"), "says why: {prompt}");
+  }
+
   fn registry_with_one_pending() -> (
     ApprovalRegistry,
     tokio::sync::oneshot::Receiver<ApprovalOutcome>,
@@ -2136,6 +2314,7 @@ mod tests {
         tool: "delete_file".to_owned(),
         raw_arguments: r#"{"path":"notes.txt"}"#.to_owned(),
         requested_at: 0,
+        once_only: false,
       },
       tx,
     );

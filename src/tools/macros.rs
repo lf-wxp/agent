@@ -110,8 +110,7 @@ macro_rules! impl_simple_tool {
       }
 
       fn parameters(&self) -> serde_json::Value {
-        serde_json::to_value(schemars::schema_for!($args))
-          .expect("schema is always serializable")
+        $crate::tools::schema_of::<$args>()
       }
 
       $(

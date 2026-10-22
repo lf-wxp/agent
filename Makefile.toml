@@ -71,7 +71,7 @@ args = ["fmt", "--all", "--", "--check"]
 description = "Type-check the native package including examples, tests and benches"
 category = "Development"
 command = "cargo"
-# `--all-targets` matters more than usual here: the 19 files under `examples/` are part
+# `--all-targets` matters more than usual here: the files under `examples/` are part
 # of the documented API surface (the README points at them), so they have to keep
 # compiling, and they are not built by a plain `cargo check`.
 #

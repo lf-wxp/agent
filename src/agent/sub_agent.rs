@@ -230,8 +230,7 @@ impl Tool for AgentTool {
   }
 
   fn parameters(&self) -> Value {
-    serde_json::to_value(schemars::schema_for!(AgentToolArgs))
-      .expect("schema is always serializable")
+    crate::tools::schema_of::<AgentToolArgs>()
   }
 
   async fn execute(&self, args_json: &str) -> anyhow::Result<String> {

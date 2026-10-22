@@ -49,6 +49,13 @@ rmcp = { version = "3.5.1", features = [
   "transport-streamable-http-server",
 ] }
 schemars = "1.2.3"
+# The persistent vector store (`knowledge_base::store`) and long-term memory (`memory`),
+# behind the `sqlite` feature (on by default). `bundled` compiles SQLite from source, so
+# nothing has to be installed on the machine and every build gets the same SQLite version
+# — at the cost of a C compiler and a slower first build. A library consumer that only
+# wants the agent loop can turn it off with `default-features = false` and skip the whole
+# tree.
+rusqlite = { version = "0.40.2", features = ["bundled"], optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 shared = { path = "crates/shared" }
@@ -93,7 +100,12 @@ zip = "9.0"
 libc = "0.2.191"
 
 [features]
-default = []
+default = ["sqlite"]
+# The persistent vector store and long-term memory (`knowledge_base::store`, `memory`,
+# `tools::retrieve`). On by default because the `cli` binary and the `rag` example build
+# on it; off means the crate has no SQLite dependency at all, and those two targets are
+# not built.
+sqlite = ["dep:rusqlite"]
 # Export spans over OTLP/HTTP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set; see
 # `telemetry`'s module docs.
 otel = [
@@ -102,6 +114,18 @@ otel = [
   "dep:opentelemetry-otlp",
   "dep:tracing-opentelemetry",
 ]
+
+# The `cli` binary needs the vector store; so does the `rag` example. Cargo's
+# `required-features` is what keeps `--no-default-features` a working build rather than a
+# pile of unresolved imports.
+[[bin]]
+name = "cli"
+path = "src/bin/cli/main.rs"
+required-features = ["sqlite"]
+
+[[example]]
+name = "rag"
+required-features = ["sqlite"]
 
 [profile.release]
 codegen-units = 1

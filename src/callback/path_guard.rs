@@ -146,8 +146,8 @@ impl WorkspaceGuardCallback {
 /// - `.env*` — credentials. Refused for reading as well as writing, since reading one
 ///   puts the secrets straight into the model's context (and the provider's logs).
 /// - `.git/` — hooks run as the user the next time git does anything.
-/// - `.agent/` — the session and approval stores; rewriting them forges history and
-///   pending approvals.
+/// - `.agent/` — the session, approval and memory stores; rewriting them forges history,
+///   pending approvals, or what the agent "remembers" about the user.
 /// - `mcp.json` — each enabled entry is a command launched at startup, so writing it is
 ///   code execution on the next run, with no approval prompt in the way.
 ///
@@ -170,7 +170,9 @@ fn protected(relative: &Path, write: bool) -> Option<&'static str> {
     match name.as_str() {
       ".git" => return Some("inside `.git`, which these tools may not modify"),
       ".agent" => {
-        return Some("inside `.agent` (sessions and approvals), which these tools may not modify");
+        return Some(
+          "inside `.agent` (sessions, approvals and memory), which these tools may not modify",
+        );
       }
       _ => {}
     }

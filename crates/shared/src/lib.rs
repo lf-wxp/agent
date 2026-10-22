@@ -76,6 +76,9 @@ pub struct PendingApprovalView {
   /// turn (see [`ChatEvent::TurnSuspended`]), so a prompt left alone does not stay live
   /// indefinitely.
   pub requested_at: i64,
+  /// See [`ChatEvent::ApprovalRequired::once_only`].
+  #[serde(default)]
+  pub once_only: bool,
 }
 
 /// What `GET /api/suspended` returns when a turn is waiting to be resumed; `null` when
@@ -189,6 +192,15 @@ pub enum ChatEvent {
     /// parsed here: showing a human what they are approving should never fail just
     /// because the model produced a malformed payload.
     arguments: String,
+    /// "Always allow" is not remembered for this tool: approving applies to this call
+    /// only, and the next call asks again. A client should not offer the option — a button
+    /// that approves and then quietly asks again reads as the setting not having taken.
+    /// "Always deny" is remembered as usual.
+    ///
+    /// `#[serde(default)]`, so a frame from a server that predates the field reads as
+    /// `false`, the old behaviour: the option is offered, as it always was.
+    #[serde(default)]
+    once_only: bool,
   },
   /// `id` was just resolved (by a `POST /api/approve/{id}` call, from this browser tab
   /// or another one) with `approved`. Sent so every tab watching this turn can update
@@ -435,13 +447,45 @@ mod tests {
       id: "call-1".to_owned(),
       tool: "delete_file".to_owned(),
       arguments: "{\"path\":\"notes.txt\"}".to_owned(),
+      once_only: true,
     };
     let json = serde_json::to_value(&event).unwrap();
     assert_eq!(json["type"], "approval_required");
     assert_eq!(json["tool"], "delete_file");
+    assert_eq!(json["once_only"], true);
 
     let back: ChatEvent = serde_json::from_value(json).unwrap();
-    assert!(matches!(back, ChatEvent::ApprovalRequired { id, .. } if id == "call-1"));
+    assert!(
+      matches!(back, ChatEvent::ApprovalRequired { id, once_only: true, .. } if id == "call-1")
+    );
+  }
+
+  /// A frame from a server that predates `once_only` still reads, as the old behaviour.
+  #[test]
+  fn an_approval_frame_without_once_only_offers_always_allow_as_before() {
+    let frame = serde_json::json!({
+      "type": "approval_required",
+      "id": "call-1",
+      "tool": "delete_file",
+      "arguments": "{}",
+    });
+    let event: ChatEvent = serde_json::from_value(frame).unwrap();
+    assert!(matches!(
+      event,
+      ChatEvent::ApprovalRequired {
+        once_only: false,
+        ..
+      }
+    ));
+
+    let view: PendingApprovalView = serde_json::from_value(serde_json::json!({
+      "id": "call-1",
+      "tool": "delete_file",
+      "arguments": "{}",
+      "requested_at": 1,
+    }))
+    .unwrap();
+    assert!(!view.once_only);
   }
 
   #[test]
@@ -464,6 +508,7 @@ mod tests {
       tool: "delete_file".to_owned(),
       arguments: "{\"path\":\"notes.txt\"}".to_owned(),
       requested_at: 1_700_000_000,
+      once_only: false,
     };
     let json = serde_json::to_string(&view).unwrap();
     let back: PendingApprovalView = serde_json::from_str(&json).unwrap();

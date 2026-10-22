@@ -40,6 +40,8 @@ pub enum Command {
   /// Give up on a turn that stopped waiting for an approval, committing what it had
   /// already done so the conversation can carry on. Also front-end dispatched.
   Discard,
+  /// List everything in long-term memory, when the process was started with it.
+  Memory,
   /// Leave the chat. Terminal-only in effect — a browser tab has no process to end, so
   /// the web front-end reports it as unsupported rather than pretending.
   Exit,
@@ -79,6 +81,12 @@ pub const COMMANDS: &[CommandSpec] = &[
     aliases: &["/discard"],
     summary: "放弃被暂停的一轮，保留已完成的部分",
     command: Command::Discard,
+    available_on_web: true,
+  },
+  CommandSpec {
+    aliases: &["/memory", "/memories"],
+    summary: "列出长期记忆（需以 --memory 启动）",
+    command: Command::Memory,
     available_on_web: true,
   },
   CommandSpec {
@@ -320,6 +328,8 @@ mod tests {
         "/resume",
         "/continue",
         "/discard",
+        "/memory",
+        "/memories",
         "/exit"
       ]
     );

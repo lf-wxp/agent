@@ -106,6 +106,9 @@ enum TimelineItem {
     tool_id: String,
     tool: String,
     arguments: String,
+    /// "Always allow" is not remembered for this tool, so it is not offered; see
+    /// [`ChatEvent::ApprovalRequired::once_only`].
+    once_only: bool,
     /// `None` while waiting on a decision; set from either this browser's own
     /// approve/deny button once the server has accepted it (see `render_approval`) or a
     /// [`ChatEvent::ApprovalResolved`] — the latter needed because another browser tab
@@ -432,7 +435,7 @@ impl ChatState {
       .update(|items| items.retain(|item| !item.is_suspended()));
   }
 
-  fn push_approval(&self, tool_id: String, tool: String, arguments: String) {
+  fn push_approval(&self, tool_id: String, tool: String, arguments: String, once_only: bool) {
     // `_untracked`: called from an event handler and from a fetch continuation, neither
     // of which is a reactive context — subscribing to the timeline here would only risk
     // a self-triggering update, given this goes on to push to it.
@@ -452,6 +455,7 @@ impl ChatState {
       tool_id,
       tool,
       arguments,
+      once_only,
       resolved: RwSignal::new(None),
     });
   }
@@ -998,9 +1002,10 @@ fn render_item(state: ChatState, item: TimelineItem) -> impl IntoView {
       tool_id,
       tool,
       arguments,
+      once_only,
       resolved,
       ..
-    } => render_approval(tool_id, tool, arguments, resolved).into_any(),
+    } => render_approval(tool_id, tool, arguments, once_only, resolved).into_any(),
     TimelineItem::Notice { text, .. } => view! {
       // `pre-wrap`: `/help` is an aligned table, so its newlines and runs of spaces are
       // what makes it readable.
@@ -1192,6 +1197,7 @@ fn render_approval(
   tool_id: String,
   tool: String,
   arguments: String,
+  once_only: bool,
   resolved: RwSignal<Option<bool>>,
 ) -> impl IntoView {
   let lang = i18n::current_lang();
@@ -1286,14 +1292,24 @@ fn render_approval(
               // The sticky pair is visually secondary: these are the consequential
               // answers (they stop asking), so the one-off decision stays the obvious
               // default rather than sitting beside an equally prominent "stop asking".
-              <button
-                type="button"
-                class="approve sticky"
-                disabled=move || submitting.get()
-                on:click=move |_| decide_always(true, true)
-              >
-                {move || t(lang.get(), Key::ApprovalAlways)}
-              </button>
+              //
+              // "Always allow" is left out for a tool the server will not remember it for
+              // (`once_only`): the button would approve the call and the next one would
+              // ask again, which reads as the setting not having taken. "Always deny" is
+              // remembered for every tool, so it stays.
+              {(!once_only).then(|| {
+                let decide_always = decide_always.clone();
+                view! {
+                  <button
+                    type="button"
+                    class="approve sticky"
+                    disabled=move || submitting.get()
+                    on:click=move |_| decide_always(true, true)
+                  >
+                    {move || t(lang.get(), Key::ApprovalAlways)}
+                  </button>
+                }
+              })}
               <button
                 type="button"
                 class="deny sticky"
@@ -1303,7 +1319,14 @@ fn render_approval(
                 {move || t(lang.get(), Key::ApprovalNever)}
               </button>
             </div>
-            <p class="approval-hint">{move || t(lang.get(), Key::ApprovalStickyHint)}</p>
+            <p class="approval-hint">
+              {move || {
+                t(
+                  lang.get(),
+                  if once_only { Key::ApprovalOnceOnlyHint } else { Key::ApprovalStickyHint },
+                )
+              }}
+            </p>
             <input
               class="approval-reason"
               type="text"
@@ -1479,7 +1502,12 @@ async fn load_pending_approvals(state: ChatState) {
     }
   };
   for approval in pending {
-    state.push_approval(approval.id, approval.tool, approval.arguments);
+    state.push_approval(
+      approval.id,
+      approval.tool,
+      approval.arguments,
+      approval.once_only,
+    );
   }
 }
 
@@ -1729,10 +1757,11 @@ fn apply_chat_event(event: ChatEvent, state: ChatState) {
       id,
       tool,
       arguments,
+      once_only,
     } => {
       // De-duplicated against whatever `load_pending_approvals` may have already put
       // there for this same tool call — see `push_approval`.
-      state.push_approval(id, tool, arguments);
+      state.push_approval(id, tool, arguments, once_only);
     }
     ChatEvent::ApprovalResolved { id, approved } => {
       state.resolve_approval(&id, approved);

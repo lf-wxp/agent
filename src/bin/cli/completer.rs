@@ -153,6 +153,8 @@ mod tests {
         "/resume",
         "/continue",
         "/discard",
+        "/memory",
+        "/memories",
         "/exit"
       ]
     );

@@ -164,6 +164,7 @@ pub enum Key {
   ApprovalAlways,
   ApprovalNever,
   ApprovalStickyHint,
+  ApprovalOnceOnlyHint,
   ApprovalReasonPlaceholder,
   ApprovalApproved,
   ApprovalDenied,
@@ -278,6 +279,14 @@ pub fn t(lang: Lang, key: Key) -> &'static str {
       "\"Siempre\" se aplica a las siguientes llamadas de esta herramienta en esta sesión, hasta /reset"
     }
 
+    (ApprovalOnceOnlyHint, Zh) => "该工具每次调用都会询问，没有「总是允许」；「总是拒绝」仍然有效",
+    (ApprovalOnceOnlyHint, En) => {
+      "This tool asks every time, so there is no \"Always allow\"; \"Always deny\" still applies"
+    }
+    (ApprovalOnceOnlyHint, Es) => {
+      "Esta herramienta pregunta cada vez, por lo que no hay \"Permitir siempre\"; \"Rechazar siempre\" sigue vigente"
+    }
+
     (ApprovalReasonPlaceholder, Zh) => "拒绝理由（可选，会告知模型）",
     (ApprovalReasonPlaceholder, En) => "Reason for denying (optional, shown to the model)",
     (ApprovalReasonPlaceholder, Es) => "Motivo del rechazo (opcional, se muestra al modelo)",
@@ -382,6 +391,10 @@ pub fn command_summary(lang: Lang, command: Command) -> &'static str {
     (Command::Discard, Lang::Zh) => "放弃被暂停的一轮，保留已完成的部分",
     (Command::Discard, Lang::En) => "Give up the suspended turn, keeping what it finished",
     (Command::Discard, Lang::Es) => "Descartar el turno suspendido, conservando lo hecho",
+
+    (Command::Memory, Lang::Zh) => "列出长期记忆（需以 --memory 启动）",
+    (Command::Memory, Lang::En) => "List long-term memory (needs --memory)",
+    (Command::Memory, Lang::Es) => "Listar la memoria a largo plazo (requiere --memory)",
 
     // Never actually listed in this menu (`available_on_web` filters it out before it
     // gets here), but translated anyway rather than left to a fallback arm: a catch-all
@@ -540,6 +553,7 @@ mod tests {
       Key::ApprovalAlways,
       Key::ApprovalNever,
       Key::ApprovalStickyHint,
+      Key::ApprovalOnceOnlyHint,
       Key::ApprovalReasonPlaceholder,
       Key::ApprovalApproved,
       Key::ApprovalDenied,

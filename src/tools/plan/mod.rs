@@ -107,8 +107,7 @@ impl Tool for UpdatePlanTool {
   }
 
   fn parameters(&self) -> Value {
-    serde_json::to_value(schemars::schema_for!(UpdatePlanArgs))
-      .expect("schema is always serializable")
+    crate::tools::schema_of::<UpdatePlanArgs>()
   }
 
   async fn execute(&self, args_json: &str) -> anyhow::Result<String> {

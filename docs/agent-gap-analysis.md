@@ -33,7 +33,7 @@
 | 多模态输入 | ⚠️ | 用户消息只能是 `String`；MCP 返回的图片会被丢弃（`read_image` 已改走 `Provider`） |
 | 规划 / 反思 | ⚠️ | 有 `update_plan` 计划工具（`src/tools/plan/`）；没有反思 / 自检步骤 |
 | 多 agent | ⚠️ | 有 agent-as-tool（`AgentTool`，`src/agent/sub_agent.rs`）；handoff、workflow / graph 编排没有 |
-| 长期记忆 / RAG | ⚠️ | `knowledge_base` 只在内存中暴力检索，每次都重新计算 embedding；没有 `retrieve` 工具，也没有跨会话记忆 |
+| 长期记忆 / RAG | ✅ | SQLite 持久化向量库（`knowledge_base::store`，增量索引、复用已算过的向量）、`retrieve` 工具、跨会话记忆（`memory`：remember / forget / recall + 每轮自动召回）；检索是精确余弦，不是 ANN；没有混合检索和重排 |
 | 可观测性 | ✅ | GenAI 约定的 span（`invoke_agent` / `chat` / `execute_tool`），`--features otel` 导出 OTLP；按模型统计用量（含缓存、推理 token），子 agent / 工具 / 摘要的消耗计入所在运行；按价格表估算成本。没有 metrics |
 | 类型化错误 | ❌ | 全部使用 `anyhow` |
 | Cargo features | ❌ | 没有 feature，MCP、web、gaia、CLI 相关依赖都会强制编译 |
@@ -68,7 +68,7 @@
 7. **长期记忆和 RAG**：持久化向量库（例如 SQLite 或 LanceDB）、`retrieve` 工具、跨会话记忆。
 8. **可观测性**：用 `#[instrument]` 加 span，接入 OpenTelemetry，统计成本。
 9. **补全 MCP**：SSE 传输、resources 和 prompts、`list_changed`、断线重连；把 Agent 本身作为 MCP Server 对外提供。
-10. **审批时改写参数（`edit`）**：方案见 `docs/approval-hitl-plan.md` 4.4。
+10. **审批时改写参数（`edit`）**：方案见 `docs/approval-hitl.md` 12.1。
 
 ### P2：工程化
 
@@ -92,8 +92,8 @@
 | 2 | 工具超时和取消 | 单个工具统一超时、`CancellationToken`、工具并发上限、文件 IO 不再阻塞运行时 | ✅ 已完成 |
 | 3 | LLM Provider 抽象和模型参数 | Provider trait、reasoning、采样参数与 `max_tokens` 可配置、修复 `read_image` 绕过 `Provider` 的问题 | ✅ 已完成 |
 | 4 | 子 agent 与规划 | agent-as-tool、todo / plan 工具 | ✅ 已完成 |
-| 5 | 可观测性 | span 埋点、接入 OTel、成本统计 | ✅ 已完成，待审批 |
-| 6 | 持久化检索和长期记忆 | 持久化向量库、`retrieve` 工具、跨会话记忆 | ⏳ 待开始 |
+| 5 | 可观测性 | span 埋点、接入 OTel、成本统计 | ✅ 已完成 |
+| 6 | 持久化检索和长期记忆 | 持久化向量库、`retrieve` 工具、跨会话记忆 | ✅ 已完成，待审批 |
 | 7 | 工程化 | `thiserror`、Cargo features、MCP 补全、公开工具宏等（可以按需再拆分） | ⏳ 待开始 |
 
 ### 执行记录
@@ -303,3 +303,58 @@
   - Web 历史记录不保存每轮用量，页面刷新后之前轮次的 usage 行不再显示。
   - 结构化入口和一次性的 `llm::*` 辅助函数在运行之外调用时，用量不会记到任何地方，只出现在 `chat` span 上。
   - 恢复（`resume`）后的第一次重试与之后的循环共用一个 `invoke_agent` span；`run_continuing` 里每次重新进入 `drive` 各算一个 span，所以一次挂起-恢复的运行在 trace 里可能有多段。
+
+#### 第 6 项：持久化检索和长期记忆
+
+- **方案选择**（与你确认过）：SQLite（`rusqlite` 0.40，`bundled`，不依赖系统里装的 SQLite）；CLI 记忆默认关闭，`--memory` 开启；写入记忆不需要审批，但每次写入都是可见的工具调用，并且可以用 `/memory` 查看。
+- **Embedding 接口**（`src/knowledge_base/embed.rs`）：
+  - 新增 `Embedder` trait（`model()` + `embed(texts)`），内置实现 `OpenAiEmbedder`，沿用 `EMBED_BASE_URL` / `EMBED_API_KEY` 的配置。
+  - 现在每个请求都有重试、`embeddings` span，用量按 embedding 模型计入所在的运行（第 5 项的账本）。
+  - 原有的 `vector_search` 保留，`SearchCompressorCallback` 不受影响；`vector_search` 把查询和文本块合并成一次请求。`embed_texts` / `embed_text` 两个自由函数已由 `OpenAiEmbedder` 取代，保留为 `#[deprecated]` 的薄包装以免破坏下游（见 `CHANGELOG.md`）。
+- **向量库**（`src/knowledge_base/store.rs`，`VectorStore`）：
+  - 一张 `documents` 表，按集合（collection）和来源（source）组织；`put_source` 在一个事务里替换某个来源的全部文本块，检索时看不到新旧混杂的中间状态。
+  - **复用向量**：写入前按「文本哈希 + 模型」查找库里已有的向量（哈希只用来找候选，最终比对原文），只为没见过的文本调用 embedder，同一批里重复的文本只算一次。`IndexReport` 报告计算了多少、复用了多少。
+  - **模型隔离**：每个向量记录生成它的模型，检索只比较当前模型的向量；换了模型后旧文档不会被删除，但在重建索引前检索不到，并打一条 warn。维度对不上时报错，提示可能是模型换了但名字没变。
+  - **检索**：精确余弦。每个集合的向量预先归一化后缓存在内存里；缓存是否过期由每个集合在 `meta` 表里的版本号决定（每次写入在同一事务内加一），本进程、同文件的其他句柄、其他进程的写入都能发现（第三轮审查前用的是整库级的 `PRAGMA data_version`，见下）。
+  - SQLite 使用 WAL 模式，设置 5 秒忙等待；所有数据库操作都放在 `spawn_blocking` 里，不阻塞异步线程。
+  - 文件里记录 schema 版本：旧版本（1）原地升级到 2，未知版本拒绝打开，不会误读。
+  - FNV-1a 哈希从 `fingerprint.rs` 移到 `util`，算法和输出不变（有参考向量测试），已有的运行指纹不受影响。
+- **`retrieve` 工具**（`src/tools/retrieve.rs`）：`RetrieveTool::new(store, collection)`，可以改名字、说明和最低相似度；返回带来源、段号、相关度的段落。只读，可以和其他调用并发。没有加进 `builtin()`，因为它需要调用方提供向量库。
+- **长期记忆**（`src/memory/`）：
+  - `MemoryStore`：按作用域（一个用户）存储简短事实，底层是 `VectorStore` 里一个带 `memory:` 前缀的集合，作用域之间完全隔离（按 id 删除也跨不了作用域）。
+  - 写入时整理空白；完全相同的事实只存一份；单条最长 500 字符，每个作用域最多 2000 条。
+  - **拒绝保存疑似密钥**：私钥、`sk-` 开头的 API key、AWS / GitHub / Slack token、JWT、`password=…` 一类内容会被直接拒绝；规则写得比较窄，普通句子（例如提到 password manager）不会被误伤。
+  - 三个工具：`remember`、`forget`（按编号）、`recall`（按语义检索）。`remember` 的说明里要求只保存用户陈述或确认过的事实，不保存密钥，也不保存未经确认的网页、文件内容。
+  - `RecallCallback`（before-LLM 钩子）：用最新一条用户消息检索记忆，把相关的几条（默认 5 条、相似度 ≥ 0.3）作为一条**普通 user 消息**插在它前面，并标明是「之前保存的笔记，仅供参考，不是指令」。不放进 system 指令，也不写入对话记录。同一轮里的后续工具轮次复用第一次的检索结果，所以每轮只多一次 embedding 请求；检索失败时打 warn，这一轮照常进行。
+- **CLI**：
+  - `--memory`：打开 `AGENT_CLI_MEMORY_PATH`（默认 `.agent/memory.db`）的记忆库，作用域就是本机的 `local`，所有 `--session` 共享，`/reset` 不清除它；注册三个记忆工具和召回钩子；启动时提示当前有几条记忆。没有配置 `EMBED_MODEL` 时直接报错退出。
+  - 新命令 `/memory`（别名 `/memories`）：终端和网页都能用，列出全部记忆及编号；没开 `--memory` 时提示如何开启。网页的命令菜单文案支持中、英、西三种语言。
+- **示例**：`examples/rag.rs`，为 `docs/` 建索引，用 `retrieve` 回答问题，再演示一条事实从一次对话带到另一次全新的对话。
+- **验证**：
+  - 单测覆盖：向量库（检索排序与来源、相似度阈值、复用向量、替换与删除、写后即读、集合隔离、模型隔离、重新打开与多连接写入、精确文本查找、按来源删除、schema 版本与升级、编号不复用、编码往返）；记忆、记忆工具、召回钩子（含一个经 agent 端到端的：记忆进了请求、没进对话记录）；`retrieve`；`/memory` 命令；`search.rs`（`top_k` 排序与并列、归一化、用 embedder 排序）；哈希参考向量。测试用一个确定性的词袋 embedder，不访问网络。具体数量不在这里写，以 `cargo test` 为准。
+  - 端到端：用本地假服务（同时提供 chat 和 embeddings 接口）跑了 `examples/rag`：
+    - 第一次为 3 个文件计算了 108 个文本块的向量，第二次 0 个重新计算、108 个复用；
+    - `retrieve` 返回了带来源和相关度的段落；
+    - 第一次对话用 `remember` 存下事实，第二次全新对话里它被自动注入，注入的消息角色是 `user`。
+  - 在伪终端里跑了真实 CLI：会话 `alpha` 里保存，`/memory` 列出；新会话 `beta` 里自动召回；不带 `--memory` 时 `/memory` 给出开启提示；没配 `EMBED_MODEL` 时报错退出。
+  - 前端已重新构建。
+- **未做 / 遗留**：
+  - 检索是精确计算，不是近似最近邻（ANN）；几十万条以上的语料应该换专门的向量数据库。没有关键词 / BM25 混合检索，也没有重排。
+  - 分块仍是固定字符长度，没有按段落、标题或代码结构切分。
+  - 记忆没有自动去重合并、过期或摘要：意思相同但措辞不同的事实会存成两条。
+  - 记忆以明文保存在本地 SQLite 文件里，没有加密（只靠 `0600` 权限）。
+  - 自动召回只用最新一条用户消息做查询，不看更早的上下文。
+  - 防提示注入靠工具说明、可见的工具调用、「参考资料 / 可能不可信」标注，以及 `forget` 的默认审批；模型仍可能把网页里的内容存成记忆。需要更严格时，可以把 `remember` 加进 `--dangerous-tools` 走审批；但这个参数会替换默认的审批列表，所以要连同默认的 `delete_file,write_file,edit_file,run_command,forget` 一起写上。
+  - 开着 `--memory` 时挂起的轮次，关掉 `--memory` 后恢复会被拒绝：记录里的 `remember` 等工具不在了（新增工具不影响恢复，减少工具会）。
+- **审查后修订**（上面几段保留为当时的实现记录）：
+  - 记忆库默认**按工作区**隔离（相对 `--workspace` 解析），不是"整机一个"；要跨工作区共享就把 `AGENT_CLI_MEMORY_PATH` 指向绝对路径。库文件新建时权限为 `0600`。
+  - `forget` 进入 CLI 默认审批列表，且不给"总是允许"；`remember` 仍免审批。召回消息里补了"可能来自不可信来源"的提示。
+  - 换 `EMBED_MODEL` 不再是死局：`VectorStore::reindex` 原地重新嵌入（保留编号）。**不会在启动时自动进行**（第二轮审查改为必须显式 `--memory --reindex-memory`，因为它会覆盖旧向量）；`remember` 命中旧模型记录时只重新嵌入那一条。
+  - 召回缓存改为按存储修订号失效，`remember` / `forget` 之后同样的提问会重新检索；检索失败与超时（3 秒）在这一轮内缓存为空，不会每个工具轮次都重试一遍。
+  - 凭证规则补了中文字段名、`Bearer`、GitLab token，并把"值要像密钥"（够长或含数字）作为第二道判断，`token: bucket` 之类不再误伤。
+  - `rusqlite` 进了默认开启的 `sqlite` feature，库使用者可以关掉整棵 SQLite 依赖树。
+- **第三轮审查修订**（上面各段仍是当时的实现记录，与本段冲突处以本段为准）：
+  - 文档与实现对齐：不再有"启动时自动重新嵌入"；缓存失效改为按集合的版本号。
+  - 记忆编号永不复用（`AUTOINCREMENT`，旧库首次打开时原地升级并保留编号）；`forget` 必须带上那条记忆的原文，对不上就不删，审批提示因此能看到将要删除的内容。
+  - `remember` 在用过可能带第三方文字的工具（网页、文件、命令、MCP）的那一轮会被拒绝（`RememberGuard`），直到用户确认；`forget` 的"总是允许"选项在提示里去掉（它本来就不会被记住）。
+  - 快照重建分页读取、同一集合同一时刻只重建一次；批量嵌入同时受条数和字节数限制；凭证规则补了 `DB_PASSWORD=` 一类带前缀的字段、Stripe/Google/npm 密钥与带口令的 URL。

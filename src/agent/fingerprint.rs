@@ -20,10 +20,12 @@
 //! releases. Using it would make "the same instructions" digest differently after a
 //! toolchain upgrade, and every suspended run would then refuse to resume — a
 //! fail-closed outcome, so nothing unsafe, but a self-inflicted one that looks exactly
-//! like a real mismatch. [`fnv1a64`] is fixed by this file instead, so a digest written
-//! today still means the same thing to a future build.
+//! like a real mismatch. [`crate::util::fnv1a64`] is fixed by this crate instead, so a
+//! digest written today still means the same thing to a future build.
 
 use serde::{Deserialize, Serialize};
+
+use crate::util::fnv1a64_hex;
 
 /// Bumped whenever the serialized shape of a suspended run changes incompatibly.
 ///
@@ -73,7 +75,7 @@ impl RunFingerprint {
       // An absent prompt and an empty one are deliberately not distinguished: neither
       // contributes anything to the request, so treating them as different identities
       // would refuse a resume over a difference the model never sees.
-      instructions_digest: digest(instructions.unwrap_or_default()),
+      instructions_digest: fnv1a64_hex(instructions.unwrap_or_default()),
       tools,
     }
   }
@@ -124,27 +126,6 @@ impl RunFingerprint {
   pub fn matches(&self, current: &Self) -> bool {
     self.mismatch(current).is_none()
   }
-}
-
-/// Lowercase hex of [`fnv1a64`] over `text`'s bytes.
-fn digest(text: &str) -> String {
-  format!("{:016x}", fnv1a64(text.as_bytes()))
-}
-
-/// FNV-1a, 64-bit. Chosen for being short enough to state in full and fixed forever by
-/// this function — see the module docs on why a standard-library hasher is not usable
-/// here. Not a cryptographic hash and not used as one: this detects accidental drift in a
-/// local config, not tampering.
-fn fnv1a64(bytes: &[u8]) -> u64 {
-  const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-  const PRIME: u64 = 0x0000_0100_0000_01b3;
-
-  let mut hash = OFFSET_BASIS;
-  for byte in bytes {
-    hash ^= u64::from(*byte);
-    hash = hash.wrapping_mul(PRIME);
-  }
-  hash
 }
 
 #[cfg(test)]
@@ -255,9 +236,9 @@ mod tests {
   /// therefore come with a `STATE_VERSION` bump rather than a quiet edit to the test.
   #[test]
   fn the_digest_is_stable_by_construction() {
-    assert_eq!(digest(""), "cbf29ce484222325");
-    assert_eq!(digest("a"), "af63dc4c8601ec8c");
-    assert_eq!(digest("be helpful"), digest("be helpful"));
-    assert_ne!(digest("be helpful"), digest("be terse"));
+    assert_eq!(fnv1a64_hex(""), "cbf29ce484222325");
+    assert_eq!(fnv1a64_hex("a"), "af63dc4c8601ec8c");
+    assert_eq!(fnv1a64_hex("be helpful"), fnv1a64_hex("be helpful"));
+    assert_ne!(fnv1a64_hex("be helpful"), fnv1a64_hex("be terse"));
   }
 }

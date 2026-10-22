@@ -13,13 +13,15 @@ pub mod mcp;
 pub mod plan;
 pub mod read_image;
 pub mod registry;
+#[cfg(feature = "sqlite")]
+pub mod retrieve;
 pub mod schedule;
 pub mod shell;
 pub mod tool;
 pub mod web_search;
 
 pub use registry::ToolRegistry;
-pub use tool::Tool;
+pub use tool::{Tool, schema_of};
 
 /// Test-only helpers shared by the tools' unit tests.
 #[cfg(test)]

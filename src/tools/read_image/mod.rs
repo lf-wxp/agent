@@ -69,8 +69,7 @@ impl Tool for ReadImageTool {
   }
 
   fn parameters(&self) -> Value {
-    serde_json::to_value(schemars::schema_for!(ReadImageArgs))
-      .expect("schema is always serializable")
+    crate::tools::schema_of::<ReadImageArgs>()
   }
 
   async fn execute(&self, args_json: &str) -> anyhow::Result<String> {

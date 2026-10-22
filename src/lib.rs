@@ -15,6 +15,8 @@ pub mod gaia;
 pub mod http;
 pub mod knowledge_base;
 pub mod llm;
+#[cfg(feature = "sqlite")]
+pub mod memory;
 pub mod models;
 pub mod telemetry;
 pub mod tools;

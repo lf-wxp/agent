@@ -1,6 +1,6 @@
 //! Local web front-end for the same `Agent`/session state the terminal loop in
 //! `main.rs` drives — the browser is another way to interact with *this* process, not a
-//! separate deployment (see `docs/web-ui-plan.md`).
+//! separate deployment (see `docs/web-ui.md`).
 //!
 //! Every turn this process runs — typed in the terminal or submitted from a browser tab
 //! — is broadcast to every connected `GET /api/stream` subscriber via [`WebState::events`]
@@ -31,6 +31,7 @@ use agent::{
     PendingApproval,
   },
   llm::pricing::PriceTable,
+  memory::MemoryStore,
   session::{FileSessionStore, SessionStore},
 };
 use anyhow::Context;
@@ -93,6 +94,9 @@ pub struct WebState {
   /// suspended by a terminal-typed turn must be resumable from a browser tab, and the
   /// other way round.
   approvals_store: Arc<FileApprovalStore>,
+  /// Long-term memory, when the process was started with `--memory` — the *same* store
+  /// the agent's memory tools write to, so `/memory` from a tab lists what they saved.
+  memory: Option<MemoryStore>,
   /// Every [`ChatEvent`] this process produces, from *any* turn regardless of which
   /// front-end started it — this is the one channel that makes a terminal-typed message
   /// (or one from a different browser tab) show up here. `main.rs`'s terminal loop
@@ -105,9 +109,12 @@ pub struct WebState {
 }
 
 impl WebState {
-  // Eight `Arc`/handle parameters, each a distinct piece of process-wide state this
-  // binary already owns. A parameter struct would only move the same list one level out
-  // and add a type whose sole purpose is to be destructured here.
+  // Nine `Arc`/handle parameters, each a distinct piece of process-wide state this
+  // binary already owns, handed over once from a single call site at startup. That is the
+  // difference from `commands::CommandContext`, which exists because *three* front-ends
+  // and the tests build the same set over and over: here a parameter struct would only
+  // move the one list `main` writes out one level, and add a type whose sole purpose is
+  // to be destructured in this constructor.
   #[allow(clippy::too_many_arguments)]
   pub fn new(
     agent: Arc<Agent>,
@@ -117,6 +124,7 @@ impl WebState {
     approvals: Arc<ApprovalRegistry>,
     approval_callback: Option<Arc<DualApprovalCallback>>,
     approvals_store: Arc<FileApprovalStore>,
+    memory: Option<MemoryStore>,
     events: broadcast::Sender<ChatEvent>,
   ) -> Self {
     Self {
@@ -127,6 +135,7 @@ impl WebState {
       approvals,
       approval_callback,
       approvals_store,
+      memory,
       events,
     }
   }
@@ -179,6 +188,9 @@ impl WebState {
           tool: call.name,
           arguments: call.raw_arguments,
           requested_at: now,
+          // A stored run has no live prompt; the flag is read again when it is resumed
+          // and the prompt is raised afresh.
+          once_only: false,
         })
         .collect(),
       transcript: view.events.into_iter().map(to_history_entry).collect(),
@@ -439,12 +451,15 @@ pub(crate) async fn chat_handler(
         super::commands::execute(
           command,
           &request.input,
-          MessageOrigin::Web,
-          &state.store,
-          state.approval_callback.as_deref(),
-          &state.approvals_store,
-          &state.session_id,
-          &state.events,
+          super::commands::CommandContext {
+            origin: MessageOrigin::Web,
+            store: &state.store,
+            approvals: state.approval_callback.as_deref(),
+            approvals_store: &state.approvals_store,
+            memory: state.memory.as_ref(),
+            session_id: &state.session_id,
+            events: &state.events,
+          },
         )
         .await;
       }
@@ -566,6 +581,7 @@ pub(crate) async fn drive_turn(state: Arc<WebState>, turn: String, input: TurnIn
               id: meta.id.clone(),
               tool: meta.tool.clone(),
               arguments: meta.raw_arguments.clone(),
+              once_only: meta.once_only,
             };
             // Into the *session-wide* registry, so a terminal sharing this session can
             // answer it too — not just the browser tab that submitted this turn. Done
@@ -654,6 +670,7 @@ fn to_pending_approval_view(meta: ApprovalMeta) -> PendingApprovalView {
     tool: meta.tool,
     arguments: meta.raw_arguments,
     requested_at: meta.requested_at,
+    once_only: meta.once_only,
   }
 }
 

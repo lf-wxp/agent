@@ -80,6 +80,15 @@ pub trait Tool: Send + Sync {
   }
 }
 
+/// The JSON Schema of a tool's argument type `T`, as the value for [`Tool::parameters`].
+///
+/// One place for what every tool otherwise writes out, including the `expect`: a schema
+/// derived from a plain `Deserialize` struct always serializes, so a failure here is a
+/// bug in the type, not something a caller could handle.
+pub fn schema_of<T: schemars::JsonSchema>() -> Value {
+  serde_json::to_value(schemars::schema_for!(T)).expect("schema is always serializable")
+}
+
 /// Run `tool`, giving up once its limit — [`Tool::timeout`], else `default` — elapses.
 ///
 /// The single place every call site ([`crate::tools::ToolRegistry::execute`],

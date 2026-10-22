@@ -164,6 +164,11 @@ pub struct ApprovalMeta {
   /// Unix seconds at which the prompt was raised, so a snapshot can be ordered the way
   /// the prompts actually arrived rather than in `HashMap` iteration order.
   pub requested_at: i64,
+  /// Whether an "always allow" answer would be accepted for this call only (see
+  /// [`DualApprovalCallback::without_standing_approval`]). A front-end uses it to leave
+  /// the option out, instead of offering a button that approves the call and then quietly
+  /// asks again next time — which reads as the setting not having taken.
+  pub once_only: bool,
 }
 
 /// One tool call waiting on a human decision.
@@ -381,6 +386,17 @@ pub async fn with_approval_channel<F: Future>(channel: ApprovalChannel, fut: F) 
   APPROVAL_CHANNEL.scope(channel, fut).await
 }
 
+/// The answers a terminal prompt offers, as the text after "是否执行？". Without "always
+/// allow" for a tool that would not remember it (see [`ApprovalMeta::once_only`]): listing
+/// an answer the prompt will then ignore is how a setting appears not to work.
+pub fn approval_choices(once_only: bool) -> &'static str {
+  if once_only {
+    "y=本次允许 / n=本次拒绝 / d=本会话总是拒绝；该工具每次都会询问，没有「总是允许」"
+  } else {
+    "y=本次允许 / n=本次拒绝 / a=本会话总是允许 / d=本会话总是拒绝"
+  }
+}
+
 /// When calls to one tool need a human decision.
 ///
 /// A tool absent from [`DualApprovalCallback`]'s rule set is never gated at all; this
@@ -567,6 +583,13 @@ impl DualApprovalCallback {
     }
   }
 
+  /// Whether an "always allow" answer for `tool` is honoured for this call only; see
+  /// [`Self::without_standing_approval`]. What a front-end consults to decide whether to
+  /// offer the option at all.
+  pub fn is_once_only(&self, tool: &str) -> bool {
+    self.once_only.contains(tool)
+  }
+
   /// Never let an "always allow" answer for `tool` stand for later calls: each call is
   /// put to a human on its own, whatever was answered before.
   ///
@@ -723,8 +746,9 @@ impl DualApprovalCallback {
     // prompt at all.
     eprintln!("参数: {}", tool_call.raw_arguments);
 
-    let read = tokio::task::spawn_blocking(|| {
-      eprint!("是否执行？(y=本次允许 / n=本次拒绝 / a=本会话总是允许 / d=本会话总是拒绝): ");
+    let choices = approval_choices(self.is_once_only(tool_call.name));
+    let read = tokio::task::spawn_blocking(move || {
+      eprint!("是否执行？({choices}): ");
       if let Err(err) = io::stderr().flush() {
         tracing::warn!("failed to flush approval prompt: {err}");
       }
@@ -780,6 +804,7 @@ impl DualApprovalCallback {
     sender: &mpsc::UnboundedSender<PendingApproval>,
     tool_call: &ToolCallView<'_>,
     timeout: Duration,
+    once_only: bool,
   ) -> Option<ApprovalOutcome> {
     let (decision_tx, decision_rx) = oneshot::channel();
     let request = PendingApproval {
@@ -788,6 +813,7 @@ impl DualApprovalCallback {
         tool: tool_call.name.to_owned(),
         raw_arguments: tool_call.raw_arguments.to_owned(),
         requested_at: chrono::Utc::now().timestamp(),
+        once_only,
       },
       decision: decision_tx,
     };
@@ -890,7 +916,8 @@ impl BeforeToolCallback for DualApprovalCallback {
     let outcome = match channel {
       ApprovalChannel::Terminal => self.prompt_terminal(&tool_call).await,
       ApprovalChannel::Session(sender) => {
-        Self::prompt_session(&sender, &tool_call, self.timeout).await
+        let once_only = self.is_once_only(tool_call.name);
+        Self::prompt_session(&sender, &tool_call, self.timeout, once_only).await
       }
     };
 
@@ -977,6 +1004,7 @@ mod tests {
       tool: "delete_file".to_owned(),
       raw_arguments: "{}".to_owned(),
       requested_at: 0,
+      once_only: false,
     }
   }
 

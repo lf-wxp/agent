@@ -42,6 +42,9 @@ const ENV_CLI_SESSION_DIR: &str = "AGENT_CLI_SESSION_DIR";
 /// Environment variable: directory the `cli` binary persists suspended runs under.
 const ENV_CLI_APPROVAL_DIR: &str = "AGENT_CLI_APPROVAL_DIR";
 
+/// Environment variable: SQLite file the `cli` binary keeps long-term memory in.
+const ENV_CLI_MEMORY_PATH: &str = "AGENT_CLI_MEMORY_PATH";
+
 /// Environment variable: port the `cli` binary's `--mode web`/`--mode both` local web
 /// server binds to (always on `127.0.0.1`, see `src/bin/cli/web.rs`).
 const ENV_CLI_WEB_PORT: &str = "AGENT_CLI_WEB_PORT";
@@ -133,6 +136,16 @@ const DEFAULT_CLI_SESSION_DIR: &str = ".agent/sessions";
 /// [`crate::agent::approval_store`]), and nesting would make a recursive clear of one
 /// silently take the other with it.
 const DEFAULT_CLI_APPROVAL_DIR: &str = ".agent/approvals";
+
+/// Default file for the `cli` binary's long-term memory (`--memory`). Under `.agent/`
+/// with the rest of its state, and therefore **per workspace**: `main.rs` switches into
+/// `--workspace` before reading this, so two projects keep two sets of memories. Point
+/// [`ENV_CLI_MEMORY_PATH`] at an absolute path to share one store across workspaces.
+///
+/// Note that `.gitignore` excluding `.agent/` is this repository's own doing, not a
+/// guarantee for a user's projects: a workspace with memory on will have a
+/// `.agent/memory.db` holding what the agent was told about them.
+const DEFAULT_CLI_MEMORY_PATH: &str = ".agent/memory.db";
 
 /// Default port for the `cli` binary's local web server.
 const DEFAULT_CLI_WEB_PORT: u16 = 4173;
@@ -254,6 +267,18 @@ pub fn cli_approval_dir() -> PathBuf {
   non_empty_var(ENV_CLI_APPROVAL_DIR)
     .map(PathBuf::from)
     .unwrap_or_else(|| PathBuf::from(DEFAULT_CLI_APPROVAL_DIR))
+}
+
+/// SQLite file the `cli` binary keeps long-term memory in when started with `--memory`
+/// (see [`crate::memory`]). Override with `AGENT_CLI_MEMORY_PATH`; relative paths resolve
+/// against `--workspace`.
+///
+/// So the default is per workspace, not per machine: two projects get two sets of
+/// memories. An absolute `AGENT_CLI_MEMORY_PATH` is how one store is shared across them.
+pub fn cli_memory_path() -> PathBuf {
+  non_empty_var(ENV_CLI_MEMORY_PATH)
+    .map(PathBuf::from)
+    .unwrap_or_else(|| PathBuf::from(DEFAULT_CLI_MEMORY_PATH))
 }
 
 /// Port the `cli` binary's local web server binds to on `127.0.0.1`. Override with
@@ -417,6 +442,37 @@ pub fn embed_base_url() -> Option<String> {
 /// letting the caller fall back to `OPENAI_API_KEY`.
 pub fn embed_api_key() -> Option<String> {
   non_empty_var(ENV_EMBED_API_KEY)
+}
+
+/// Where text sent for embedding goes, in a form fit to print: the host (and port) of the
+/// embeddings endpoint, and whether that is the chat provider's or a separate one.
+///
+/// Mirrors how the client picks its endpoint — `EMBED_BASE_URL`, else `OPENAI_BASE_URL`,
+/// else the OpenAI default — but prints only the authority, never the path or anything
+/// before an `@`: a base URL can carry credentials (`https://user:key@host/v1`), and a
+/// line meant to tell people where their data goes must not become a place a key shows up.
+pub fn embed_endpoint_label() -> String {
+  let (url, source) = match embed_base_url() {
+    Some(url) => (url, "EMBED_BASE_URL"),
+    None => match non_empty_var("OPENAI_BASE_URL") {
+      Some(url) => (url, "the chat provider"),
+      None => ("https://api.openai.com/v1".to_owned(), "the default"),
+    },
+  };
+  format!("{} via {source}", url_authority(&url))
+}
+
+/// `host[:port]` of `url`, without scheme, path, query or userinfo; `url` itself, trimmed
+/// to its first 60 characters, when it has no recognizable scheme.
+fn url_authority(url: &str) -> String {
+  let Some((_, rest)) = url.split_once("://") else {
+    return url.chars().take(60).collect();
+  };
+  let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+  authority
+    .rsplit_once('@')
+    .map_or(authority, |(_, host)| host)
+    .to_owned()
 }
 
 /// Environment variable read by the OpenAI client for the chat API key.
@@ -636,6 +692,29 @@ mod tests {
     assert_eq!(
       parsed_var_opt::<f32>("AGENT_TEST_PARSED_VAR_OPT_VALUE"),
       Some(0.7)
+    );
+  }
+
+  #[test]
+  fn the_endpoint_label_shows_where_text_goes_and_never_a_credential() {
+    assert_eq!(url_authority("https://api.openai.com/v1"), "api.openai.com");
+    assert_eq!(
+      url_authority("http://localhost:11434/v1"),
+      "localhost:11434"
+    );
+    assert_eq!(url_authority("https://host.example"), "host.example");
+    assert_eq!(url_authority("https://host.example?x=1"), "host.example");
+    assert_eq!(
+      url_authority("https://user:sk-secret@host.example:8443/v1"),
+      "host.example:8443",
+      "userinfo is dropped"
+    );
+    assert_eq!(url_authority("https://a@b@host.example/x"), "host.example");
+    let junk = url_authority(&"x".repeat(200));
+    assert_eq!(
+      junk.chars().count(),
+      60,
+      "no scheme: bounded, not echoed whole"
     );
   }
 }
