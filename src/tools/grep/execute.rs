@@ -9,11 +9,11 @@ use std::{
   },
 };
 
-use anyhow::Context;
 use regex::{Regex, RegexBuilder};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::{
+  error::ResultExt,
   tools::grep::{DEFAULT_MAX_RESULTS, GrepArgs, MAX_RESULTS_CAP},
   util::truncate_chars,
 };
@@ -37,14 +37,15 @@ const MAX_LINE_CHARS: usize = 300;
 /// flag as it goes ([`CancelOnDrop`]): when the tool call is abandoned — it timed out, or
 /// the run was cancelled — the future is dropped, the flag is set, and the thread stops
 /// at its next file instead of walking the rest of the tree for nobody.
-pub async fn run(args_json: &str) -> anyhow::Result<String> {
-  let args = serde_json::from_str::<GrepArgs>(args_json).context("invalid grep arguments")?;
+pub async fn run(args_json: &str) -> crate::Result<String> {
+  let args = serde_json::from_str::<GrepArgs>(args_json)
+    .wrap_err(crate::Error::tool, "invalid grep arguments")?;
 
   let cancelled = Arc::new(AtomicBool::new(false));
   let _stop_on_drop = CancelOnDrop(Arc::clone(&cancelled));
   tokio::task::spawn_blocking(move || search(args, &cancelled))
     .await
-    .context("grep task panicked")?
+    .wrap_err(crate::Error::tool, "grep task panicked")?
 }
 
 /// Sets its flag when dropped; see [`run`].
@@ -56,7 +57,7 @@ impl Drop for CancelOnDrop {
   }
 }
 
-fn search(args: GrepArgs, cancelled: &AtomicBool) -> anyhow::Result<String> {
+fn search(args: GrepArgs, cancelled: &AtomicBool) -> crate::Result<String> {
   let GrepArgs {
     pattern,
     path,
@@ -68,7 +69,7 @@ fn search(args: GrepArgs, cancelled: &AtomicBool) -> anyhow::Result<String> {
   let regex = RegexBuilder::new(&pattern)
     .case_insensitive(case_insensitive)
     .build()
-    .with_context(|| format!("invalid regex `{pattern}`"))?;
+    .wrap_err_with(crate::Error::tool, || format!("invalid regex `{pattern}`"))?;
   let include = include
     .filter(|glob| !glob.is_empty())
     .map(|glob| glob_to_regex(&glob))
@@ -78,7 +79,7 @@ fn search(args: GrepArgs, cancelled: &AtomicBool) -> anyhow::Result<String> {
     .clamp(1, MAX_RESULTS_CAP);
 
   let root = Path::new(&path);
-  anyhow::ensure!(root.exists(), "Path not found: {path}");
+  crate::error::ensure!(root.exists(), tool, "Path not found: {path}");
 
   let mut output = String::new();
   let mut matches = 0usize;
@@ -94,7 +95,7 @@ fn search(args: GrepArgs, cancelled: &AtomicBool) -> anyhow::Result<String> {
 
   'files: for entry in walker.filter_map(Result::ok) {
     if cancelled.load(Ordering::Relaxed) {
-      anyhow::bail!("search cancelled");
+      crate::error::bail!(tool, "search cancelled");
     }
     if !entry.file_type().is_file() {
       continue;
@@ -193,7 +194,7 @@ fn is_skipped(entry: &DirEntry) -> bool {
 }
 
 /// Translate a filename glob (`*`, `?`, everything else literal) into an anchored regex.
-fn glob_to_regex(glob: &str) -> anyhow::Result<Regex> {
+fn glob_to_regex(glob: &str) -> crate::Result<Regex> {
   let mut pattern = String::from("^");
   for ch in glob.chars() {
     match ch {
@@ -215,7 +216,9 @@ fn glob_to_regex(glob: &str) -> anyhow::Result<Regex> {
     }
   }
   pattern.push('$');
-  Regex::new(&pattern).with_context(|| format!("invalid include glob `{glob}`"))
+  Regex::new(&pattern).wrap_err_with(crate::Error::tool, || {
+    format!("invalid include glob `{glob}`")
+  })
 }
 
 #[cfg(test)]
@@ -242,7 +245,7 @@ mod tests {
     root
   }
 
-  async fn grep(value: serde_json::Value) -> anyhow::Result<String> {
+  async fn grep(value: serde_json::Value) -> crate::Result<String> {
     run(&value.to_string()).await
   }
 

@@ -36,6 +36,29 @@ fn new_defaults_max_steps_to_the_shared_tool_round_budget() {
   assert_eq!(agent.max_steps, config::max_tool_rounds() as u32);
 }
 
+/// The optimizer `new` installs is a trait object in `before_llm_callbacks`, so the
+/// encoding it was given cannot be read back out; `context_encoding` is what makes the
+/// choice testable, and it is what a caller would report alongside the agent.
+#[test]
+fn new_counted_the_history_budget_in_the_models_encoding() {
+  let for_model = |model: &str| {
+    Agent::new(
+      Provider::shared().clone(),
+      model,
+      Option::<String>::None,
+      Arc::new(ToolRegistry::empty()),
+    )
+    .context_encoding()
+  };
+  assert_eq!(for_model("gpt-4o"), Encoding::O200kBase);
+  assert_eq!(for_model("gpt-4"), Encoding::Cl100kBase);
+  assert_eq!(
+    for_model("deepseek-v4-flash"),
+    Encoding::Cl100kBase,
+    "a model tiktoken does not know keeps the stand-in"
+  );
+}
+
 #[test]
 fn with_max_steps_overrides_the_default() {
   let agent = agent_with(ToolRegistry::empty()).with_max_steps(1);
@@ -385,7 +408,7 @@ impl Tool for SpyTool {
     json!({"type": "object", "properties": {}})
   }
 
-  async fn execute(&self, _args_json: &str) -> anyhow::Result<String> {
+  async fn execute(&self, _args_json: &str) -> crate::Result<String> {
     self.executed.store(true, Ordering::SeqCst);
     Ok("real result".to_owned())
   }
@@ -666,7 +689,7 @@ impl Tool for OtherSpyTool {
     json!({"type": "object", "properties": {}})
   }
 
-  async fn execute(&self, _args_json: &str) -> anyhow::Result<String> {
+  async fn execute(&self, _args_json: &str) -> crate::Result<String> {
     self.executed.store(true, Ordering::SeqCst);
     Ok("other result".to_owned())
   }
@@ -1870,7 +1893,7 @@ impl Tool for SlowTool {
     self.concurrency_safe
   }
 
-  async fn execute(&self, _args_json: &str) -> anyhow::Result<String> {
+  async fn execute(&self, _args_json: &str) -> crate::Result<String> {
     let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
     self.peak.fetch_max(now, Ordering::SeqCst);
     tokio::time::sleep(self.delay).await;
@@ -2169,9 +2192,9 @@ async fn a_cancelled_run_returns_its_transcript_without_calling_the_model() {
     .await
     .expect_err("a cancelled run does not finish");
 
-  let cancelled = err
-    .downcast_ref::<Cancelled>()
-    .expect("the error is `Cancelled`, so a caller can recover the transcript");
+  let crate::Error::Cancelled(cancelled) = err else {
+    panic!("the error is `Cancelled`, so a caller can recover the transcript; got {err:?}");
+  };
   assert_eq!(cancelled.context.events.len(), 1, "the user's turn is kept");
 }
 
@@ -2190,7 +2213,7 @@ async fn a_cancelled_stream_ends_with_cancelled() {
   let first = stream.next().await.expect("one item");
 
   let err = first.expect_err("a cancelled stream reports it");
-  assert!(err.downcast_ref::<Cancelled>().is_some(), "got: {err}");
+  assert!(matches!(err, crate::Error::Cancelled(_)), "got: {err}");
   assert!(
     stream.next().await.is_none(),
     "nothing follows the cancellation"
@@ -2213,7 +2236,7 @@ async fn a_resumed_run_can_be_given_a_token() {
     .await
     .expect_err("the attached token is cancelled");
 
-  assert!(err.downcast_ref::<Cancelled>().is_some(), "got: {err}");
+  assert!(matches!(err, crate::Error::Cancelled(_)), "got: {err}");
   assert!(
     !executed.load(Ordering::SeqCst),
     "a cancelled resume runs nothing"

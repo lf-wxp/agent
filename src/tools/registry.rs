@@ -1,24 +1,24 @@
 //! The set of tools available to a model: the definitions to advertise plus dispatch.
 
-use std::{path::Path, sync::Arc};
-
-use async_openai::types::chat::ChatCompletionTools;
+use std::sync::Arc;
 
 use crate::config;
+#[cfg(feature = "zip")]
+use crate::tools::file_upzip::{self, UnzipFileTool};
+#[cfg(feature = "mcp")]
+use crate::tools::mcp::{McpConfig, McpConnection};
 use crate::tools::{
   calculator::{self, Calculator},
   file_delete::{self, DeleteFileTool},
   file_edit::{self, EditFileTool},
   file_list::{self, ListFileTool},
   file_read::{self, ReadFileTool},
-  file_upzip::{self, UnzipFileTool},
   file_write::{self, WriteFileTool},
   grep::{self, GrepTool},
-  mcp::{McpConfig, McpConnection},
   plan::{self, UpdatePlanTool},
   read_image::{self, ReadImageTool},
   shell::{self, RunCommandTool},
-  tool::{Tool, execute_with_timeout},
+  tool::{Tool, ToolDefinition, execute_with_timeout, validate_tool_name},
   web_search::{self, WebSearch},
 };
 
@@ -32,7 +32,7 @@ use crate::tools::{
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
   tools: Vec<Arc<dyn Tool>>,
-  definitions: Vec<ChatCompletionTools>,
+  definitions: Vec<ToolDefinition>,
 }
 
 impl ToolRegistry {
@@ -56,7 +56,8 @@ impl ToolRegistry {
   /// `delete_file` and `unzip_file` are still destructive — they stay only because they
   /// predate the sandbox/approval split, and dropping them here would be a breaking
   /// change. A caller that cannot gate them (an unattended job) should pick its tools
-  /// with [`Self::select`] rather than read this list as "harmless".
+  /// with [`Self::select`] rather than read this list as "harmless". (`unzip_file` is
+  /// only here with the `zip` feature, on by default.)
   ///
   /// Use [`Self::builtin_all`] when the caller does supply that gate (as the CLI does),
   /// or [`Self::select`] to pick tools by name.
@@ -76,13 +77,14 @@ impl ToolRegistry {
   /// let mut registry = ToolRegistry::select(&["read_file".to_owned()])?;
   /// registry.add(Arc::new(ReadImageTool::new(tenant_provider.clone())))?;
   /// ```
-  pub fn builtin() -> anyhow::Result<Self> {
+  pub fn builtin() -> crate::Result<Self> {
     let mut registry = Self::empty();
     registry.add(Arc::new(Calculator))?;
     registry.add(Arc::new(WebSearch))?;
     registry.add(Arc::new(DeleteFileTool))?;
     registry.add(Arc::new(ListFileTool))?;
     registry.add(Arc::new(ReadFileTool))?;
+    #[cfg(feature = "zip")]
     registry.add(Arc::new(UnzipFileTool))?;
     registry.add(Arc::new(ReadImageTool::default()))?;
     registry.add(Arc::new(GrepTool))?;
@@ -99,7 +101,7 @@ impl ToolRegistry {
   /// [`crate::callback::dual_approval::DualApprovalCallback`] as the CLI does. A caller
   /// that cannot (an unattended job, a library embedding with no human to ask) should
   /// use [`Self::builtin`] or [`Self::select`] instead.
-  pub fn builtin_all() -> anyhow::Result<Self> {
+  pub fn builtin_all() -> crate::Result<Self> {
     let mut registry = Self::builtin()?;
     registry.add(Arc::new(WriteFileTool))?;
     registry.add(Arc::new(EditFileTool))?;
@@ -112,8 +114,10 @@ impl ToolRegistry {
   /// For callers that let a request pick a subset of tools by name rather than always
   /// getting the full [`Self::builtin`] set.
   /// MCP tools are not selectable this way: they only exist once discovered from
-  /// `mcp.json` (see [`Self::with_mcp`]), so there is no name to select before that.
-  pub fn select(names: &[String]) -> anyhow::Result<Self> {
+  /// `mcp.json` (see `Self::with_mcp`, `mcp` feature), so there is no name to select
+  /// before that. `unzip_file` is only known with the `zip` feature; without it, asking
+  /// for it is an unknown-tool error like any other.
+  pub fn select(names: &[String]) -> crate::Result<Self> {
     let mut registry = Self::empty();
     for name in names {
       let tool: Arc<dyn Tool> = match name.as_str() {
@@ -122,6 +126,7 @@ impl ToolRegistry {
         file_delete::NAME => Arc::new(DeleteFileTool),
         file_list::NAME => Arc::new(ListFileTool),
         file_read::NAME => Arc::new(ReadFileTool),
+        #[cfg(feature = "zip")]
         file_upzip::NAME => Arc::new(UnzipFileTool),
         read_image::NAME => Arc::new(ReadImageTool::default()),
         file_write::NAME => Arc::new(WriteFileTool),
@@ -129,7 +134,7 @@ impl ToolRegistry {
         grep::NAME => Arc::new(GrepTool),
         shell::NAME => Arc::new(RunCommandTool),
         plan::NAME => Arc::new(UpdatePlanTool),
-        other => anyhow::bail!("unknown tool `{other}`"),
+        other => crate::error::bail!(invalid_input, "unknown tool `{other}`"),
       };
       registry.add(tool)?;
     }
@@ -144,16 +149,20 @@ impl ToolRegistry {
   /// The returned connections must be kept alive for as long as the registry is used, and
   /// shut down only after it is dropped. Individual servers and tools that fail are logged
   /// and skipped, so one bad entry cannot take the rest down with it.
-  pub async fn with_mcp(path: impl AsRef<Path>) -> anyhow::Result<(Self, Vec<McpConnection>)> {
+  #[cfg(feature = "mcp")]
+  pub async fn with_mcp(
+    path: impl AsRef<std::path::Path>,
+  ) -> crate::Result<(Self, Vec<McpConnection>)> {
     Self::with_mcp_over(Self::builtin()?, path).await
   }
 
   /// Like [`Self::with_mcp`], but on top of a registry the caller already built — e.g.
   /// [`Self::builtin_all`], which `with_mcp` deliberately does not use by itself.
+  #[cfg(feature = "mcp")]
   pub async fn with_mcp_over(
     mut registry: Self,
-    path: impl AsRef<Path>,
-  ) -> anyhow::Result<(Self, Vec<McpConnection>)> {
+    path: impl AsRef<std::path::Path>,
+  ) -> crate::Result<(Self, Vec<McpConnection>)> {
     let path = path.as_ref();
 
     if !tokio::fs::try_exists(path).await.unwrap_or(false) {
@@ -165,18 +174,30 @@ impl ToolRegistry {
     }
 
     let (connections, tools) = McpConfig::load(path).await?.connect_all().await;
-    for tool in tools {
-      let name = tool.name().to_owned();
-      if let Err(err) = registry.add(tool) {
-        tracing::warn!("skipping MCP tool `{name}`: {err:#}");
-      }
-    }
+    registry.add_skipping(tools);
 
     Ok((registry, connections))
   }
 
-  /// Definitions advertised to the model.
-  pub fn definitions(&self) -> &[ChatCompletionTools] {
+  /// [`Self::add`] for a set discovered at runtime, from one server: a tool the registry
+  /// refuses (a name the API would reject, a duplicate) is logged and left out instead of
+  /// failing the whole batch — one bad entry on an MCP server must not take the others,
+  /// or the rest of the run, down with it.
+  ///
+  /// `mcp` is its only production caller; the tests exercise it directly, which is why it
+  /// stays compiled without the feature.
+  #[cfg(any(feature = "mcp", test))]
+  fn add_skipping(&mut self, tools: impl IntoIterator<Item = Arc<dyn Tool>>) {
+    for tool in tools {
+      let name = tool.name().to_owned();
+      if let Err(err) = self.add(tool) {
+        tracing::warn!("skipping tool `{name}`: {err:#}");
+      }
+    }
+  }
+
+  /// Definitions advertised to the model, in registration order.
+  pub fn definitions(&self) -> &[ToolDefinition] {
     &self.definitions
   }
 
@@ -216,23 +237,29 @@ impl ToolRegistry {
 
   /// Register one tool.
   ///
-  /// Rejects an already-taken name: dispatch resolves by name, so a duplicate would make
-  /// one of the two permanently unreachable with no error at call time. This matters most
-  /// for MCP servers, whose tool names are only known at runtime.
-  pub fn add(&mut self, tool: Arc<dyn Tool>) -> anyhow::Result<()> {
+  /// Rejects a name chat APIs would not accept (see
+  /// [`crate::tools::tool::validate_tool_name`]): advertised anyway, it would make every
+  /// request this registry goes into fail, with an error that does not say which tool is
+  /// to blame. Also rejects an already-taken name: dispatch resolves by name, so a
+  /// duplicate would make one of the two permanently unreachable with no error at call
+  /// time. Both matter most for MCP servers, whose tool names are only known at runtime —
+  /// [`Self::with_mcp_over`] logs and skips such a tool rather than failing the batch.
+  pub fn add(&mut self, tool: Arc<dyn Tool>) -> crate::Result<()> {
     let name = tool.name();
-    anyhow::ensure!(
+    validate_tool_name(name)?;
+    crate::error::ensure!(
       !self.contains(name),
+      invalid_input,
       "duplicate tool name `{name}`; rename it or drop one of the sources"
     );
 
-    self.definitions.push(tool.definition()?);
+    self.definitions.push(tool.definition());
     self.tools.push(tool);
     Ok(())
   }
 
   /// Register several tools, e.g. everything discovered on one MCP server.
-  pub fn extend<I>(&mut self, tools: I) -> anyhow::Result<()>
+  pub fn extend<I>(&mut self, tools: I) -> crate::Result<()>
   where
     I: IntoIterator<Item = Arc<dyn Tool>>,
   {
@@ -286,8 +313,8 @@ impl std::fmt::Debug for ToolRegistry {
 mod tests {
   use super::*;
   use crate::tools::{
-    calculator, file_delete, file_edit, file_list, file_read, file_upzip, file_write, grep, plan,
-    read_image, shell, web_search,
+    calculator, file_delete, file_edit, file_list, file_read, file_write, grep, plan, read_image,
+    shell, web_search,
   };
 
   #[test]
@@ -307,6 +334,7 @@ mod tests {
       file_delete::NAME,
       file_list::NAME,
       file_read::NAME,
+      #[cfg(feature = "zip")]
       file_upzip::NAME,
       read_image::NAME,
       grep::NAME,
@@ -314,6 +342,16 @@ mod tests {
     ] {
       assert!(registry.contains(name), "missing built-in tool `{name}`");
     }
+  }
+
+  /// Without `zip`, `unzip_file` is gone from every route in — not just left out of the
+  /// default set while `select` still knows it.
+  #[cfg(not(feature = "zip"))]
+  #[test]
+  fn without_the_zip_feature_there_is_no_unzip_tool() {
+    assert!(!ToolRegistry::builtin_all().unwrap().contains("unzip_file"));
+    let err = ToolRegistry::select(&["unzip_file".to_owned()]).unwrap_err();
+    assert!(err.to_string().contains("unknown tool"), "got: {err}");
   }
 
   /// The point of the split: whoever asks for "the defaults" without having built a
@@ -379,6 +417,72 @@ mod tests {
     let mut registry = ToolRegistry::builtin().unwrap();
     let err = registry.add(Arc::new(Calculator)).unwrap_err();
     assert!(err.to_string().contains("duplicate tool name"));
+  }
+
+  /// A name the chat API would reject makes *every* request fail, so it is refused at
+  /// registration, where the error can still name the tool.
+  #[test]
+  fn rejects_names_the_api_would_not_accept() {
+    struct Dotted;
+
+    #[async_trait::async_trait]
+    impl Tool for Dotted {
+      fn name(&self) -> &str {
+        "demo.tool"
+      }
+      fn description(&self) -> &str {
+        "A name with a dot in it."
+      }
+      fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
+      }
+      async fn execute(&self, _args_json: &str) -> crate::Result<String> {
+        Ok(String::new())
+      }
+    }
+
+    let mut registry = ToolRegistry::empty();
+    let err = registry.add(Arc::new(Dotted)).unwrap_err();
+    assert!(err.to_string().contains("invalid tool name"), "got: {err}");
+    assert!(
+      err.to_string().contains("`demo.tool`"),
+      "the error names the tool: {err}"
+    );
+    assert!(registry.is_empty(), "nothing was registered");
+  }
+
+  /// `with_mcp_over` promises that one bad entry does not take the rest with it — a tool
+  /// the registry refuses must be skipped, not raised.
+  #[test]
+  fn a_tool_the_registry_refuses_is_skipped_not_raised() {
+    struct Bad {
+      name: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for Bad {
+      fn name(&self) -> &str {
+        self.name
+      }
+      fn description(&self) -> &str {
+        "Whether it is registered is the point."
+      }
+      fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
+      }
+      async fn execute(&self, _args_json: &str) -> crate::Result<String> {
+        Ok(String::new())
+      }
+    }
+
+    let mut registry = ToolRegistry::empty();
+    registry.add_skipping(vec![
+      Arc::new(Bad { name: "not a name" }) as Arc<dyn Tool>,
+      Arc::new(Calculator) as Arc<dyn Tool>,
+      Arc::new(Calculator) as Arc<dyn Tool>,
+    ]);
+    assert_eq!(registry.len(), 1, "only the valid, first `calculator`");
+    assert!(registry.contains(calculator::NAME));
   }
 
   #[tokio::test]

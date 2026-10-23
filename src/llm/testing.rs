@@ -62,7 +62,7 @@ impl ScriptedBackend {
 
 #[async_trait::async_trait]
 impl ChatBackend for ScriptedBackend {
-  async fn create(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+  async fn create(&self, request: ChatRequest) -> crate::Result<ChatResponse> {
     self.record(&request);
     let reply = self
       .replies
@@ -73,7 +73,7 @@ impl ChatBackend for ScriptedBackend {
     parse_response(reply)
   }
 
-  async fn create_stream(&self, request: ChatRequest) -> anyhow::Result<ChatChunkStream> {
+  async fn create_stream(&self, request: ChatRequest) -> crate::Result<ChatChunkStream> {
     self.record(&request);
     let chunks = self
       .streams

@@ -158,7 +158,7 @@ impl MemoryStore {
     path: impl AsRef<Path>,
     embedder: Arc<dyn Embedder>,
     scope: impl Into<String>,
-  ) -> anyhow::Result<Self> {
+  ) -> crate::Result<Self> {
     Ok(Self::new(VectorStore::open(path, embedder)?, scope))
   }
 
@@ -178,7 +178,7 @@ impl MemoryStore {
   /// transaction as the change — so a write through this handle, through another handle
   /// on the file, or by another process all move it, and a write to some *other* scope or
   /// collection in the same file does not.
-  pub async fn revision(&self) -> anyhow::Result<i64> {
+  pub async fn revision(&self) -> crate::Result<i64> {
     self.store.version(&self.collection).await
   }
 
@@ -189,17 +189,19 @@ impl MemoryStore {
   ///
   /// When the fact is blank, longer than [`MAX_FACT_CHARS`], looks like a credential, or
   /// the scope already holds [`MAX_MEMORIES`] — each with a message the model can act on.
-  pub async fn remember(&self, fact: &str) -> anyhow::Result<Remembered> {
+  pub async fn remember(&self, fact: &str) -> crate::Result<Remembered> {
     let fact = normalize(fact);
-    anyhow::ensure!(!fact.is_empty(), "the fact is empty");
+    crate::error::ensure!(!fact.is_empty(), invalid_input, "the fact is empty");
     let chars = fact.chars().count();
-    anyhow::ensure!(
+    crate::error::ensure!(
       chars <= MAX_FACT_CHARS,
+      invalid_input,
       "the fact is {chars} characters; keep it to one short fact of at most \
        {MAX_FACT_CHARS}"
     );
     if let Some(kind) = looks_like_a_secret(&fact) {
-      anyhow::bail!(
+      crate::error::bail!(
+        invalid_input,
         "this looks like {kind}; memories are stored as plain text, so it was not saved"
       );
     }
@@ -227,13 +229,16 @@ impl MemoryStore {
         Ok(Remembered::Existing(document.into()))
       }
       Inserted::Full(count) => {
-        anyhow::bail!("memory is full ({count} facts); forget something outdated first")
+        crate::error::bail!(
+          storage,
+          "memory is full ({count} facts); forget something outdated first"
+        )
       }
     }
   }
 
   /// Delete memory `id`, returning it; `None` when this scope has no such memory.
-  pub async fn forget(&self, id: i64) -> anyhow::Result<Option<Memory>> {
+  pub async fn forget(&self, id: i64) -> crate::Result<Option<Memory>> {
     Ok(
       self
         .store
@@ -254,7 +259,7 @@ impl MemoryStore {
   /// `expected` matches when, ignoring case and runs of whitespace, it is the whole fact,
   /// or a quote of at least [`MIN_QUOTE_CHARS`] characters from inside it. (A shorter
   /// fragment would match too many different facts to say anything.)
-  pub async fn forget_checked(&self, id: i64, expected: &str) -> anyhow::Result<Forgotten> {
+  pub async fn forget_checked(&self, id: i64, expected: &str) -> crate::Result<Forgotten> {
     let expected = expected.to_owned();
     Ok(
       match self
@@ -273,7 +278,7 @@ impl MemoryStore {
 
   /// How many memories in this scope were embedded with a model other than the current
   /// one, and so cannot be found by [`Self::recall`] until [`Self::reindex_stale`] runs.
-  pub async fn stale_count(&self) -> anyhow::Result<usize> {
+  pub async fn stale_count(&self) -> crate::Result<usize> {
     self.store.stale_count(&self.collection).await
   }
 
@@ -281,13 +286,13 @@ impl MemoryStore {
   /// recallable again. Their numbers are kept, so anything referring to one still works.
   ///
   /// Returns how many were re-embedded — 0, cheaply, when there is nothing to do.
-  pub async fn reindex_stale(&self) -> anyhow::Result<usize> {
+  pub async fn reindex_stale(&self) -> crate::Result<usize> {
     self.store.reindex(&self.collection).await
   }
 
   /// How many memories this scope holds, whatever model embedded them. Cheap: a count,
   /// not a listing.
-  pub async fn count(&self) -> anyhow::Result<usize> {
+  pub async fn count(&self) -> crate::Result<usize> {
     self.store.count(&self.collection).await
   }
 
@@ -297,7 +302,7 @@ impl MemoryStore {
     query: &str,
     limit: usize,
     min_similarity: f32,
-  ) -> anyhow::Result<Vec<(Memory, f32)>> {
+  ) -> crate::Result<Vec<(Memory, f32)>> {
     Ok(
       self
         .store
@@ -310,7 +315,7 @@ impl MemoryStore {
   }
 
   /// Every memory in this scope, oldest first.
-  pub async fn list(&self) -> anyhow::Result<Vec<Memory>> {
+  pub async fn list(&self) -> crate::Result<Vec<Memory>> {
     Ok(
       self
         .store

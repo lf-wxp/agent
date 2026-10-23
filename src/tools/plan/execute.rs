@@ -1,7 +1,8 @@
-use anyhow::Context;
-
-use crate::tools::plan::{
-  MAX_EXPLANATION_CHARS, MAX_STEP_CHARS, MAX_STEPS, PlanStep, StepStatus, UpdatePlanArgs,
+use crate::{
+  error::ResultExt,
+  tools::plan::{
+    MAX_EXPLANATION_CHARS, MAX_STEP_CHARS, MAX_STEPS, PlanStep, StepStatus, UpdatePlanArgs,
+  },
 };
 
 /// Validate the plan and render it as a checklist.
@@ -12,17 +13,19 @@ use crate::tools::plan::{
 /// on" is what makes the plan useful to read, and two of them means it says nothing.
 /// Too long is refused rather than cut, because the model decides what a step says and a
 /// silently clipped one may no longer say it.
-pub fn run(args_json: &str) -> anyhow::Result<String> {
-  let UpdatePlanArgs { plan, explanation } =
-    serde_json::from_str(args_json).context("invalid update_plan arguments")?;
+pub fn run(args_json: &str) -> crate::Result<String> {
+  let UpdatePlanArgs { plan, explanation } = serde_json::from_str(args_json)
+    .wrap_err(crate::Error::tool, "invalid update_plan arguments")?;
 
-  anyhow::ensure!(
+  crate::error::ensure!(
     plan.len() <= MAX_STEPS,
+    tool,
     "the plan has {} steps; keep it to at most {MAX_STEPS} by merging small ones",
     plan.len()
   );
   if let Some(position) = plan.iter().position(|step| step.step.trim().is_empty()) {
-    anyhow::bail!(
+    crate::error::bail!(
+      tool,
       "step {} is blank; every step needs a description",
       position + 1
     );
@@ -32,7 +35,8 @@ pub fn run(args_json: &str) -> anyhow::Result<String> {
     .enumerate()
     .find(|(_, step)| step.step.trim().chars().count() > MAX_STEP_CHARS)
   {
-    anyhow::bail!(
+    crate::error::bail!(
+      tool,
       "step {} is {} characters; keep each step to at most {MAX_STEP_CHARS} and move the \
        detail into your reply",
       position + 1,
@@ -42,7 +46,8 @@ pub fn run(args_json: &str) -> anyhow::Result<String> {
   if let Some(note) = &explanation
     && note.trim().chars().count() > MAX_EXPLANATION_CHARS
   {
-    anyhow::bail!(
+    crate::error::bail!(
+      tool,
       "the explanation is {} characters; keep it to at most {MAX_EXPLANATION_CHARS}",
       note.trim().chars().count()
     );
@@ -52,8 +57,9 @@ pub fn run(args_json: &str) -> anyhow::Result<String> {
     .filter(|step| step.status == StepStatus::InProgress)
     .map(|step| step.step.trim())
     .collect();
-  anyhow::ensure!(
+  crate::error::ensure!(
     in_progress.len() <= 1,
+    tool,
     "{} steps are in_progress ({}); keep exactly one in_progress and mark the others \
      pending or completed",
     in_progress.len(),
@@ -99,7 +105,7 @@ mod tests {
 
   use super::*;
 
-  fn run_json(args: serde_json::Value) -> anyhow::Result<String> {
+  fn run_json(args: serde_json::Value) -> crate::Result<String> {
     run(&args.to_string())
   }
 

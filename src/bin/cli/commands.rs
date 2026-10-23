@@ -206,7 +206,7 @@ pub enum Reindexed {
   /// This many memories were re-embedded.
   Done(usize),
   /// The embedder or the store failed; the memories are as they were.
-  Failed(anyhow::Error),
+  Failed(agent::Error),
   /// `timeout` ran out first. `remaining` is how many still need re-embedding, `None` if
   /// that could not be found out either.
   ///
@@ -730,7 +730,7 @@ mod test_embedders {
     fn model(&self) -> &str {
       self.0
     }
-    async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+    async fn embed(&self, texts: &[String]) -> agent::Result<Vec<Vec<f32>>> {
       Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
     }
   }
@@ -743,8 +743,8 @@ mod test_embedders {
     fn model(&self) -> &str {
       self.0
     }
-    async fn embed(&self, _texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
-      anyhow::bail!("the embedding endpoint is down")
+    async fn embed(&self, _texts: &[String]) -> agent::Result<Vec<Vec<f32>>> {
+      Err(agent::error::ProviderError::transient("the embedding endpoint is down").into())
     }
   }
 
@@ -756,7 +756,7 @@ mod test_embedders {
     fn model(&self) -> &str {
       self.0
     }
-    async fn embed(&self, _texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+    async fn embed(&self, _texts: &[String]) -> agent::Result<Vec<Vec<f32>>> {
       std::future::pending().await
     }
   }

@@ -26,27 +26,26 @@ anyhow = "1.0.104"
 async-openai = { version = "0.42.2", features = ["byot", "chat-completion", "embedding"] }
 async-stream = "0.3.6"
 async-trait = "0.1.92"
-axum = "0.8.9"
+# The CLI's local web server (`cli` feature). The library itself serves nothing.
+axum = { version = "0.8.9", optional = true }
 backon = "1.6.0"
 base64 = "0.23.1"
 chrono = "0.4.45"
-crossterm = "0.29.0"
+# The CLI's terminal (`cli` feature): cursor shapes and the `reedline` line editor.
+crossterm = { version = "0.29.0", optional = true }
 csv = "1.4.0"
 dotenvy = "0.15.7"
 futures = "0.3.34"
-reedline = "0.52.1"
+reedline = { version = "0.52.1", optional = true }
 regex = "1.13.1"
 reqwest = { version = "0.13.5", features = ["json"] }
-rmcp = { version = "3.5.1", features = [
+# The MCP *client* (`mcp` feature): what `tools::mcp` needs to spawn or reach a server
+# and call its tools. The server side the examples run lives in `[dev-dependencies]`, so
+# a library build never compiles it.
+rmcp = { version = "3.5.1", optional = true, features = [
   "client",
-  "server",
-  "macros",
   "transport-child-process",
-  "transport-io",
   "transport-streamable-http-client-reqwest",
-  # Server side of Streamable HTTP: only the `mcp_http_*` examples need it, but Cargo
-  # features are per-package rather than per-target, so it is enabled here.
-  "transport-streamable-http-server",
 ] }
 schemars = "1.2.3"
 # The persistent vector store (`knowledge_base::store`) and long-term memory (`memory`),
@@ -58,24 +57,23 @@ schemars = "1.2.3"
 rusqlite = { version = "0.40.2", features = ["bundled"], optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-shared = { path = "crates/shared" }
+# Wire types shared with the Web UI (`cli` feature); the library does not use them.
+shared = { path = "crates/shared", optional = true }
+# `agent::Error` (see `src/error.rs`). Already in the tree through `async-openai`.
+thiserror = "2.0.21"
 tiktoken-rs = "0.12.1"
 tokio = { version = "1.53.3", features = [
   "fs",
   "io-util",
   "macros",
-  "net",
   # `run_command` spawns a shell child process.
   "process",
   "rt-multi-thread",
-  # `Ctrl-C` at an approval prompt has to wind the turn down rather than take it with
-  # the process — see `spawn_interrupt_handler` in `src/bin/cli/main.rs`.
-  "signal",
   "sync",
   "time",
 ] }
 tokio-util = "0.7.20"
-tower-http = { version = "0.7.1", features = ["cors", "fs", "trace"] }
+tower-http = { version = "0.7.1", features = ["cors", "fs", "trace"], optional = true }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 # OpenTelemetry export (`--features otel`). Optional because it is a sizeable dependency
@@ -93,19 +91,62 @@ opentelemetry-otlp = { version = "0.33.1", default-features = false, features = 
 tracing-opentelemetry = { version = "0.34.0", optional = true }
 uuid = { version = "1.28.0", features = ["v4"] }
 walkdir = "2.5.0"
-zip = "9.0"
+# The `unzip_file` tool (`zip` feature).
+zip = { version = "9.0", optional = true }
 
 # `run_command` signals its child's whole process group, which std/tokio do not expose.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.191"
 
+# Only for tests and examples. Resolver 2 does not unify these features into a normal
+# build, so none of this reaches a library consumer.
+[dev-dependencies]
+# Stub HTTP servers in `tests/`, and the `mcp_http_*` examples' server.
+axum = "0.8.9"
+# The MCP *server* side, for the `mcp_*` examples' demo server (`examples/shared`).
+rmcp = { version = "3.5.1", features = [
+  "client",
+  "macros",
+  "server",
+  "transport-child-process",
+  "transport-io",
+  "transport-streamable-http-client-reqwest",
+  "transport-streamable-http-server",
+] }
+# Tests and examples bind local listeners for their stub servers; `examples/rag.rs` stops
+# on `Ctrl-C`.
+tokio = { version = "1.53.3", features = ["net", "signal"] }
+# `examples/file_tools.rs` writes the archive it then asks the agent to unzip.
+zip = "9.0"
+
 [features]
-default = ["sqlite"]
+# Everything on: `cargo build` builds the CLI exactly as before. A library consumer that
+# only wants the agent loop opts out with `default-features = false` and picks what it
+# needs; see "Cargo features" in the README.
+default = ["cli", "mcp", "sqlite", "zip"]
+# The `cli` binary: terminal REPL, local web server and the wire types it shares with the
+# Web UI. It loads MCP servers and offers `--memory`, so it needs those two as well.
+cli = [
+  "dep:axum",
+  "dep:crossterm",
+  "dep:reedline",
+  "dep:shared",
+  "dep:tower-http",
+  "mcp",
+  "sqlite",
+  "tokio/net",
+  # `Ctrl-C` at an approval prompt has to wind the turn down rather than take it with
+  # the process — see `spawn_interrupt_handler` in `src/bin/cli/main.rs`.
+  "tokio/signal",
+]
+# MCP servers as tool providers: `tools::mcp`, `ToolRegistry::with_mcp`,
+# `callback::mcp_guard`.
+mcp = ["dep:rmcp"]
 # The persistent vector store and long-term memory (`knowledge_base::store`, `memory`,
-# `tools::retrieve`). On by default because the `cli` binary and the `rag` example build
-# on it; off means the crate has no SQLite dependency at all, and those two targets are
-# not built.
+# `tools::retrieve`). Off means the crate has no SQLite dependency at all.
 sqlite = ["dep:rusqlite"]
+# The `unzip_file` tool. Off leaves it out of `ToolRegistry::builtin` and `select`.
+zip = ["dep:zip"]
 # Export spans over OTLP/HTTP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set; see
 # `telemetry`'s module docs.
 otel = [
@@ -115,17 +156,45 @@ otel = [
   "dep:tracing-opentelemetry",
 ]
 
-# The `cli` binary needs the vector store; so does the `rag` example. Cargo's
-# `required-features` is what keeps `--no-default-features` a working build rather than a
-# pile of unresolved imports.
+# Targets that need an optional part of the crate. `required-features` is what keeps
+# `--no-default-features` a working build (Cargo skips these) rather than a pile of
+# unresolved imports.
 [[bin]]
 name = "cli"
 path = "src/bin/cli/main.rs"
-required-features = ["sqlite"]
+required-features = ["cli"]
+
+# The benchmark's tool set is fixed, `unzip_file` included: GAIA attachments can be
+# archives, and a tool set that silently shrank with a feature flag would make two runs'
+# scores incomparable.
+[[bin]]
+name = "gaia"
+path = "src/bin/gaia.rs"
+required-features = ["zip"]
 
 [[example]]
 name = "rag"
 required-features = ["sqlite"]
+
+[[example]]
+name = "file_tools"
+required-features = ["zip"]
+
+[[example]]
+name = "mcp_agent"
+required-features = ["mcp"]
+
+[[example]]
+name = "mcp_config"
+required-features = ["mcp"]
+
+[[example]]
+name = "mcp_http_agent"
+required-features = ["mcp"]
+
+[[example]]
+name = "mcp_inspect"
+required-features = ["mcp"]
 
 [profile.release]
 codegen-units = 1

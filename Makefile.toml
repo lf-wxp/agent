@@ -95,6 +95,29 @@ command = "cargo"
 # and CI runs them.
 args = ["test", "--all-features"]
 
+# `--all-features` alone never notices a `cfg` that only compiles because some other
+# feature happens to be on, so each optional part is linted on its own, plus none at all,
+# and the tests that only exist without a feature are run. Same list as CI's `features`
+# job; keep both in step with `[features]` in Cargo.toml.
+#
+# The second command is what makes the first one mean anything: `--all-targets` pulls in
+# the dev-dependencies, whose own features (`tokio/net`, the full `rmcp`, `zip`, `axum`)
+# unify into the build, so a library file using one of them without a `cfg` still
+# compiles. `--lib --bins` leaves them out, the way a consumer builds it.
+[tasks.check-features]
+description = "Lint with no features and with each feature alone; test with none"
+category = "CI"
+script_runner = "@shell"
+script = '''
+set -e
+for features in "" cli mcp otel sqlite zip; do
+  echo "== --no-default-features --features '${features}' =="
+  cargo clippy --all-targets --no-default-features --features "${features}" -- -D warnings
+  cargo check --lib --bins --no-default-features --features "${features}"
+done
+cargo test --no-default-features
+'''
+
 [tasks.doc]
 description = "Build the API docs (private items included, see .cargo/config.toml)"
 category = "Development"
@@ -216,13 +239,13 @@ rm -rf "${WEB_UI_DIR}/dist"
 # linting, native before wasm (the wasm crates pull a second dependency tree and a
 # second target directory), tests last.
 [tasks.ci]
-description = "Everything a PR must pass: fmt, clippy (native + wasm), tests"
+description = "Everything a PR must pass: fmt, clippy (native + wasm), feature combinations, tests"
 category = "CI"
-dependencies = ["fmt-check", "clippy", "clippy-wasm", "test"]
+dependencies = ["fmt-check", "clippy", "clippy-wasm", "test", "check-features"]
 
 # Same coverage as `ci`, but formats instead of complaining about formatting — the
 # version to run mid-change rather than before pushing.
 [tasks.dev]
-description = "Local loop: format, then lint (native + wasm) and test"
+description = "Local loop: format, then lint (native + wasm), test and check feature combinations"
 category = "Development"
-dependencies = ["fmt", "clippy", "clippy-wasm", "test"]
+dependencies = ["fmt", "clippy", "clippy-wasm", "test", "check-features"]

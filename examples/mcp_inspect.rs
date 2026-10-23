@@ -23,12 +23,8 @@ use agent::{
   tools::{ToolRegistry, mcp::McpConnection},
 };
 use anyhow::Context;
-use async_openai::types::chat::ChatCompletionTools;
 use serde_json::Value;
 use tokio::process::Command;
-
-/// The chat completions API rejects function names longer than this.
-const MAX_FUNCTION_NAME_CHARS: usize = 64;
 
 /// Environment variable holding the bearer token for HTTP servers.
 const ENV_BEARER_TOKEN: &str = "MCP_BEARER_TOKEN";
@@ -47,16 +43,11 @@ async fn main() -> anyhow::Result<()> {
 
   println!("\ndiscovered {} tool(s)\n", registry.len());
   for definition in registry.definitions() {
-    let ChatCompletionTools::Function(tool) = definition else {
-      println!("  (non-function tool, skipped)");
-      continue;
-    };
-
-    println!("  - {}", tool.function.name);
-    if let Some(description) = &tool.function.description {
-      println!("    {}", first_line(description));
+    println!("  - {}", definition.name);
+    if !definition.description.is_empty() {
+      println!("    {}", first_line(&definition.description));
     }
-    for warning in warnings(&tool.function.name, tool.function.parameters.as_ref()) {
+    for warning in warnings(&definition.parameters) {
       println!("    ! {warning}");
     }
   }
@@ -78,29 +69,25 @@ async fn connect() -> anyhow::Result<McpConnection> {
 
   if first == "--url" {
     let url = args.next().context("--url needs a URI")?;
-    return McpConnection::connect("probe", &url, &headers()).await;
+    return Ok(McpConnection::connect("probe", &url, &headers()).await?);
   }
 
   let mut command = Command::new(first);
   command.args(args);
-  McpConnection::spawn("probe", command).await
+  Ok(McpConnection::spawn("probe", command).await?)
 }
 
-/// Report traits that make a tool risky to advertise as an OpenAI function.
-fn warnings(name: &str, parameters: Option<&Value>) -> Vec<String> {
+/// Report traits that make a tool's schema risky to advertise as an OpenAI function.
+///
+/// Names need no check here: the client sanitizes them to what the API accepts, and the
+/// registry rejects anything else when the tool is added.
+fn warnings(parameters: &Value) -> Vec<String> {
   let mut warnings = Vec::new();
 
-  let length = name.chars().count();
-  if length > MAX_FUNCTION_NAME_CHARS {
-    warnings.push(format!(
-      "name is {length} chars, over the {MAX_FUNCTION_NAME_CHARS} char limit"
-    ));
-  }
-
-  let Some(parameters) = parameters else {
+  if !parameters.is_object() {
     warnings.push("no parameter schema".to_owned());
     return warnings;
-  };
+  }
 
   // `$ref` / `$defs` are legal JSON Schema and common in MCP, but several
   // OpenAI-compatible endpoints reject them inside `function.parameters`.

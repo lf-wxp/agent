@@ -14,7 +14,7 @@ use std::{
 };
 
 use agent::{
-  Agent, Cancelled,
+  Agent,
   agent::{ContentItem, Conversation, ToolResultStatus},
   llm::provider::Provider,
   tools::{Tool, ToolRegistry},
@@ -113,7 +113,7 @@ impl Tool for SlowTool {
     json!({ "type": "object", "properties": {} })
   }
 
-  async fn execute(&self, _args_json: &str) -> anyhow::Result<String> {
+  async fn execute(&self, _args_json: &str) -> agent::Result<String> {
     self.started.fetch_add(1, Ordering::SeqCst);
     tokio::time::sleep(Duration::from_secs(60)).await;
     self.finished.fetch_add(1, Ordering::SeqCst);
@@ -165,9 +165,9 @@ async fn cancelling_abandons_a_model_request_in_flight() {
 
   assert!(started.elapsed() < Duration::from_secs(10));
   assert_eq!(requests.load(Ordering::SeqCst), 1, "the request was sent");
-  let cancelled = err
-    .downcast_ref::<Cancelled>()
-    .expect("a `Cancelled` error");
+  let agent::Error::Cancelled(cancelled) = err else {
+    panic!("expected a `Cancelled` error, got {err:?}");
+  };
   assert_eq!(cancelled.context.events.len(), 1, "only the user's turn");
 }
 
@@ -218,9 +218,9 @@ async fn cancelling_cuts_a_running_tool_short_and_keeps_the_round() {
     "no second model request after the cancellation"
   );
 
-  let cancelled = err
-    .downcast_ref::<Cancelled>()
-    .expect("a `Cancelled` error");
+  let agent::Error::Cancelled(cancelled) = err else {
+    panic!("expected a `Cancelled` error, got {err:?}");
+  };
   let items: Vec<&ContentItem> = cancelled
     .context
     .events

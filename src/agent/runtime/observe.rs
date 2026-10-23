@@ -14,7 +14,7 @@ use std::{
 use futures::Stream;
 use tracing::{Instrument, Span, field::Empty};
 
-use super::{Agent, AgentOutcome, AgentStreamEvent, Cancelled, StructuredAgentResult};
+use super::{Agent, AgentOutcome, AgentStreamEvent, StructuredAgentResult};
 use crate::{
   agent::{
     ContentItem, ExecutionContext, SuspendedToolCall, TokenUsage, ToolResultStatus, usage::Ledger,
@@ -75,10 +75,7 @@ impl RunScope {
   }
 
   /// Close out a plain run's result.
-  pub(super) fn finish(
-    &self,
-    result: anyhow::Result<AgentOutcome>,
-  ) -> anyhow::Result<AgentOutcome> {
+  pub(super) fn finish(&self, result: crate::Result<AgentOutcome>) -> crate::Result<AgentOutcome> {
     match result {
       Ok(AgentOutcome::Done(mut done)) => {
         self.settle(&mut done.context, "done");
@@ -95,8 +92,8 @@ impl RunScope {
   /// Close out a structured run's result.
   pub(super) fn finish_structured<T>(
     &self,
-    result: anyhow::Result<StructuredAgentResult<T>>,
-  ) -> anyhow::Result<StructuredAgentResult<T>> {
+    result: crate::Result<StructuredAgentResult<T>>,
+  ) -> crate::Result<StructuredAgentResult<T>> {
     match result {
       Ok(mut done) => {
         self.settle(&mut done.context, "done");
@@ -111,9 +108,9 @@ impl RunScope {
   pub(super) fn wrap_stream<'a, S>(
     self,
     inner: S,
-  ) -> impl Stream<Item = anyhow::Result<AgentStreamEvent>> + 'a
+  ) -> impl Stream<Item = crate::Result<AgentStreamEvent>> + 'a
   where
-    S: Stream<Item = anyhow::Result<AgentStreamEvent>> + 'a,
+    S: Stream<Item = crate::Result<AgentStreamEvent>> + 'a,
   {
     ScopedStream {
       inner: Box::pin(inner),
@@ -123,8 +120,8 @@ impl RunScope {
 
   fn settle_event(
     &self,
-    event: anyhow::Result<AgentStreamEvent>,
-  ) -> anyhow::Result<AgentStreamEvent> {
+    event: crate::Result<AgentStreamEvent>,
+  ) -> crate::Result<AgentStreamEvent> {
     match event {
       Ok(AgentStreamEvent::Done {
         output,
@@ -147,10 +144,10 @@ impl RunScope {
     }
   }
 
-  /// A failed run still settles when it carries its transcript ([`Cancelled`]), so a
+  /// A failed run still settles when it carries its transcript ([`crate::Cancelled`]), so a
   /// caller persisting a cancelled turn persists what it cost too.
-  fn fail(&self, mut err: anyhow::Error) -> anyhow::Error {
-    if let Some(cancelled) = err.downcast_mut::<Cancelled>() {
+  fn fail(&self, mut err: crate::Error) -> crate::Error {
+    if let crate::Error::Cancelled(cancelled) = &mut err {
       self.settle(&mut cancelled.context, "cancelled");
     } else {
       self.span.record("agent.outcome", "error");
@@ -189,9 +186,9 @@ struct ScopedStream<S> {
 
 impl<S> Stream for ScopedStream<S>
 where
-  S: Stream<Item = anyhow::Result<AgentStreamEvent>>,
+  S: Stream<Item = crate::Result<AgentStreamEvent>>,
 {
-  type Item = anyhow::Result<AgentStreamEvent>;
+  type Item = crate::Result<AgentStreamEvent>;
 
   fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
     // Both fields are `Unpin` (the inner stream is boxed), so the wrapper is too.

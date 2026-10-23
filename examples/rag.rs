@@ -341,7 +341,7 @@ mod tests {
     fn model(&self) -> &str {
       "flat"
     }
-    async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+    async fn embed(&self, texts: &[String]) -> agent::Result<Vec<Vec<f32>>> {
       Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
     }
   }

@@ -92,7 +92,7 @@ pub async fn vector_search(
   query: &str,
   chunks: &[String],
   top_k: usize,
-) -> anyhow::Result<Vec<SearchHit>> {
+) -> crate::Result<Vec<SearchHit>> {
   if chunks.is_empty() || top_k == 0 {
     return Ok(Vec::new());
   }
@@ -105,7 +105,7 @@ pub async fn vector_search_with(
   query: &str,
   chunks: &[String],
   k: usize,
-) -> anyhow::Result<Vec<SearchHit>> {
+) -> crate::Result<Vec<SearchHit>> {
   if chunks.is_empty() || k == 0 {
     return Ok(Vec::new());
   }

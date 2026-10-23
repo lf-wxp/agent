@@ -1161,7 +1161,7 @@ async fn drive_terminal_turn(
   // Already `Pin<Box<..>>`, which is itself a `Stream` — so no `pin_mut!`, and the
   // binding stays something this function can drop. That matters below: the stream owns
   // the turn's lock guard, so dropping it is what releases the session.
-  let mut stream: Pin<Box<dyn Stream<Item = anyhow::Result<AgentStreamEvent>> + '_>> = match input {
+  let mut stream: Pin<Box<dyn Stream<Item = agent::Result<AgentStreamEvent>> + '_>> = match input {
     TurnInput::Fresh(text) => Box::pin(run_turn_stream(
       agent, store, turn_lock, session_id, text, channel,
     )),
@@ -1299,7 +1299,7 @@ async fn drive_terminal_turn(
   }
 
   match failure {
-    Some(err) => Err(err),
+    Some(err) => Err(err.into()),
     None => Ok(()),
   }
 }
@@ -1737,7 +1737,7 @@ fn run_turn_stream<'a>(
   session_id: &'a str,
   input: &'a str,
   channel: ApprovalChannel,
-) -> impl Stream<Item = anyhow::Result<AgentStreamEvent>> + 'a {
+) -> impl Stream<Item = agent::Result<AgentStreamEvent>> + 'a {
   stream! {
     let _guard = turn_lock.lock().await;
     let history = store.history(LOCAL_SCOPE, session_id).await;
@@ -1905,7 +1905,7 @@ fn resume_turn_stream<'a>(
   session_id: &'a str,
   channel: ApprovalChannel,
   events: &'a broadcast::Sender<ChatEvent>,
-) -> impl Stream<Item = anyhow::Result<AgentStreamEvent>> + 'a {
+) -> impl Stream<Item = agent::Result<AgentStreamEvent>> + 'a {
   stream! {
     let _guard = turn_lock.lock().await;
     let Some(state) = approvals_store.take(LOCAL_SCOPE, session_id).await else {
@@ -1913,7 +1913,7 @@ fn resume_turn_stream<'a>(
       // rather than ending the stream silently: a front-end waits for *some*
       // terminating event to release the composer it disabled on submit, and an empty
       // stream is not one.
-      yield Err(anyhow::anyhow!(
+      yield Err(agent::Error::invalid_input(
         "没有被暂停的一轮可以继续——可能已被其他界面处理。"
       ));
       return;
@@ -1934,7 +1934,7 @@ fn resume_turn_stream<'a>(
     // interrupted wording either way.
     if state.unresumable().is_some() {
       approvals_store.put(LOCAL_SCOPE, session_id, &state).await;
-      yield Err(anyhow::anyhow!(
+      yield Err(agent::Error::invalid_input(
         "这一轮无法继续：上次运行是在执行工具的过程中被中断的，这些调用是否已生效无法确定，\
          重新执行可能会重复副作用。请用 /discard 放弃该轮（会如实记录为「结果未知」），\
          然后正常继续对话。"
@@ -1944,9 +1944,9 @@ fn resume_turn_stream<'a>(
 
     if let Some(reason) = state.fingerprint.mismatch(&agent.fingerprint()) {
       approvals_store.put(LOCAL_SCOPE, session_id, &state).await;
-      yield Err(anyhow::anyhow!(
+      yield Err(agent::Error::invalid_input(format!(
         "无法继续这一轮：{reason}。该轮仍保留，可在恢复原配置后继续，或用 /discard 放弃。"
-      ));
+      )));
       return;
     }
 

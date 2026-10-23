@@ -26,7 +26,6 @@ use std::{
   sync::LazyLock,
 };
 
-use anyhow::Context;
 use serde::Deserialize;
 
 use crate::{agent::TokenUsage, config};
@@ -57,13 +56,14 @@ impl ModelPrice {
       / TOKENS_PER_PRICE_UNIT
   }
 
-  fn validate(&self, model: &str) -> anyhow::Result<()> {
+  fn validate(&self, model: &str) -> crate::Result<()> {
     let prices = [Some(self.input), self.cached_input, Some(self.output)];
-    anyhow::ensure!(
+    crate::error::ensure!(
       prices
         .into_iter()
         .flatten()
         .all(|price| price.is_finite() && price >= 0.0),
+      config,
       "the prices for `{model}` must be finite, non-negative numbers"
     );
     Ok(())
@@ -117,12 +117,16 @@ impl PriceTable {
   }
 
   /// Read a price file; see the module docs for the format.
-  pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+  pub fn load(path: impl AsRef<Path>) -> crate::Result<Self> {
+    use crate::{Error, error::ResultExt};
+
     let path = path.as_ref();
-    let text = std::fs::read_to_string(path)
-      .with_context(|| format!("failed to read the price file `{}`", path.display()))?;
-    let table: Self = serde_json::from_str(&text)
-      .with_context(|| format!("`{}` is not a valid price file", path.display()))?;
+    let text = std::fs::read_to_string(path).wrap_err_with(Error::config, || {
+      format!("failed to read the price file `{}`", path.display())
+    })?;
+    let table: Self = serde_json::from_str(&text).wrap_err_with(Error::config, || {
+      format!("`{}` is not a valid price file", path.display())
+    })?;
     for (model, price) in &table.models {
       price.validate(model)?;
     }

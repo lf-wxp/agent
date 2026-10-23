@@ -1,19 +1,17 @@
 use std::{fs, path::Path};
 
-use anyhow::{Context, Ok};
-
-use crate::tools::file_delete::DeleteFileArgs;
+use crate::{error::ResultExt, tools::file_delete::DeleteFileArgs};
 
 /// Removes `file_path`, recursively if it is a directory.
 ///
 /// There is no confirmation step and no trash/undo: this is a permanent, synchronous
 /// removal, matching the "cannot be undone" warning in the tool description.
-pub fn run(args_json: &str) -> anyhow::Result<String> {
-  let DeleteFileArgs { file_path } =
-    serde_json::from_str::<DeleteFileArgs>(args_json).context("invalid file delete arguments")?;
+pub fn run(args_json: &str) -> crate::Result<String> {
+  let DeleteFileArgs { file_path } = serde_json::from_str::<DeleteFileArgs>(args_json)
+    .wrap_err(crate::Error::tool, "invalid file delete arguments")?;
   let path = Path::new(&file_path);
   if !path.exists() {
-    anyhow::bail!("Path not found: {}", path.display());
+    crate::error::bail!(tool, "Path not found: {}", path.display());
   }
 
   if path.is_dir() {

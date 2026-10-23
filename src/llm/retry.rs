@@ -6,58 +6,28 @@
 //! budget ([`crate::config::max_retries`]) and backoff curve live in one place instead of
 //! being copied (and drifting) at each call site.
 
-use std::{error::Error, fmt, future::Future};
+use std::future::Future;
 
-use async_openai::error::OpenAIError;
 use backon::{ExponentialBuilder, Retryable};
-use reqwest::StatusCode;
 
-use crate::config;
-
-/// An error a [`crate::llm::backend::ChatBackend`] reports as not worth retrying.
-///
-/// [`is_transient`] can only tell a provider failure it recognizes
-/// ([`OpenAIError`]) from one it does not, and retries the latter. A custom backend knows
-/// better about its own errors — a rejected key, a request its API calls malformed — and
-/// says so by wrapping them with [`Self::wrap`]. Displays exactly like the error it wraps.
-#[derive(Debug)]
-pub struct Permanent(anyhow::Error);
-
-impl Permanent {
-  /// Mark `err` as deterministic: the identical request would fail identically.
-  pub fn wrap(err: impl Into<anyhow::Error>) -> anyhow::Error {
-    anyhow::Error::new(Self(err.into()))
-  }
-}
-
-impl fmt::Display for Permanent {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    fmt::Display::fmt(&self.0, f)
-  }
-}
-
-impl Error for Permanent {
-  /// What the wrapped error was caused by, so a `{:#}` of the chain reads as if the
-  /// marker were not there.
-  fn source(&self) -> Option<&(dyn Error + 'static)> {
-    self.0.source()
-  }
-}
+use crate::{Error, Result, config};
 
 /// Whether `err` is the kind of failure another attempt could plausibly survive.
 ///
-/// Transient by nature: transport errors, rate limiting (429), a request timeout (408),
-/// a conflict (409), and any 5xx. Everything else a provider reports as a 4xx — a
-/// malformed request, a rejected key, a model the tenant cannot reach — is
-/// *deterministic*: the identical request fails identically, so retrying only burns the
-/// attempt budget and delays surfacing the real error. Client-side validation failures
-/// ([`OpenAIError::InvalidArgument`], raised while the request is still being built) are
-/// deterministic for exactly the same reason.
-///
-/// Errors that are not an [`OpenAIError`] are treated as retryable: this predicate only
-/// claims to recognize *provably* deterministic provider failures, and guessing at
-/// anything else would silently turn a recoverable blip into a hard failure. A backend
-/// that knows an error of its own is deterministic wraps it in [`Permanent`].
+/// - [`Error::Provider`]: what the provider error says ([`crate::error::ProviderError::is_retryable`]).
+///   For the provider that ships that is transport errors, rate limiting (429), a request
+///   timeout (408), a conflict (409), any 5xx and a response that did not parse; any
+///   other 4xx — a malformed request, a rejected key, a model the tenant cannot reach —
+///   fails identically on every attempt. A custom backend says which of its own errors
+///   are which with [`crate::error::ProviderError::transient`] /
+///   [`crate::error::ProviderError::permanent`].
+/// - Never: [`Error::InvalidInput`] and [`Error::Config`] (nothing about them changes
+///   between attempts), [`Error::Cancelled`] (the caller asked to stop),
+///   [`Error::TruncatedOutput`] and [`Error::BudgetExhausted`] (a retry spends the same
+///   tokens, or the whole tool budget, to fail the same way).
+/// - Everything else is retried: this predicate only rules out failures it can show are
+///   deterministic, and guessing at the rest would turn a recoverable blip into a hard
+///   failure.
 ///
 /// # Known limitation: `Retry-After`
 ///
@@ -68,20 +38,14 @@ impl Error for Permanent {
 /// parsed error body, discarding the response headers before the error reaches us. Fixing
 /// this needs either an upstream change or a custom transport, so until then
 /// [`with_retry`]'s exponential curve is the whole of the backoff policy.
-pub fn is_transient(err: &anyhow::Error) -> bool {
-  if err.downcast_ref::<Permanent>().is_some() {
-    return false;
-  }
-  match err.downcast_ref::<OpenAIError>() {
-    Some(OpenAIError::InvalidArgument(_)) => false,
-    Some(OpenAIError::ApiError(response)) => {
-      let status = response.status_code;
-      status.is_server_error()
-        || matches!(
-          status,
-          StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT | StatusCode::CONFLICT
-        )
-    }
+pub fn is_transient(err: &Error) -> bool {
+  match err {
+    Error::Provider(provider) => provider.is_retryable(),
+    Error::InvalidInput(_)
+    | Error::Config(_)
+    | Error::Cancelled(_)
+    | Error::TruncatedOutput(_)
+    | Error::BudgetExhausted(_) => false,
     _ => true,
   }
 }
@@ -89,17 +53,14 @@ pub fn is_transient(err: &anyhow::Error) -> bool {
 /// Retry `op` with exponential backoff, skipping failures for which `should_retry` returns
 /// `false`.
 ///
-/// `should_retry` exists for deterministic failures a retry cannot fix — e.g. a
-/// `max_tokens` truncation ([`crate::llm::structured::TruncatedOutput`]) or a tool-round
-/// budget exhausted attempt ([`crate::llm::tool_loop::BudgetExhausted`]) would just repeat
-/// the same outcome at the same cost. Pass `|_| true` when there is nothing like that to
-/// skip.
+/// Pass [`is_transient`] unless the operation has deterministic failures of its own it
+/// knows about; `|_| true` retries everything.
 pub async fn with_retry<T, Fut>(
   op: impl FnMut() -> Fut,
-  should_retry: impl Fn(&anyhow::Error) -> bool,
-) -> anyhow::Result<T>
+  should_retry: impl Fn(&Error) -> bool,
+) -> Result<T>
 where
-  Fut: Future<Output = anyhow::Result<T>>,
+  Fut: Future<Output = Result<T>>,
 {
   op.retry(ExponentialBuilder::default().with_max_times(config::max_retries()))
     .when(should_retry)
@@ -111,7 +72,11 @@ where
 mod tests {
   use std::sync::atomic::{AtomicUsize, Ordering};
 
+  use async_openai::error::OpenAIError;
+  use reqwest::StatusCode;
+
   use super::*;
+  use crate::error::{BudgetExhausted, ProviderError, TruncatedOutput};
 
   #[tokio::test]
   async fn succeeds_without_retrying_on_the_first_try() {
@@ -119,7 +84,7 @@ mod tests {
     let result = with_retry(
       || async {
         attempts.fetch_add(1, Ordering::SeqCst);
-        anyhow::Ok(42)
+        Ok::<_, Error>(42)
       },
       |_| true,
     )
@@ -133,10 +98,10 @@ mod tests {
   #[tokio::test]
   async fn stops_immediately_when_should_retry_returns_false() {
     let attempts = AtomicUsize::new(0);
-    let result: anyhow::Result<()> = with_retry(
+    let result: Result<()> = with_retry(
       || async {
         attempts.fetch_add(1, Ordering::SeqCst);
-        anyhow::bail!("deterministic failure")
+        Err(Error::other("deterministic failure"))
       },
       |_| false,
     )
@@ -146,8 +111,8 @@ mod tests {
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
   }
 
-  fn api_error(status: StatusCode) -> anyhow::Error {
-    anyhow::Error::new(OpenAIError::ApiError(
+  fn api_error(status: StatusCode) -> Error {
+    Error::from(OpenAIError::ApiError(
       async_openai::error::ApiErrorResponse {
         status_code: status,
         api_error: async_openai::error::ApiError {
@@ -195,34 +160,38 @@ mod tests {
 
   #[test]
   fn request_building_failures_are_not_retried() {
-    let err = anyhow::Error::new(OpenAIError::InvalidArgument("bad model".to_owned()));
+    let err = Error::from(OpenAIError::InvalidArgument("bad model".to_owned()));
     assert!(!is_transient(&err));
   }
 
-  /// The predicate only recognizes provider failures it can prove are deterministic;
-  /// anything else keeps its retries rather than being downgraded to a hard failure.
+  /// The predicate only rules out failures it can show are deterministic; anything else
+  /// keeps its retries rather than being downgraded to a hard failure.
   #[test]
   fn unrecognized_errors_keep_their_retries() {
-    assert!(is_transient(&anyhow::anyhow!("some other failure")));
+    assert!(is_transient(&Error::other("some other failure")));
+    assert!(is_transient(&Error::tool("a tool hiccup")));
   }
 
-  /// A backend's own deterministic error opts out of retries, and still reads as itself.
+  /// A custom backend's own deterministic error opts out of retries, and keeps doing so
+  /// under a message added on the way up.
   #[test]
-  fn a_permanent_error_is_not_retried_and_keeps_its_message() {
-    let inner = anyhow::anyhow!("key rejected").context("calling the backend");
-    let err = Permanent::wrap(inner);
-
+  fn a_permanent_provider_error_is_not_retried_even_with_context() {
+    let err = Error::from(ProviderError::permanent("key rejected")).context("calling the backend");
     assert!(!is_transient(&err));
-    assert_eq!(format!("{err}"), "calling the backend");
     assert_eq!(format!("{err:#}"), "calling the backend: key rejected");
+
+    let transient = Error::from(ProviderError::transient("connection reset"));
+    assert!(is_transient(&transient));
   }
 
-  /// Wrapping a provider error hides it from the `OpenAIError` check, so the marker has to
-  /// win on its own — and an unwrapped one next to it still behaves as before.
+  /// What `gaia::solver` used to exclude by hand.
   #[test]
-  fn the_permanent_marker_overrides_an_otherwise_transient_error() {
-    let transient = api_error(StatusCode::SERVICE_UNAVAILABLE);
-    assert!(is_transient(&transient));
-    assert!(!is_transient(&Permanent::wrap(transient)));
+  fn truncation_budget_exhaustion_and_bad_input_are_not_retried() {
+    assert!(!is_transient(&TruncatedOutput { limit: 16 }.into()));
+    assert!(!is_transient(
+      &BudgetExhausted::new(Error::other("x")).into()
+    ));
+    assert!(!is_transient(&Error::invalid_input("empty prompt")));
+    assert!(!is_transient(&Error::config("EMBED_MODEL is not set")));
   }
 }

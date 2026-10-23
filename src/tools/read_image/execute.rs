@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use anyhow::Context;
 use async_openai::types::chat::{
   ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImageArgs,
   ChatCompletionRequestMessageContentPartTextArgs, ChatCompletionRequestUserMessageArgs,
@@ -10,6 +9,7 @@ use async_openai::types::chat::{
 use base64::Engine;
 
 use crate::{
+  error::ResultExt,
   llm::{
     client::{first_choice, request_builder},
     provider::Provider,
@@ -29,16 +29,19 @@ use crate::{
 /// No size cap on the file: a large image inflates ~33% once base64-encoded and is
 /// sent in full, so a very large input can mean a very large (and costly) request —
 /// left to the caller to bound, same as any other tool argument coming from the model.
-pub async fn run(provider: &Provider, args_json: &str) -> anyhow::Result<String> {
+pub async fn run(provider: &Provider, args_json: &str) -> crate::Result<String> {
   let ReadImageArgs {
     file_path,
     query,
     model,
-  } = serde_json::from_str::<ReadImageArgs>(args_json).context("invalid read image arguments")?;
+  } = serde_json::from_str::<ReadImageArgs>(args_json)
+    .wrap_err(crate::Error::tool, "invalid read image arguments")?;
   let path = Path::new(&file_path);
   let bytes = tokio::fs::read(path)
     .await
-    .with_context(|| format!("failed to read `{file_path}`"))?;
+    .wrap_err_with(crate::Error::tool, || {
+      format!("failed to read `{file_path}`")
+    })?;
 
   let mime = match path.extension().and_then(|ext| ext.to_str()) {
     Some("png") => "image/png",
@@ -92,7 +95,7 @@ pub async fn run(provider: &Provider, args_json: &str) -> anyhow::Result<String>
     .message
     .content
     .filter(|content| !content.trim().is_empty())
-    .ok_or_else(|| anyhow::anyhow!("No content in vision response"))
+    .ok_or_else(|| crate::error::ProviderError::transient("No content in vision response").into())
 }
 
 #[cfg(test)]
@@ -114,7 +117,7 @@ mod tests {
 
   #[async_trait::async_trait]
   impl ChatBackend for VisionStub {
-    async fn create(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+    async fn create(&self, request: ChatRequest) -> crate::Result<ChatResponse> {
       self.seen.lock().unwrap().push(request.to_body()?);
       parse_response(json!({
         "id": "x", "object": "chat.completion", "created": 0, "model": "vision",
@@ -123,8 +126,8 @@ mod tests {
       }))
     }
 
-    async fn create_stream(&self, _request: ChatRequest) -> anyhow::Result<ChatChunkStream> {
-      anyhow::bail!("not used")
+    async fn create_stream(&self, _request: ChatRequest) -> crate::Result<ChatChunkStream> {
+      crate::error::bail!(tool, "not used")
     }
   }
 

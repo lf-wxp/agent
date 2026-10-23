@@ -1,20 +1,19 @@
 use std::{fs, path::Path};
 
-use anyhow::{Context, Ok};
-
-use crate::tools::file_read::ReadFileArgs;
+use crate::{error::ResultExt, tools::file_read::ReadFileArgs};
 
 /// Dispatches on the file extension: `.csv` renders as a markdown table, everything
 /// else as line-numbered text.
-pub fn run(args_json: &str) -> anyhow::Result<String> {
+pub fn run(args_json: &str) -> crate::Result<String> {
   let ReadFileArgs {
     file_path,
     end_line,
     start_line,
-  } = serde_json::from_str::<ReadFileArgs>(args_json).context("invalid file read arguments")?;
+  } = serde_json::from_str::<ReadFileArgs>(args_json)
+    .wrap_err(crate::Error::tool, "invalid file read arguments")?;
   let path = Path::new(&file_path);
   if !path.exists() {
-    anyhow::bail!("File not found: {}", file_path);
+    crate::error::bail!(tool, "File not found: {}", file_path);
   }
 
   match path.extension().and_then(|ext| ext.to_str()) {
@@ -33,8 +32,10 @@ fn read_text_with_line_numbers(
   path: &Path,
   start_line: usize,
   end_line: i64,
-) -> anyhow::Result<String> {
-  let content = fs::read_to_string(path)?;
+) -> crate::Result<String> {
+  let content = fs::read_to_string(path).wrap_err_with(crate::Error::tool, || {
+    format!("failed to read `{}`", path.display())
+  })?;
   let lines: Vec<&str> = content.lines().collect();
 
   // `usize` line numbers are 1-based; the slice index below is 0-based.
@@ -64,9 +65,9 @@ fn read_text_with_line_numbers(
 /// Uses the `csv` crate's default dialect (comma-delimited, `"`-quoted) rather than
 /// sniffing the delimiter: `.csv` implies that dialect strongly enough that
 /// autodetection would add complexity for a case that essentially never occurs.
-fn read_csv_as_markdown(path: &Path) -> anyhow::Result<String> {
-  let mut reader = csv::Reader::from_path(path)?;
-  let headers = reader.headers()?.clone();
+fn read_csv_as_markdown(path: &Path) -> crate::Result<String> {
+  let mut reader = csv::Reader::from_path(path).err_as(crate::Error::tool)?;
+  let headers = reader.headers().err_as(crate::Error::tool)?.clone();
 
   let mut table = String::new();
   table.push_str(&format!(
@@ -76,7 +77,7 @@ fn read_csv_as_markdown(path: &Path) -> anyhow::Result<String> {
   table.push_str(&format!("|{}\n", "---|".repeat(headers.len())));
 
   for record in reader.records() {
-    let record = record?;
+    let record = record.err_as(crate::Error::tool)?;
     table.push_str(&format!(
       "| {} |\n",
       record.iter().collect::<Vec<_>>().join(" | ")

@@ -38,3 +38,39 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-features
+
+  # Every optional part has to build on its own, and the crate has to build with none of
+  # them: `--all-features` alone would never notice a `cfg` that only compiles because
+  # some other feature happens to be on. Keep the list in step with `[features]` in
+  # Cargo.toml and `check-features` in Makefile.toml.
+  features:
+    name: Clippy (features ${{ matrix.features || 'none' }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", "cli", "mcp", "otel", "sqlite", "zip"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: features-${{ matrix.features }}
+      - run: cargo clippy --all-targets --no-default-features --features "${{ matrix.features }}" -- -D warnings
+      # `--all-targets` pulls the dev-dependencies in, and their features unify into the
+      # build — `tokio/net`, the full `rmcp`, `zip` and `axum` are all on through them. A
+      # library file using one of those without a `cfg` would then compile here and fail
+      # for every consumer. `--lib --bins` leaves the dev-dependencies out.
+      - run: cargo check --lib --bins --no-default-features --features "${{ matrix.features }}"
+
+  # The tests that only exist without a feature (e.g. "no `unzip_file` without `zip`").
+  test-minimal:
+    name: Test (no default features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --no-default-features

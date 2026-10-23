@@ -1,14 +1,25 @@
 //! Tool registry and the tools themselves.
+//!
+//! A custom tool implements [`Tool`], or — when it is one typed function — is built with
+//! [`FnTool`]. Either way it is described to the model by a provider-neutral
+//! [`ToolDefinition`].
+//!
+//! Two of them are behind Cargo features (see "Cargo features" in the README):
+//! `unzip_file` (`file_upzip`) needs `zip`, MCP servers (`mcp`) need `mcp`. Both are on
+//! by default.
 
 pub mod calculator;
 pub mod file_delete;
 pub mod file_edit;
 pub mod file_list;
 pub mod file_read;
+#[cfg(feature = "zip")]
 pub mod file_upzip;
 pub mod file_write;
+pub mod fn_tool;
 pub mod grep;
 pub(crate) mod macros;
+#[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod plan;
 pub mod read_image;
@@ -20,8 +31,9 @@ pub mod shell;
 pub mod tool;
 pub mod web_search;
 
+pub use fn_tool::FnTool;
 pub use registry::ToolRegistry;
-pub use tool::{Tool, schema_of};
+pub use tool::{Tool, ToolDefinition, schema_of};
 
 /// Test-only helpers shared by the tools' unit tests.
 #[cfg(test)]

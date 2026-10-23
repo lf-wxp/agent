@@ -32,7 +32,7 @@ impl Tool for Calculator {
     definition::parameters()
   }
 
-  async fn execute(&self, args_json: &str) -> anyhow::Result<String> {
+  async fn execute(&self, args_json: &str) -> crate::Result<String> {
     // Pure CPU work: nothing to await, and fast enough not to need spawn_blocking.
     execute::run(args_json)
   }

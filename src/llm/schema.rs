@@ -12,11 +12,10 @@
 //! logic used to be written in two places (and the agent side missed the name sanitize); it is now
 //! unified here to avoid logic drift.
 
-use async_openai::types::chat::{
-  ChatCompletionTool, ChatCompletionTools, FunctionObjectArgs, ResponseFormat,
-  ResponseFormatJsonSchema,
-};
+use async_openai::types::chat::{ResponseFormat, ResponseFormatJsonSchema};
 use serde_json::Value;
+
+use crate::tools::ToolDefinition;
 
 /// The synthetic tool name the model uses to submit the final answer in a structured agent loop.
 ///
@@ -46,9 +45,10 @@ pub fn schema_name<T: ?Sized>() -> String {
 /// `[a-zA-Z0-9_-]` only. A name that violates this reaches this crate from the outside — e.g. a
 /// `response_schema` field on an HTTP request — so it must be rejected here, with a message
 /// naming the actual problem, rather than left to fail as an opaque error from the model API.
-pub fn validate_schema_name(name: &str) -> anyhow::Result<()> {
+pub fn validate_schema_name(name: &str) -> crate::Result<()> {
   if name.is_empty() || name.len() > 64 {
-    anyhow::bail!(
+    crate::error::bail!(
+      invalid_input,
       "schema name must be 1-64 characters long, got {} ({name:?})",
       name.len()
     );
@@ -57,7 +57,10 @@ pub fn validate_schema_name(name: &str) -> anyhow::Result<()> {
     .chars()
     .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
   {
-    anyhow::bail!("schema name must only contain [a-zA-Z0-9_-], got {name:?}");
+    crate::error::bail!(
+      invalid_input,
+      "schema name must only contain [a-zA-Z0-9_-], got {name:?}"
+    );
   }
   Ok(())
 }
@@ -70,11 +73,19 @@ pub fn validate_schema_name(name: &str) -> anyhow::Result<()> {
 ///
 /// # Errors
 ///
-/// Returns `Err` when name / description / parameters cannot be assembled into an API-accepted
-/// definition; this is a programming error, not a runtime condition.
-pub fn final_answer_tool<T: schemars::JsonSchema>() -> anyhow::Result<ChatCompletionTools> {
-  let schema_json = serde_json::to_value(schemars::schema_for!(T))?;
-  final_answer_tool_from_schema(&schema_name::<T>(), schema_json)
+/// Returns `Err` when `T`'s schema cannot be serialized, which is a bug in the type rather
+/// than a runtime condition.
+pub fn final_answer_tool<T: schemars::JsonSchema>() -> crate::Result<ToolDefinition> {
+  use crate::error::ResultExt;
+
+  let schema_json = serde_json::to_value(schemars::schema_for!(T)).wrap_err(
+    crate::Error::invalid_input,
+    "the output type's schema could not be serialized",
+  )?;
+  Ok(final_answer_tool_from_schema(
+    &schema_name::<T>(),
+    schema_json,
+  ))
 }
 
 /// Build the `final_answer` tool from a caller-supplied JSON Schema `Value` rather than a
@@ -85,27 +96,14 @@ pub fn final_answer_tool<T: schemars::JsonSchema>() -> anyhow::Result<ChatComple
 /// `name` is used only in the tool's description (the tool itself is always named
 /// [`FINAL_ANSWER_TOOL_NAME`]); callers that accept it from the outside should validate it with
 /// [`validate_schema_name`] first.
-///
-/// # Errors
-///
-/// Returns `Err` when the description / parameters cannot be assembled into an API-accepted
-/// definition.
-pub fn final_answer_tool_from_schema(
-  name: &str,
-  schema: Value,
-) -> anyhow::Result<ChatCompletionTools> {
-  let function = FunctionObjectArgs::default()
-    .name(FINAL_ANSWER_TOOL_NAME)
-    .description(format!(
+pub fn final_answer_tool_from_schema(name: &str, schema: Value) -> ToolDefinition {
+  ToolDefinition {
+    name: FINAL_ANSWER_TOOL_NAME.to_owned(),
+    description: format!(
       "Return the final answer as a `{name}` object matching the required schema."
-    ))
-    .parameters(schema)
-    .build()
-    .map_err(|e| anyhow::anyhow!("Failed to build `{FINAL_ANSWER_TOOL_NAME}` tool: {e}"))?;
-
-  Ok(ChatCompletionTools::Function(ChatCompletionTool {
-    function,
-  }))
+    ),
+    parameters: schema,
+  }
 }
 
 /// Build the native `json_schema` response format for `T`.
@@ -199,12 +197,13 @@ mod tests {
 
   #[test]
   fn final_answer_tool_is_named_and_describes_the_schema() {
-    let ChatCompletionTools::Function(function) = final_answer_tool::<ActionPlan>().unwrap() else {
-      panic!("expected a function tool");
-    };
-    assert_eq!(function.function.name, FINAL_ANSWER_TOOL_NAME);
-    let description = function.function.description.unwrap_or_default();
-    assert!(description.contains("ActionPlan"), "got: {description}");
+    let tool = final_answer_tool::<ActionPlan>().unwrap();
+    assert_eq!(tool.name, FINAL_ANSWER_TOOL_NAME);
+    assert!(
+      tool.description.contains("ActionPlan"),
+      "got: {}",
+      tool.description
+    );
   }
 
   #[test]
@@ -228,20 +227,10 @@ mod tests {
   #[test]
   fn final_answer_tool_from_schema_uses_the_given_name_and_schema() {
     let schema = serde_json::json!({"type": "object", "properties": {"x": {"type": "integer"}}});
-    let ChatCompletionTools::Function(function) =
-      final_answer_tool_from_schema("Custom", schema.clone()).unwrap()
-    else {
-      panic!("expected a function tool");
-    };
-    assert_eq!(function.function.name, FINAL_ANSWER_TOOL_NAME);
-    assert!(
-      function
-        .function
-        .description
-        .unwrap_or_default()
-        .contains("Custom")
-    );
-    assert_eq!(function.function.parameters, Some(schema));
+    let tool = final_answer_tool_from_schema("Custom", schema.clone());
+    assert_eq!(tool.name, FINAL_ANSWER_TOOL_NAME);
+    assert!(tool.description.contains("Custom"));
+    assert_eq!(tool.parameters, schema);
   }
 
   #[test]

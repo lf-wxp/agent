@@ -11,6 +11,7 @@
 pub mod agent;
 pub mod callback;
 pub mod config;
+pub mod error;
 pub mod gaia;
 pub mod http;
 pub mod knowledge_base;
@@ -24,6 +25,7 @@ pub mod util;
 
 pub use agent::session;
 pub use agent::{
-  Agent, AgentOutcome, AgentResult, AgentRunState, AgentStreamEvent, AgentTool, Cancelled, GiveUp,
+  Agent, AgentOutcome, AgentResult, AgentRunState, AgentStreamEvent, AgentTool, GiveUp,
   ResumedDecision, RunCheckpoint, StopReason, StructuredAgentResult, SuspendedToolCall,
 };
+pub use error::{Cancelled, Error, Result};

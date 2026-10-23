@@ -3,14 +3,12 @@
 //! Streaming has its own loop in [`crate::llm::stream`] (fragments must be reassembled
 //! first), but reuses [`disable_tools`] and [`append_tool_results`] from here.
 
-use std::fmt;
-
 use async_openai::types::chat::{
   ChatChoice, ChatCompletionMessageCustomToolCall, ChatCompletionMessageToolCall,
   ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs,
   ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs,
-  ChatCompletionToolChoiceOption, ChatCompletionTools, CreateChatCompletionRequestArgs,
-  FunctionCall, ResponseFormat, ToolChoiceOptions,
+  ChatCompletionToolChoiceOption, CreateChatCompletionRequestArgs, FunctionCall, ResponseFormat,
+  ToolChoiceOptions,
 };
 use futures::future::join_all;
 
@@ -23,7 +21,7 @@ use crate::{
     retry::{is_transient, with_retry},
     settings::ModelSettings,
   },
-  tools::{ToolRegistry, schedule},
+  tools::{ToolDefinition, ToolRegistry, schedule},
   util::truncate_chars,
 };
 
@@ -48,22 +46,13 @@ pub struct Completion {
   pub reasoning: Option<String>,
 }
 
-/// Marker attached to failures that happened after the tool budget was spent.
+/// A failure that happened after the tool budget was spent; see
+/// [`crate::error::Error::BudgetExhausted`].
 ///
 /// Such a failure is effectively deterministic: a retry replays the whole conversation
-/// and spends the entire budget again before failing the same way. Callers use it to
-/// skip retries (see `gaia::solver`).
-#[derive(Debug)]
-pub struct BudgetExhausted;
-
-impl fmt::Display for BudgetExhausted {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    write!(
-      f,
-      "failed after the tool round budget was spent, so retrying would repeat the full budget"
-    )
-  }
-}
+/// and spends the entire budget again before failing the same way, which is why
+/// [`crate::llm::retry::is_transient`] says no to it.
+pub use crate::error::BudgetExhausted;
 
 /// Drive a completion to a final answer, executing tool calls as the model requests them.
 ///
@@ -93,7 +82,7 @@ pub async fn run(
   registry: &ToolRegistry,
   settings: &ModelSettings,
   response_format: Option<ResponseFormat>,
-) -> anyhow::Result<Completion> {
+) -> crate::Result<Completion> {
   let max_rounds = config::max_tool_rounds();
   let mut round: usize = 0;
   let mut wire = WireMessages::from(messages);
@@ -187,7 +176,7 @@ pub async fn run(
 /// without `tools` is meaningless and rejected by some endpoints.
 pub(crate) fn disable_tools(
   builder: &mut CreateChatCompletionRequestArgs,
-  tools: &[ChatCompletionTools],
+  tools: &[ToolDefinition],
 ) {
   if tools.is_empty() {
     return;
@@ -212,7 +201,7 @@ pub(crate) async fn append_tool_results(
   tool_calls: Vec<ChatCompletionMessageToolCalls>,
   assistant_text: Option<String>,
   reasoning: Option<String>,
-) -> anyhow::Result<()> {
+) -> crate::Result<()> {
   let mut assistant = ChatCompletionRequestAssistantMessageArgs::default();
   assistant.tool_calls(tool_calls.clone());
   // Some models emit prose alongside the tool call; keep it so the context stays coherent.
@@ -511,7 +500,7 @@ mod tests {
     async fn create(
       &self,
       request: crate::llm::backend::ChatRequest,
-    ) -> anyhow::Result<ChatResponse> {
+    ) -> crate::Result<ChatResponse> {
       self.seen.lock().unwrap().push(request.to_body()?);
       let reply = self.replies.lock().unwrap().pop_front().expect("scripted");
       crate::llm::backend::parse_response(reply)
@@ -520,8 +509,8 @@ mod tests {
     async fn create_stream(
       &self,
       _request: crate::llm::backend::ChatRequest,
-    ) -> anyhow::Result<crate::llm::backend::ChatChunkStream> {
-      anyhow::bail!("not used")
+    ) -> crate::Result<crate::llm::backend::ChatChunkStream> {
+      crate::error::bail!(other, "not used")
     }
   }
 

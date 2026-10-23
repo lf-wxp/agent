@@ -61,7 +61,7 @@ impl Embedder for WordEmbedder {
     &self.model
   }
 
-  async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+  async fn embed(&self, texts: &[String]) -> crate::Result<Vec<Vec<f32>>> {
     self.calls.fetch_add(1, Ordering::SeqCst);
     self.texts.fetch_add(texts.len(), Ordering::SeqCst);
     Ok(texts.iter().map(|text| Self::vector(text)).collect())
@@ -102,10 +102,10 @@ impl Embedder for Flaky {
     self.inner.model()
   }
 
-  async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+  async fn embed(&self, texts: &[String]) -> crate::Result<Vec<Vec<f32>>> {
     if self.failing.load(Ordering::SeqCst) {
       self.inner.calls.fetch_add(1, Ordering::SeqCst);
-      anyhow::bail!("the embedding endpoint is down");
+      crate::error::bail!(other, "the embedding endpoint is down");
     }
     self.inner.embed(texts).await
   }

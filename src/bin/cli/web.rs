@@ -540,7 +540,7 @@ pub(crate) async fn drive_turn(state: Arc<WebState>, turn: String, input: TurnIn
   let (approval_tx, mut approval_rx) = mpsc::unbounded_channel::<PendingApproval>();
   let channel = ApprovalChannel::Session(approval_tx);
   // Identical plumbing either way — see `drive_terminal_turn`, which mirrors this.
-  let stream: Pin<Box<dyn Stream<Item = anyhow::Result<AgentStreamEvent>> + Send + '_>> =
+  let stream: Pin<Box<dyn Stream<Item = agent::Result<AgentStreamEvent>> + Send + '_>> =
     match &input {
       TurnInput::Fresh(text) => Box::pin(run_turn_stream(
         &state.agent,

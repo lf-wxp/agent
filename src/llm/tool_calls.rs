@@ -65,17 +65,21 @@ impl ToolCallAccumulator {
   ///
   /// Fails when a call never received an `id` or a name: it cannot be executed, and
   /// dropping it silently would leave the next request with an unanswered tool call.
-  pub fn finish(self) -> anyhow::Result<Vec<ChatCompletionMessageToolCalls>> {
+  pub fn finish(self) -> crate::Result<Vec<ChatCompletionMessageToolCalls>> {
     self
       .calls
       .into_iter()
       .map(|(index, partial)| {
-        let id = partial
-          .id
-          .ok_or_else(|| anyhow::anyhow!("streamed tool call at index {index} has no id"))?;
-        let name = partial
-          .name
-          .ok_or_else(|| anyhow::anyhow!("streamed tool call `{id}` has no function name"))?;
+        let id = partial.id.ok_or_else(|| {
+          crate::error::ProviderError::transient(format!(
+            "streamed tool call at index {index} has no id"
+          ))
+        })?;
+        let name = partial.name.ok_or_else(|| {
+          crate::error::ProviderError::transient(format!(
+            "streamed tool call `{id}` has no function name"
+          ))
+        })?;
         let arguments = if partial.arguments.trim().is_empty() {
           EMPTY_ARGUMENTS.to_owned()
         } else {

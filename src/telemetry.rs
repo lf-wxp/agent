@@ -69,7 +69,7 @@ use tracing_subscriber::{
   layer::SubscriberExt,
 };
 
-use crate::config;
+use crate::{config, error::ResultExt};
 
 /// The longest [`shutdown`] waits for the exporter to hand its last batch over.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -85,7 +85,7 @@ pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// With the `otel` feature this can also fail on a malformed OTLP endpoint; an endpoint
 /// that is well-formed but unreachable is not an error here — exports to it just fail in
 /// the background.
-pub fn init() -> anyhow::Result<Telemetry> {
+pub fn init() -> crate::Result<Telemetry> {
   dotenvy::dotenv().ok();
 
   let console = tracing_subscriber::fmt::layer()
@@ -94,7 +94,10 @@ pub fn init() -> anyhow::Result<Telemetry> {
   let subscriber = tracing_subscriber::registry().with(console);
   #[cfg(feature = "otel")]
   let subscriber = subscriber.with(otel::layer()?);
-  tracing::subscriber::set_global_default(subscriber)?;
+  tracing::subscriber::set_global_default(subscriber).wrap_err(
+    crate::Error::other,
+    "failed to install the tracing subscriber",
+  )?;
 
   Ok(Telemetry { _private: () })
 }
@@ -216,6 +219,7 @@ mod otel {
   use tracing_subscriber::{Layer, filter::LevelFilter, registry::LookupSpan};
 
   use super::SHUTDOWN_TIMEOUT;
+  use crate::error::ResultExt;
 
   /// Kept so [`shutdown`] can flush it; `tracing-opentelemetry` only holds a tracer.
   static PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
@@ -227,7 +231,7 @@ mod otel {
   const DEFAULT_SERVICE_NAME: &str = "agent";
 
   /// The export layer, or `None` when nothing asked for export.
-  pub(super) fn layer<S>() -> anyhow::Result<Option<impl Layer<S>>>
+  pub(super) fn layer<S>() -> crate::Result<Option<impl Layer<S>>>
   where
     S: Subscriber + for<'span> LookupSpan<'span>,
   {
@@ -237,7 +241,11 @@ mod otel {
 
     let exporter = opentelemetry_otlp::SpanExporter::builder()
       .with_http()
-      .build()?;
+      .build()
+      .wrap_err(
+        crate::Error::config,
+        "the OTLP exporter could not be configured",
+      )?;
     let provider = SdkTracerProvider::builder()
       .with_batch_exporter(exporter)
       .with_resource(resource())

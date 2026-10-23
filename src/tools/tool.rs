@@ -1,9 +1,62 @@
-//! The `Tool` abstraction implemented by every tool.
+//! The `Tool` abstraction implemented by every tool, and [`ToolDefinition`], what the
+//! model is told about one.
+//!
+//! Nothing here depends on a provider's wire format: a definition is a name, a
+//! description and a JSON Schema, and turning that into what a given API expects is the
+//! request builder's job (see [`crate::llm::client::request_builder`]). A tool written
+//! against this trait works unchanged whichever [`crate::llm::backend::ChatBackend`] sends
+//! it.
+//!
+//! For a tool that is one typed function, [`crate::tools::FnTool`] implements this trait
+//! from an argument struct and an async closure.
 
 use std::time::Duration;
 
-use async_openai::types::chat::{ChatCompletionTool, ChatCompletionTools, FunctionObjectArgs};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// Longest tool name chat APIs accept.
+pub const MAX_TOOL_NAME_CHARS: usize = 64;
+
+/// What the model is told about a tool, independent of any provider's wire format.
+///
+/// Built by [`Tool::definition`] and kept by [`crate::tools::ToolRegistry`]; converted to
+/// the API's own shape only when a request is assembled.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolDefinition {
+  /// See [`Tool::name`].
+  pub name: String,
+  /// See [`Tool::description`].
+  pub description: String,
+  /// See [`Tool::parameters`].
+  pub parameters: Value,
+}
+
+/// Check `name` against what chat APIs accept for a tool: 1–[`MAX_TOOL_NAME_CHARS`] ASCII
+/// letters, digits, `_` or `-`.
+///
+/// [`crate::tools::ToolRegistry::add`] applies it to every tool, so a bad name fails when
+/// the tool is registered — naming the tool — rather than as an opaque rejection of every
+/// request the agent then sends.
+///
+/// This is the **chat-completions** rule, and the one place this crate's provider-neutral
+/// layer assumes a particular provider: a name the API rejects makes every request
+/// carrying it fail, so it is checked at registration, where the error can still say which
+/// tool is to blame. A backend with a narrower rule is satisfied by any name passing this
+/// one; one with a *wider* rule (dotted or namespaced names, say) is held back, and would
+/// need this check relaxed for its build.
+pub fn validate_tool_name(name: &str) -> crate::Result<()> {
+  crate::error::ensure!(
+    !name.is_empty()
+      && name.len() <= MAX_TOOL_NAME_CHARS
+      && name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+    invalid_input,
+    "invalid tool name `{name}`: use 1-{MAX_TOOL_NAME_CHARS} ASCII letters, digits, `_` or `-`"
+  );
+  Ok(())
+}
 
 /// A tool the model can call.
 ///
@@ -12,13 +65,15 @@ use serde_json::Value;
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
   /// Name used both in the advertised definition and for dispatch; must be unique
-  /// across the registry, otherwise only the first match is ever reached.
+  /// across the registry, otherwise only the first match is ever reached, and pass
+  /// [`validate_tool_name`].
   fn name(&self) -> &str;
 
   /// What the tool does, and when the model should reach for it.
   fn description(&self) -> &str;
 
-  /// JSON Schema for the arguments, used as `function.parameters`.
+  /// JSON Schema for the arguments: an object schema, whose properties are the
+  /// arguments. [`schema_of`] derives one from an argument struct.
   fn parameters(&self) -> Value;
 
   /// Run the tool against the raw JSON arguments produced by the model.
@@ -33,7 +88,7 @@ pub trait Tool: Send + Sync {
   /// speculative generality. Add it back (as a `Vec<Event>` snapshot or similar) if a
   /// concrete tool needs it — e.g. to avoid repeating a lookup already made earlier in
   /// the same turn.
-  async fn execute(&self, args_json: &str) -> anyhow::Result<String>;
+  async fn execute(&self, args_json: &str) -> crate::Result<String>;
 
   /// This tool's own time limit, overriding the caller's default (see
   /// [`execute_with_timeout`]). `None` — the default — means "use the caller's".
@@ -62,21 +117,14 @@ pub trait Tool: Send + Sync {
     false
   }
 
-  /// Render the definition advertised to the model.
-  ///
-  /// Fails only when name / description / parameters are inconsistent with what the API
-  /// accepts, which is a programming error rather than a runtime condition.
-  fn definition(&self) -> anyhow::Result<ChatCompletionTools> {
-    let function = FunctionObjectArgs::default()
-      .name(self.name())
-      .description(self.description())
-      .parameters(self.parameters())
-      .build()
-      .map_err(|e| anyhow::anyhow!("Failed to build tool definition for {}: {e}", self.name()))?;
-
-    Ok(ChatCompletionTools::Function(ChatCompletionTool {
-      function,
-    }))
+  /// The definition advertised to the model: [`Self::name`], [`Self::description`] and
+  /// [`Self::parameters`], captured once when the tool is registered.
+  fn definition(&self) -> ToolDefinition {
+    ToolDefinition {
+      name: self.name().to_owned(),
+      description: self.description().to_owned(),
+      parameters: self.parameters(),
+    }
   }
 }
 
@@ -111,17 +159,19 @@ pub async fn execute_with_timeout(
   tool: &dyn Tool,
   args_json: &str,
   default: Duration,
-) -> anyhow::Result<String> {
+) -> crate::Result<String> {
   let limit = tool.timeout().unwrap_or(default);
   match tokio::time::timeout(limit, tool.execute(args_json)).await {
     Ok(result) => result,
-    Err(_) if tool.concurrency_safe() => anyhow::bail!(
+    Err(_) if tool.concurrency_safe() => crate::error::bail!(
+      tool,
       "`{}` did not finish within {}s and was abandoned; try a smaller or more specific \
        request",
       tool.name(),
       limit.as_secs_f64()
     ),
-    Err(_) => anyhow::bail!(
+    Err(_) => crate::error::bail!(
+      tool,
       "`{}` did not finish within {}s and the caller stopped waiting, but it may still be \
        running or may have partly taken effect; check the current state before trying \
        again instead of repeating it",
@@ -151,7 +201,7 @@ mod tests {
     fn parameters(&self) -> Value {
       serde_json::json!({ "type": "object" })
     }
-    async fn execute(&self, _args_json: &str) -> anyhow::Result<String> {
+    async fn execute(&self, _args_json: &str) -> crate::Result<String> {
       tokio::time::sleep(Duration::from_millis(200)).await;
       Ok("woke".to_owned())
     }
@@ -234,10 +284,48 @@ mod tests {
       fn parameters(&self) -> Value {
         serde_json::json!({ "type": "object" })
       }
-      async fn execute(&self, _args_json: &str) -> anyhow::Result<String> {
+      async fn execute(&self, _args_json: &str) -> crate::Result<String> {
         Ok(String::new())
       }
     }
     assert!(!Plain.concurrency_safe());
+  }
+
+  #[test]
+  fn the_definition_carries_name_description_and_schema() {
+    let tool = Sleepy {
+      own_limit: None,
+      read_only: true,
+    };
+    assert_eq!(
+      tool.definition(),
+      ToolDefinition {
+        name: "sleepy".to_owned(),
+        description: "sleeps".to_owned(),
+        parameters: serde_json::json!({ "type": "object" }),
+      }
+    );
+  }
+
+  #[test]
+  fn tool_names_are_checked_against_what_apis_accept() {
+    for good in [
+      "calculator",
+      "demo__get-sum",
+      "a",
+      &"x".repeat(MAX_TOOL_NAME_CHARS),
+    ] {
+      assert!(validate_tool_name(good).is_ok(), "`{good}` was rejected");
+    }
+    for bad in [
+      "",
+      "has space",
+      "dotted.name",
+      "日本",
+      &"x".repeat(MAX_TOOL_NAME_CHARS + 1),
+    ] {
+      let err = validate_tool_name(bad).unwrap_err().to_string();
+      assert!(err.contains("invalid tool name"), "`{bad}`: {err}");
+    }
   }
 }

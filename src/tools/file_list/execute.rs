@@ -1,8 +1,6 @@
 use std::{fs, path::Path};
 
-use anyhow::{Context, Ok};
-
-use crate::tools::file_list::ListFilesArgs;
+use crate::{error::ResultExt, tools::file_list::ListFilesArgs};
 
 /// Lists the immediate children of `path`: directories first, then files, each group
 /// sorted alphabetically. Entries whose name starts with `.` are skipped — dotfiles are
@@ -11,15 +9,15 @@ use crate::tools::file_list::ListFilesArgs;
 ///
 /// Not recursive: the model is expected to call this again on a subdirectory it wants
 /// to go into.
-pub fn run(args_json: &str) -> anyhow::Result<String> {
-  let ListFilesArgs { path } =
-    serde_json::from_str::<ListFilesArgs>(args_json).context("invalid file read arguments")?;
+pub fn run(args_json: &str) -> crate::Result<String> {
+  let ListFilesArgs { path } = serde_json::from_str::<ListFilesArgs>(args_json)
+    .wrap_err(crate::Error::tool, "invalid file read arguments")?;
   let path = Path::new(&path);
   if !path.exists() {
-    anyhow::bail!("Path not found: {}", path.display());
+    crate::error::bail!(tool, "Path not found: {}", path.display());
   }
   if !path.is_dir() {
-    anyhow::bail!("Not a directory: {}", path.display());
+    crate::error::bail!(tool, "Not a directory: {}", path.display());
   }
 
   let mut dirs = Vec::new();

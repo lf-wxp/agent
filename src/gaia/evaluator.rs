@@ -25,7 +25,7 @@ fn is_correct(prediction: &str, answer: &str) -> bool {
 fn to_eval_result(
   problem: GaiaRow,
   model: &str,
-  result: anyhow::Result<Solution>,
+  result: crate::Result<Solution>,
 ) -> GaiaEvalResult {
   match result {
     Ok(Solution {

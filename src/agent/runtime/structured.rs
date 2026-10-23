@@ -25,14 +25,14 @@ use std::collections::HashMap;
 
 use async_openai::types::chat::{
   ChatCompletionMessageToolCalls, ChatCompletionRequestSystemMessageArgs,
-  ChatCompletionToolChoiceOption, ChatCompletionTools, FinishReason, ResponseFormat,
-  ToolChoiceOptions,
+  ChatCompletionToolChoiceOption, FinishReason, ResponseFormat, ToolChoiceOptions,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::{
   config,
+  error::ProviderError,
   llm::{
     backend::ChatResponse,
     client::{WireMessages, first_choice, request_builder},
@@ -42,9 +42,10 @@ use crate::{
       schema_instruction_from_value, strip_code_fence, validate_schema_name,
     },
     settings::DEFAULT_MAX_TOKENS,
-    structured::{StructuredMode, TruncatedOutput},
-    tool_loop::{BudgetExhausted, disable_tools},
+    structured::{StructuredMode, TruncatedOutput, tag_budget},
+    tool_loop::disable_tools,
   },
+  tools::ToolDefinition,
   util::truncate_chars,
 };
 
@@ -71,10 +72,7 @@ impl Agent {
   ///
   /// Both record the full [`Event`] transcript and honor the round budget
   /// ([`StructuredAgentResult::budget_exhausted`]).
-  pub async fn run_structured<T>(
-    &self,
-    user_input: &str,
-  ) -> anyhow::Result<StructuredAgentResult<T>>
+  pub async fn run_structured<T>(&self, user_input: &str) -> crate::Result<StructuredAgentResult<T>>
   where
     T: schemars::JsonSchema + DeserializeOwned,
   {
@@ -111,7 +109,7 @@ impl Agent {
     user_input: &str,
     name: &str,
     schema: Value,
-  ) -> anyhow::Result<StructuredAgentResult<Value>> {
+  ) -> crate::Result<StructuredAgentResult<Value>> {
     validate_schema_name(name)?;
 
     if config::model_supports_tool_choice(&self.model) {
@@ -134,7 +132,7 @@ impl Agent {
   async fn run_structured_via_tool_choice<T>(
     &self,
     user_input: &str,
-  ) -> anyhow::Result<StructuredAgentResult<T>>
+  ) -> crate::Result<StructuredAgentResult<T>>
   where
     T: schemars::JsonSchema + DeserializeOwned,
   {
@@ -150,9 +148,9 @@ impl Agent {
     user_input: &str,
     name: &str,
     schema: Value,
-  ) -> anyhow::Result<StructuredAgentResult<Value>> {
+  ) -> crate::Result<StructuredAgentResult<Value>> {
     self
-      .run_final_answer_loop(user_input, final_answer_tool_from_schema(name, schema)?)
+      .run_final_answer_loop(user_input, final_answer_tool_from_schema(name, schema))
       .await
   }
 
@@ -164,8 +162,8 @@ impl Agent {
   async fn run_final_answer_loop<T: DeserializeOwned>(
     &self,
     user_input: &str,
-    final_answer: ChatCompletionTools,
-  ) -> anyhow::Result<StructuredAgentResult<T>> {
+    final_answer: ToolDefinition,
+  ) -> crate::Result<StructuredAgentResult<T>> {
     let mut context = ExecutionContext::new();
     self.record_user_input(&mut context, user_input);
     let scope = RunScope::new(self, &context);
@@ -179,8 +177,8 @@ impl Agent {
   async fn final_answer_rounds<T: DeserializeOwned>(
     &self,
     mut context: ExecutionContext,
-    final_answer: ChatCompletionTools,
-  ) -> anyhow::Result<StructuredAgentResult<T>> {
+    final_answer: ToolDefinition,
+  ) -> crate::Result<StructuredAgentResult<T>> {
     let mut tool_definitions = self.toolbox.definitions().to_vec();
     tool_definitions.push(final_answer.clone());
     let final_answer_only = std::slice::from_ref(&final_answer);
@@ -188,7 +186,7 @@ impl Agent {
     loop {
       let (tools_allowed, budget_exhausted) = self.round_budget(&context);
 
-      let definitions: &[ChatCompletionTools] = if tools_allowed {
+      let definitions: &[ToolDefinition] = if tools_allowed {
         &tool_definitions
       } else {
         final_answer_only
@@ -229,7 +227,8 @@ impl Agent {
 
       let tool_calls = message.tool_calls.ok_or_else(|| {
         tag_budget(
-          anyhow::anyhow!("Model returned no tool call despite tool_choice = required"),
+          ProviderError::transient("Model returned no tool call despite tool_choice = required")
+            .into(),
           budget_exhausted,
         )
       })?;
@@ -250,7 +249,11 @@ impl Agent {
         let raw_arguments = final_call.function.arguments.clone();
         let parsed: T = serde_json::from_str(&raw_arguments).map_err(|err| {
           tag_budget(
-            anyhow::anyhow!("failed to parse `{FINAL_ANSWER_TOOL_NAME}` arguments: {err}"),
+            ProviderError::transient(format!(
+              "failed to parse `{FINAL_ANSWER_TOOL_NAME}` arguments: {err}"
+            ))
+            .with_source(err)
+            .into(),
             budget_exhausted,
           )
         })?;
@@ -267,11 +270,12 @@ impl Agent {
       // Once the budget is spent, `final_answer` is the only tool on offer; anything
       // else here cannot be recovered from without spending another round.
       if !tools_allowed {
-        anyhow::bail!(tag_budget(
-          anyhow::anyhow!(
+        return Err(tag_budget(
+          ProviderError::transient(format!(
             "model did not call `{FINAL_ANSWER_TOOL_NAME}` after the round budget was spent"
-          ),
-          true
+          ))
+          .into(),
+          true,
         ));
       }
 
@@ -290,7 +294,7 @@ impl Agent {
   async fn run_structured_via_response_format<T>(
     &self,
     user_input: &str,
-  ) -> anyhow::Result<StructuredAgentResult<T>>
+  ) -> crate::Result<StructuredAgentResult<T>>
   where
     T: schemars::JsonSchema + DeserializeOwned,
   {
@@ -317,7 +321,7 @@ impl Agent {
     &self,
     user_input: &str,
     schema: Value,
-  ) -> anyhow::Result<StructuredAgentResult<Value>> {
+  ) -> crate::Result<StructuredAgentResult<Value>> {
     let mode = StructuredMode::for_model(&self.model);
     let schema_hint = match mode {
       StructuredMode::JsonObject => Some(schema_instruction_from_value(&schema)),
@@ -345,7 +349,7 @@ impl Agent {
     mode: StructuredMode,
     schema_hint: Option<String>,
     response_format: ResponseFormat,
-  ) -> anyhow::Result<StructuredAgentResult<T>> {
+  ) -> crate::Result<StructuredAgentResult<T>> {
     let mut context = ExecutionContext::new();
     self.record_user_input(&mut context, user_input);
     let scope = RunScope::new(self, &context);
@@ -362,7 +366,7 @@ impl Agent {
     mode: StructuredMode,
     schema_hint: Option<String>,
     response_format: ResponseFormat,
-  ) -> anyhow::Result<StructuredAgentResult<T>> {
+  ) -> crate::Result<StructuredAgentResult<T>> {
     loop {
       let (tools_allowed, budget_exhausted) = self.round_budget(&context);
 
@@ -435,17 +439,19 @@ impl Agent {
         .filter(|c| !c.trim().is_empty())
         .ok_or_else(|| {
           tag_budget(
-            anyhow::anyhow!("empty content while expecting a structured answer"),
+            ProviderError::transient("empty content while expecting a structured answer").into(),
             budget_exhausted,
           )
         })?;
 
       let parsed: T = serde_json::from_str(strip_code_fence(&content)).map_err(|err| {
         tag_budget(
-          anyhow::anyhow!(
+          ProviderError::transient(format!(
             "failed to parse structured content: {err}; raw: {}",
             truncate_chars(&content, 512)
-          ),
+          ))
+          .with_source(err)
+          .into(),
           budget_exhausted,
         )
       })?;
@@ -475,7 +481,7 @@ impl Agent {
     &self,
     context: &ExecutionContext,
     hint: &str,
-  ) -> anyhow::Result<WireMessages> {
+  ) -> crate::Result<WireMessages> {
     let request = self.prepare_llm_request_with_trailer(context, hint).await;
     let mut wire = self.build_messages(request)?;
     wire.push(
@@ -504,15 +510,5 @@ impl Agent {
       }],
     ));
     context.final_result = Some(raw_arguments);
-  }
-}
-
-/// Mark a failure as caused by a budget-exhausted attempt, so retries can be skipped —
-/// same convention `llm::structured` uses around [`BudgetExhausted`].
-fn tag_budget(err: anyhow::Error, budget_exhausted: bool) -> anyhow::Error {
-  if budget_exhausted {
-    err.context(BudgetExhausted)
-  } else {
-    err
   }
 }

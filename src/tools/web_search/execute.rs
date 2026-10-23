@@ -1,8 +1,9 @@
-use anyhow::Context;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::{config, http, tools::web_search::WebSearchArgs, util::truncate_chars};
+use crate::{
+  config, error::ResultExt, http, tools::web_search::WebSearchArgs, util::truncate_chars,
+};
 
 /// Tavily search endpoint.
 const TAVILY_ENDPOINT: &str = "https://api.tavily.com/search";
@@ -35,20 +36,20 @@ pub struct TavilyResult {
 ///
 /// Errors are returned rather than formatted: the registry turns them into a tool message
 /// so the model can rephrase the query or work around the failure.
-pub async fn run(arguments: &str) -> anyhow::Result<String> {
-  let args =
-    serde_json::from_str::<WebSearchArgs>(arguments).context("invalid web_search arguments")?;
+pub async fn run(arguments: &str) -> crate::Result<String> {
+  let args = serde_json::from_str::<WebSearchArgs>(arguments)
+    .wrap_err(crate::Error::tool, "invalid web_search arguments")?;
 
   Ok(render(&search(&args).await?))
 }
 
 /// Issue the search request.
-pub async fn search(args: &WebSearchArgs) -> anyhow::Result<TavilyResponse> {
+pub async fn search(args: &WebSearchArgs) -> crate::Result<TavilyResponse> {
   let query = args.query.trim();
-  anyhow::ensure!(!query.is_empty(), "query must not be empty");
+  crate::error::ensure!(!query.is_empty(), tool, "query must not be empty");
 
   let api_key = config::tavily_api_key().ok_or_else(|| {
-    anyhow::anyhow!("TAVILY_API_KEY is not set; create a key at https://app.tavily.com")
+    crate::Error::config("TAVILY_API_KEY is not set; create a key at https://app.tavily.com")
   })?;
 
   let response = http::client()
@@ -61,24 +62,26 @@ pub async fn search(args: &WebSearchArgs) -> anyhow::Result<TavilyResponse> {
       "include_answer": true,
     }))
     .send()
-    .await?;
+    .await
+    .err_as(crate::Error::tool)?;
 
   let status = response.status();
   // Read the body as text first: on failure Tavily's `{"detail": ...}` is the only useful
   // diagnostic, and going straight to `.json()` would bury it behind a decode error.
-  let body = response.text().await?;
+  let body = response.text().await.err_as(crate::Error::tool)?;
 
-  anyhow::ensure!(
+  crate::error::ensure!(
     status.is_success(),
+    tool,
     "Tavily returned {status}: {}",
     truncate_chars(&body, ERROR_PREVIEW_CHARS)
   );
 
   serde_json::from_str(&body).map_err(|err| {
-    anyhow::anyhow!(
+    crate::Error::tool(format!(
       "failed to parse Tavily response: {err}; body: {}",
       truncate_chars(&body, ERROR_PREVIEW_CHARS)
-    )
+    ))
   })
 }
 

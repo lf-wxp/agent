@@ -3,9 +3,7 @@ use std::{
   path::{Path, PathBuf},
 };
 
-use anyhow::Context;
-
-use crate::tools::file_upzip::UnzipFileArgs;
+use crate::{error::ResultExt, tools::file_upzip::UnzipFileArgs};
 
 /// Extracts every entry of `zip_path` into `extract_to`, creating it if needed, and
 /// returns a summary listing (capped at 20 names) of what was written.
@@ -15,43 +13,60 @@ use crate::tools::file_upzip::UnzipFileArgs;
 /// write outside `extract_to`. Not sanitized here because this tool is meant for
 /// archives the caller already trusts (its own downloads/attachments), not arbitrary
 /// third-party zips — treat it the same way you would treat running an installer.
-pub fn run(args_json: &str) -> anyhow::Result<String> {
+pub fn run(args_json: &str) -> crate::Result<String> {
   let UnzipFileArgs {
     zip_path,
     extract_to,
-  } = serde_json::from_str::<UnzipFileArgs>(args_json).context("invalid file unzip arguments")?;
+  } = serde_json::from_str::<UnzipFileArgs>(args_json)
+    .wrap_err(crate::Error::tool, "invalid file unzip arguments")?;
   let zip_path = Path::new(&zip_path);
   if !zip_path.exists() {
-    anyhow::bail!("File not found: {}", zip_path.display());
+    crate::error::bail!(tool, "File not found: {}", zip_path.display());
   }
 
   let extract_to: PathBuf = match extract_to {
     Some(dir) => PathBuf::from(dir),
     None => zip_path.with_extension(""),
   };
-  fs::create_dir_all(&extract_to)?;
+  fs::create_dir_all(&extract_to).wrap_err_with(crate::Error::tool, || {
+    format!("failed to create `{}`", extract_to.display())
+  })?;
 
-  let file = fs::File::open(zip_path)?;
-  let mut archive = zip::ZipArchive::new(file)?;
+  let file = fs::File::open(zip_path).wrap_err_with(crate::Error::tool, || {
+    format!("failed to open `{}`", zip_path.display())
+  })?;
+  let mut archive = zip::ZipArchive::new(file).err_as(crate::Error::tool)?;
 
   let mut names = Vec::with_capacity(archive.len());
   for i in 0..archive.len() {
-    let mut entry = archive.by_index(i)?;
+    let mut entry = archive.by_index(i).wrap_err_with(crate::Error::tool, || {
+      format!("entry {i} of `{}` could not be read", zip_path.display())
+    })?;
     // `name()` returns `Result<Cow<str>, _>` since zip 9.0: the name is decoded from the
     // raw bytes on demand, so a non-UTF-8 entry name is an error rather than a garbled
     // string.
-    let name = entry.name().context("entry name is not valid UTF-8")?;
+    let name = entry
+      .name()
+      .wrap_err(crate::Error::tool, "entry name is not valid UTF-8")?;
     let out_path = extract_to.join(name.as_ref());
     names.push(name.into_owned());
 
     if entry.is_dir() {
-      fs::create_dir_all(&out_path)?;
+      fs::create_dir_all(&out_path).wrap_err_with(crate::Error::tool, || {
+        format!("failed to create `{}`", out_path.display())
+      })?;
     } else {
       if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).wrap_err_with(crate::Error::tool, || {
+          format!("failed to create `{}`", parent.display())
+        })?;
       }
-      let mut out_file = fs::File::create(&out_path)?;
-      io::copy(&mut entry, &mut out_file)?;
+      let mut out_file = fs::File::create(&out_path).wrap_err_with(crate::Error::tool, || {
+        format!("failed to create `{}`", out_path.display())
+      })?;
+      io::copy(&mut entry, &mut out_file).wrap_err_with(crate::Error::tool, || {
+        format!("failed to write `{}`", out_path.display())
+      })?;
     }
   }
 

@@ -258,7 +258,7 @@ impl Summarization {
     &self,
     context: &ExecutionContext,
     request: &mut LlmRequest,
-  ) -> anyhow::Result<()> {
+  ) -> crate::Result<()> {
     if request.contents.len() <= self.keep_recent {
       return Ok(());
     }
@@ -368,7 +368,7 @@ impl Summarization {
   /// whatever comes back, and a blank (or whitespace-only) answer — a refusal, a response
   /// truncated at [`SUMMARY_MAX_TOKENS`], a provider quirk — would make that trade for
   /// nothing.
-  async fn generate_summary(&self, previous: &str, excerpt: &str) -> anyhow::Result<String> {
+  async fn generate_summary(&self, previous: &str, excerpt: &str) -> crate::Result<String> {
     let material = format!(
       "## Summary so far\n\n{}\n\n## Transcript excerpt not yet summarized\n\n{excerpt}",
       if previous.is_empty() {
@@ -403,7 +403,7 @@ impl Summarization {
         let builder = request_builder(&self.model, messages, &settings, &[]);
 
         let response = self.provider.chat(builder.chat_request()?).await?.response;
-        anyhow::Ok(response)
+        Ok::<_, crate::Error>(response)
       },
       is_transient,
     )
@@ -421,7 +421,7 @@ impl Summarization {
       .unwrap_or_default();
 
     if summary.trim().is_empty() {
-      anyhow::bail!("the summarizer returned an empty summary");
+      crate::error::bail!(other, "the summarizer returned an empty summary");
     }
 
     Ok(summary)

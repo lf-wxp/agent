@@ -6,7 +6,6 @@ use std::{
   time::Duration,
 };
 
-use anyhow::Context;
 use tokio::{
   io::{AsyncRead, AsyncReadExt},
   process::Command,
@@ -14,6 +13,7 @@ use tokio::{
 
 use crate::{
   config,
+  error::ResultExt,
   tools::shell::{DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS, RunCommandArgs},
 };
 
@@ -51,13 +51,18 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// that inherited the output pipes would also keep them open, so the call would never
 /// see end-of-file. The consequence is deliberate: whatever a command leaves running in
 /// the background does not outlive it.
-pub async fn run(args_json: &str) -> anyhow::Result<String> {
+pub async fn run(args_json: &str) -> crate::Result<String> {
   let RunCommandArgs {
     command,
     workdir,
     timeout_secs,
-  } = serde_json::from_str::<RunCommandArgs>(args_json).context("invalid run_command arguments")?;
-  anyhow::ensure!(!command.trim().is_empty(), "command must not be empty");
+  } = serde_json::from_str::<RunCommandArgs>(args_json)
+    .wrap_err(crate::Error::tool, "invalid run_command arguments")?;
+  crate::error::ensure!(
+    !command.trim().is_empty(),
+    tool,
+    "command must not be empty"
+  );
 
   let secs = timeout_secs
     .unwrap_or(DEFAULT_TIMEOUT_SECS)
@@ -65,11 +70,13 @@ pub async fn run(args_json: &str) -> anyhow::Result<String> {
 
   let mut child = build(&command, workdir.as_deref())?
     .spawn()
-    .with_context(|| format!("failed to start `{command}`"))?;
+    .wrap_err_with(crate::Error::tool, || {
+      format!("failed to start `{command}`")
+    })?;
   // Created before anything can fail or be cancelled below, so no path skips the sweep.
   let group = ProcessGroup::new(child.id());
   let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
-    anyhow::bail!("failed to capture the output of `{command}`");
+    crate::error::bail!(tool, "failed to capture the output of `{command}`");
   };
 
   // Outside the future below so that, if the timeout drops it, what was captured so far
@@ -106,7 +113,7 @@ pub async fn run(args_json: &str) -> anyhow::Result<String> {
 
   match tokio::time::timeout(Duration::from_secs(secs), drive).await {
     Ok(status) => {
-      let status = status.context("failed to wait for the command")?;
+      let status = status.wrap_err(crate::Error::tool, "failed to wait for the command")?;
       Ok(render(status.code(), &finish(out), &finish(err)))
     }
     Err(_) => {
@@ -116,18 +123,19 @@ pub async fn run(args_json: &str) -> anyhow::Result<String> {
       if !partial.is_empty() {
         let _ = write!(message, "\n[output before the timeout]\n{partial}");
       }
-      anyhow::bail!(message)
+      Err(crate::Error::tool(message))
     }
   }
 }
 
 /// The fully configured, not yet spawned command: closed stdin, piped output, own
 /// process group, credentials removed from the environment.
-fn build(command: &str, workdir: Option<&str>) -> anyhow::Result<Command> {
+fn build(command: &str, workdir: Option<&str>) -> crate::Result<Command> {
   let mut cmd = shell(command);
   if let Some(dir) = workdir.filter(|dir| !dir.is_empty()) {
-    anyhow::ensure!(
+    crate::error::ensure!(
       Path::new(dir).is_dir(),
+      tool,
       "workdir `{dir}` is not an existing directory"
     );
     cmd.current_dir(dir);
@@ -366,7 +374,7 @@ mod tests {
   use super::*;
   use crate::tools::testing::TempDir;
 
-  async fn run_json(value: serde_json::Value) -> anyhow::Result<String> {
+  async fn run_json(value: serde_json::Value) -> crate::Result<String> {
     run(&value.to_string()).await
   }
 

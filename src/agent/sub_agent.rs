@@ -79,19 +79,19 @@ use std::{
   time::Duration,
 };
 
-use anyhow::Context;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
   agent::{Agent, TokenUsage},
-  tools::Tool,
+  error::ResultExt,
+  tools::{
+    Tool,
+    tool::{MAX_TOOL_NAME_CHARS, validate_tool_name},
+  },
   util::truncate_chars,
 };
-
-/// Longest tool name providers accept.
-const MAX_NAME_CHARS: usize = 64;
 
 /// Most characters of a failed run's cause chain handed to the parent model.
 const MAX_ERROR_CHARS: usize = 1000;
@@ -129,7 +129,7 @@ fn ungated_side_effect_tools(agent: &Agent) -> Vec<&str> {
 }
 
 /// The error text for a failed run: the whole cause chain, cut to [`MAX_ERROR_CHARS`].
-fn failure_message(name: &str, err: &anyhow::Error) -> String {
+fn failure_message(name: &str, err: &crate::Error) -> String {
   let cause = format!("{err:#}");
   let shown = truncate_chars(&cause, MAX_ERROR_CHARS);
   let ellipsis = if shown.len() < cause.len() { "…" } else { "" };
@@ -166,20 +166,17 @@ impl AgentTool {
     name: impl Into<String>,
     description: impl Into<String>,
     agent: impl Into<Arc<Agent>>,
-  ) -> anyhow::Result<Self> {
+  ) -> crate::Result<Self> {
     let name = name.into();
     let description = description.into();
-    anyhow::ensure!(
-      !name.is_empty()
-        && name.len() <= MAX_NAME_CHARS
-        && name
-          .chars()
-          .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
-      "invalid sub-agent tool name `{name}`: use 1-{MAX_NAME_CHARS} ASCII letters, digits, \
-       `_` or `-`"
-    );
-    anyhow::ensure!(
+    // The same rule `ToolRegistry::add` enforces, checked here so the error names the
+    // sub-agent and says "tool name" rather than surfacing at registration.
+    validate_tool_name(&name).map_err(|err| {
+      err.context(format!("invalid sub-agent tool name `{name}`: 1-{MAX_TOOL_NAME_CHARS} ASCII letters, digits, `_` or `-`"))
+    })?;
+    crate::error::ensure!(
       !description.trim().is_empty(),
+      invalid_input,
       "sub-agent tool `{name}` needs a description, or the model cannot tell when to use it"
     );
     let agent = agent.into();
@@ -233,11 +230,12 @@ impl Tool for AgentTool {
     crate::tools::schema_of::<AgentToolArgs>()
   }
 
-  async fn execute(&self, args_json: &str) -> anyhow::Result<String> {
-    let AgentToolArgs { task } =
-      serde_json::from_str(args_json).context("invalid sub-agent arguments")?;
-    anyhow::ensure!(
+  async fn execute(&self, args_json: &str) -> crate::Result<String> {
+    let AgentToolArgs { task } = serde_json::from_str(args_json)
+      .wrap_err(crate::Error::tool, "invalid sub-agent arguments")?;
+    crate::error::ensure!(
       !task.trim().is_empty(),
+      tool,
       "the task is empty; describe what the sub-agent should do"
     );
 
@@ -248,7 +246,7 @@ impl Tool for AgentTool {
       .agent
       .run(&task)
       .await
-      .map_err(|err| anyhow::anyhow!(failure_message(&self.name, &err)))?;
+      .map_err(|err| crate::Error::tool(failure_message(&self.name, &err)))?;
 
     let spent = result.context.usage;
     self
@@ -265,8 +263,9 @@ impl Tool for AgentTool {
     );
 
     let mut output = result.output;
-    anyhow::ensure!(
+    crate::error::ensure!(
       !output.trim().is_empty(),
+      tool,
       "sub-agent `{}` finished without an answer",
       self.name
     );
@@ -474,13 +473,13 @@ mod tests {
   /// boundary, so a quoted response body cannot flood the parent's context.
   #[test]
   fn the_cause_chain_is_shown_but_bounded() {
-    let chained = anyhow::anyhow!("boom").context("outer");
+    let chained = crate::Error::tool("boom").context("outer");
     assert_eq!(
       failure_message("worker", &chained),
       "sub-agent `worker` failed: outer: boom"
     );
 
-    let long = anyhow::anyhow!("{}", "é".repeat(MAX_ERROR_CHARS * 5));
+    let long = crate::Error::tool("é".repeat(MAX_ERROR_CHARS * 5));
     let message = failure_message("worker", &long);
     let prefix = "sub-agent `worker` failed: ";
     assert!(message.ends_with('…'), "marked as cut");
@@ -502,14 +501,14 @@ mod tests {
 
   #[async_trait::async_trait]
   impl ChatBackend for HangingBackend {
-    async fn create(&self, _request: ChatRequest) -> anyhow::Result<ChatResponse> {
+    async fn create(&self, _request: ChatRequest) -> crate::Result<ChatResponse> {
       let _marker = SetOnDrop(Arc::clone(&self.abandoned));
       std::future::pending::<()>().await;
       unreachable!("pending never resolves")
     }
 
-    async fn create_stream(&self, _request: ChatRequest) -> anyhow::Result<ChatChunkStream> {
-      anyhow::bail!("only the non-streaming route is used here")
+    async fn create_stream(&self, _request: ChatRequest) -> crate::Result<ChatChunkStream> {
+      crate::error::bail!(tool, "only the non-streaming route is used here")
     }
   }
 
@@ -654,11 +653,8 @@ mod tests {
     let mut registry = ToolRegistry::empty();
     registry.add(Arc::new(researcher(&backend))).unwrap();
 
-    let definition = serde_json::to_value(&registry.definitions()[0]).unwrap();
-    assert_eq!(definition["function"]["name"], "researcher");
-    assert_eq!(
-      definition["function"]["parameters"]["required"],
-      json!(["task"])
-    );
+    let definition = &registry.definitions()[0];
+    assert_eq!(definition.name, "researcher");
+    assert_eq!(definition.parameters["required"], json!(["task"]));
   }
 }

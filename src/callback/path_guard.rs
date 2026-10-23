@@ -1,16 +1,16 @@
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::Context;
 use serde_json::Value;
 
+#[cfg(feature = "zip")]
+use crate::tools::file_upzip;
 use crate::{
   agent::{
     ExecutionContext,
     callback::{BeforeToolCallback, ToolCallDecision, ToolCallView},
   },
-  tools::{
-    file_delete, file_edit, file_list, file_read, file_upzip, file_write, grep, read_image, shell,
-  },
+  error::ResultExt,
+  tools::{file_delete, file_edit, file_list, file_read, file_write, grep, read_image, shell},
 };
 
 /// Denies a built-in filesystem tool call whose path argument resolves outside a fixed
@@ -63,10 +63,11 @@ impl WorkspaceGuardCallback {
   /// `.`/`..`) so every check below compares against one stable, absolute path instead
   /// of re-resolving it — and potentially getting a different answer if the filesystem
   /// changes mid-run — on every call.
-  pub fn new(root: impl AsRef<Path>) -> anyhow::Result<Self> {
+  pub fn new(root: impl AsRef<Path>) -> crate::Result<Self> {
     let root = root.as_ref();
-    let canonical = std::fs::canonicalize(root)
-      .with_context(|| format!("workspace root `{}` does not exist", root.display()))?;
+    let canonical = std::fs::canonicalize(root).wrap_err_with(crate::Error::config, || {
+      format!("workspace root `{}` does not exist", root.display())
+    })?;
     Ok(Self { root: canonical })
   }
 
@@ -74,21 +75,17 @@ impl WorkspaceGuardCallback {
   /// for anything else this callback leaves untouched (including every MCP tool — see
   /// the type docs).
   fn guarded_fields(tool_name: &str) -> &'static [&'static str] {
-    if tool_name == file_delete::NAME
-      || tool_name == file_read::NAME
-      || tool_name == read_image::NAME
-      || tool_name == file_write::NAME
-      || tool_name == file_edit::NAME
-    {
-      &["file_path"]
-    } else if tool_name == file_list::NAME || tool_name == grep::NAME {
-      &["path"]
-    } else if tool_name == file_upzip::NAME {
-      &["zip_path", "extract_to"]
-    } else if tool_name == shell::NAME {
-      &["workdir"]
-    } else {
-      &[]
+    match tool_name {
+      file_delete::NAME
+      | file_read::NAME
+      | read_image::NAME
+      | file_write::NAME
+      | file_edit::NAME => &["file_path"],
+      file_list::NAME | grep::NAME => &["path"],
+      #[cfg(feature = "zip")]
+      file_upzip::NAME => &["zip_path", "extract_to"],
+      shell::NAME => &["workdir"],
+      _ => &[],
     }
   }
 
@@ -98,12 +95,13 @@ impl WorkspaceGuardCallback {
   ///
   /// `unzip_file`'s `extract_to` is a write and its `zip_path` is not; everything else
   /// the guard knows about that changes anything does so through `file_path`.
+  // `field` is only consulted for `unzip_file`, so it goes unused without `zip`.
+  #[cfg_attr(not(feature = "zip"), allow(unused_variables))]
   fn is_write(tool_name: &str, field: &str) -> bool {
     match tool_name {
-      name if name == file_delete::NAME || name == file_write::NAME || name == file_edit::NAME => {
-        true
-      }
-      name if name == file_upzip::NAME => field == "extract_to",
+      file_delete::NAME | file_write::NAME | file_edit::NAME => true,
+      #[cfg(feature = "zip")]
+      file_upzip::NAME => field == "extract_to",
       _ => false,
     }
   }
@@ -360,6 +358,7 @@ mod tests {
     assert!(!result.is_proceed());
   }
 
+  #[cfg(feature = "zip")]
   #[tokio::test]
   async fn checks_both_fields_of_unzip_file() {
     let root = unique_temp_dir("unzip-fields");
@@ -377,8 +376,24 @@ mod tests {
     let guard = WorkspaceGuardCallback::new(&root).unwrap();
     let context = ExecutionContext::new();
 
-    // A fresh extraction directory does not exist yet, so this must fall back to
-    // lexical `.`/`..` resolution rather than failing outright.
+    // A file in a directory that does not exist yet, so this must fall back to lexical
+    // `.`/`..` resolution rather than failing outright.
+    let args = json!({ "file_path": "brand-new-subdir/notes.txt", "content": "x" });
+    assert!(matches!(
+      guard.call(&context, view(file_write::NAME, &args)).await,
+      ToolCallDecision::Proceed
+    ));
+  }
+
+  /// The same fallback on the other field kind: `unzip_file`'s `extract_to` is a
+  /// directory that does not exist yet, and it is the field checked as a *write*.
+  #[cfg(feature = "zip")]
+  #[tokio::test]
+  async fn allows_a_not_yet_existing_unzip_target_via_lexical_resolution() {
+    let root = unique_temp_dir("lexical-unzip");
+    let guard = WorkspaceGuardCallback::new(&root).unwrap();
+    let context = ExecutionContext::new();
+
     let args = json!({ "zip_path": "archive.zip", "extract_to": "brand-new-subdir" });
     assert!(matches!(
       guard.call(&context, view(file_upzip::NAME, &args)).await,
@@ -479,6 +494,7 @@ mod tests {
         json!({ "file_path": ".agent/sessions/a.json", "old_string": "a", "new_string": "b" }),
       ),
       (file_delete::NAME, json!({ "file_path": ".git/config" })),
+      #[cfg(feature = "zip")]
       (
         file_upzip::NAME,
         json!({ "zip_path": "a.zip", "extract_to": ".git" }),
@@ -497,6 +513,7 @@ mod tests {
       (file_read::NAME, json!({ "file_path": ".git/config" })),
       (file_read::NAME, json!({ "file_path": "mcp.json" })),
       (file_list::NAME, json!({ "path": ".agent" })),
+      #[cfg(feature = "zip")]
       (
         file_upzip::NAME,
         json!({ "zip_path": ".git/x.zip", "extract_to": "out" }),

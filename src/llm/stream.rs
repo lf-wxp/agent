@@ -37,7 +37,7 @@ fn chat_stream<'a>(
   prompt: &'a str,
   registry: &'a ToolRegistry,
   settings: &'a ModelSettings,
-) -> impl Stream<Item = anyhow::Result<String>> + 'a {
+) -> impl Stream<Item = crate::Result<String>> + 'a {
   stream! {
     ensure_valid_params(model, prompt)?;
 
@@ -162,7 +162,7 @@ pub async fn chat_stream_with_retry(
   system: Option<&str>,
   prompt: &str,
   registry: &ToolRegistry,
-) -> anyhow::Result<String> {
+) -> crate::Result<String> {
   let settings = ModelSettings::from_config();
   with_retry(
     || async {
@@ -208,11 +208,11 @@ mod tests {
 
   #[async_trait::async_trait]
   impl ChatBackend for ScriptedStreams {
-    async fn create(&self, _request: ChatRequest) -> anyhow::Result<ChatResponse> {
-      anyhow::bail!("not used")
+    async fn create(&self, _request: ChatRequest) -> crate::Result<ChatResponse> {
+      crate::error::bail!(other, "not used")
     }
 
-    async fn create_stream(&self, request: ChatRequest) -> anyhow::Result<ChatChunkStream> {
+    async fn create_stream(&self, request: ChatRequest) -> crate::Result<ChatChunkStream> {
       self.seen.lock().unwrap().push(request.to_body()?);
       let chunks = self
         .rounds

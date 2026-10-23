@@ -32,7 +32,6 @@
 
 use std::pin::Pin;
 
-use anyhow::Context;
 use async_openai::{
   Client,
   config::OpenAIConfig,
@@ -44,7 +43,11 @@ use futures::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::util::truncate_chars;
+use crate::{
+  Error, Result,
+  error::{ProviderError, ResultExt},
+  util::truncate_chars,
+};
 
 /// Chars of a response body quoted in a "wrong shape" error: enough to see what came
 /// back, not enough to dump a whole completion into a log.
@@ -80,9 +83,11 @@ impl From<CreateChatCompletionRequest> for ChatRequest {
 impl ChatRequest {
   /// The JSON body that goes on the wire: the standard request, with each replayed
   /// chain of thought added to its assistant message as `reasoning_content`.
-  pub fn to_body(&self) -> anyhow::Result<Value> {
-    let mut body = serde_json::to_value(&self.request)
-      .context("the chat completion request could not be serialized")?;
+  pub fn to_body(&self) -> Result<Value> {
+    let mut body = serde_json::to_value(&self.request).wrap_err(
+      Error::invalid_input,
+      "the chat completion request could not be serialized",
+    )?;
     if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
       for (message, text) in messages.iter_mut().zip(&self.reasoning) {
         let (Some(text), Some(object)) = (text, message.as_object_mut()) else {
@@ -118,17 +123,16 @@ pub struct ChatChunk {
 
 /// What [`ChatBackend::create_stream`] yields: chunks until the response is complete,
 /// or an error that ends it.
-pub type ChatChunkStream = Pin<Box<dyn Stream<Item = anyhow::Result<ChatChunk>> + Send>>;
+pub type ChatChunkStream = Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>;
 
 /// Something that answers chat completion requests.
 ///
-/// Implementations should surface a provider's own error type inside the
-/// [`anyhow::Error`] where one exists (`?` does this), because retry decisions downcast
-/// it: [`crate::llm::retry::is_transient`] recognizes
-/// [`async_openai::error::OpenAIError`] and treats everything else as retryable. A
-/// backend with errors of its own that retrying cannot fix (a rejected key, a malformed
-/// request) marks them with [`crate::llm::retry::Permanent::wrap`], or each one costs
-/// the whole backoff curve before it surfaces.
+/// Implementations report a provider's failures as [`ProviderError`] (an
+/// [`async_openai::error::OpenAIError`] converts with `?`), saying whether the same
+/// request could succeed if sent again: [`crate::llm::retry::is_transient`] goes by that.
+/// A failure retrying cannot fix (a rejected key, a request the API calls malformed) is
+/// [`ProviderError::permanent`], or each one costs the whole backoff curve before it
+/// surfaces; anything a retry might get past is [`ProviderError::transient`].
 ///
 /// No concurrency control belongs here: that is per tenant and lives on
 /// [`crate::llm::provider::Provider`], which wraps every call.
@@ -136,11 +140,11 @@ pub type ChatChunkStream = Pin<Box<dyn Stream<Item = anyhow::Result<ChatChunk>> 
 pub trait ChatBackend: Send + Sync {
   /// One complete response to `request`. `request.request.stream` is not meaningful here
   /// and should be ignored.
-  async fn create(&self, request: ChatRequest) -> anyhow::Result<ChatResponse>;
+  async fn create(&self, request: ChatRequest) -> Result<ChatResponse>;
 
   /// Open a streamed response to `request`. Returns once the stream is open; the
   /// chunks themselves arrive through the returned stream.
-  async fn create_stream(&self, request: ChatRequest) -> anyhow::Result<ChatChunkStream>;
+  async fn create_stream(&self, request: ChatRequest) -> Result<ChatChunkStream>;
 }
 
 /// Any server speaking the OpenAI Chat Completions API, reached through `async-openai`.
@@ -160,7 +164,7 @@ impl OpenAiCompatible {
 
 #[async_trait::async_trait]
 impl ChatBackend for OpenAiCompatible {
-  async fn create(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+  async fn create(&self, request: ChatRequest) -> Result<ChatResponse> {
     // The raw (`_byot`) variants skip `async-openai`'s own check that `stream` matches
     // the method, so it is set here instead.
     let mut body = request.to_body()?;
@@ -171,7 +175,7 @@ impl ChatBackend for OpenAiCompatible {
     parse_response(raw)
   }
 
-  async fn create_stream(&self, request: ChatRequest) -> anyhow::Result<ChatChunkStream> {
+  async fn create_stream(&self, request: ChatRequest) -> Result<ChatChunkStream> {
     // Same reason as above: the raw variant does not set this itself.
     let mut body = request.to_body()?;
     if let Some(object) = body.as_object_mut() {
@@ -182,9 +186,9 @@ impl ChatBackend for OpenAiCompatible {
       .chat()
       .create_stream_byot::<_, Value>(body)
       .await?;
-    Ok(Box::pin(raw.map(|item| {
-      item.map_err(anyhow::Error::from).and_then(parse_chunk)
-    })))
+    Ok(Box::pin(
+      raw.map(|item| item.map_err(Error::from).and_then(parse_chunk)),
+    ))
   }
 }
 
@@ -192,17 +196,21 @@ impl ChatBackend for OpenAiCompatible {
 const REASONING_FIELDS: [&str; 2] = ["reasoning_content", "reasoning"];
 
 /// Split a raw response body into the standard response and its reasoning.
-pub fn parse_response(mut raw: Value) -> anyhow::Result<ChatResponse> {
+///
+/// A body that does not fit is a [`ProviderError::transient`]: the provider answered with
+/// something unusable, which another attempt may not repeat.
+pub fn parse_response(mut raw: Value) -> Result<ChatResponse> {
   let reasoning = reasoning_in(&raw, "message");
   normalize_usage(&mut raw);
   // Deserialized from a borrow, not by value, so the body is still there to quote when
   // it does not fit: a bare serde message ("missing field `id`") says nothing about what
   // the provider actually sent.
-  let response = CreateChatCompletionResponse::deserialize(&raw).with_context(|| {
-    format!(
+  let response = CreateChatCompletionResponse::deserialize(&raw).map_err(|err| {
+    ProviderError::transient(format!(
       "the chat completion response has an unexpected shape: {}",
       body_preview(&raw)
-    )
+    ))
+    .with_source(err)
   })?;
   Ok(ChatResponse {
     response,
@@ -211,14 +219,15 @@ pub fn parse_response(mut raw: Value) -> anyhow::Result<ChatResponse> {
 }
 
 /// Split a raw stream chunk into the standard chunk and its reasoning delta.
-pub fn parse_chunk(mut raw: Value) -> anyhow::Result<ChatChunk> {
+pub fn parse_chunk(mut raw: Value) -> Result<ChatChunk> {
   let reasoning = reasoning_in(&raw, "delta");
   normalize_usage(&mut raw);
-  let chunk = CreateChatCompletionStreamResponse::deserialize(&raw).with_context(|| {
-    format!(
+  let chunk = CreateChatCompletionStreamResponse::deserialize(&raw).map_err(|err| {
+    ProviderError::transient(format!(
       "a chat completion stream chunk has an unexpected shape: {}",
       body_preview(&raw)
-    )
+    ))
+    .with_source(err)
   })?;
   Ok(ChatChunk { chunk, reasoning })
 }

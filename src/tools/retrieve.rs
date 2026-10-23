@@ -8,12 +8,13 @@
 
 use std::fmt::Write as _;
 
-use anyhow::Context;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::{knowledge_base::store::VectorStore, tools::Tool, util::truncate_chars};
+use crate::{
+  error::ResultExt, knowledge_base::store::VectorStore, tools::Tool, util::truncate_chars,
+};
 
 /// Default tool name.
 pub const NAME: &str = "retrieve";
@@ -101,10 +102,10 @@ impl Tool for RetrieveTool {
     crate::tools::schema_of::<RetrieveArgs>()
   }
 
-  async fn execute(&self, args_json: &str) -> anyhow::Result<String> {
+  async fn execute(&self, args_json: &str) -> crate::Result<String> {
     let RetrieveArgs { query, limit } =
-      serde_json::from_str(args_json).context("invalid retrieve arguments")?;
-    anyhow::ensure!(!query.trim().is_empty(), "the query is empty");
+      serde_json::from_str(args_json).wrap_err(crate::Error::tool, "invalid retrieve arguments")?;
+    crate::error::ensure!(!query.trim().is_empty(), tool, "the query is empty");
     let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
     let hits = self

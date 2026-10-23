@@ -42,13 +42,15 @@ use std::{
   sync::Arc,
 };
 
-use anyhow::Context;
 use serde::Deserialize;
 use tokio::process::Command;
 
-use crate::tools::{
-  mcp::client::{self, McpConnection},
-  tool::Tool,
+use crate::{
+  error::ResultExt,
+  tools::{
+    mcp::client::{self, McpConnection},
+    tool::Tool,
+  },
 };
 
 /// Environment variables a spawned stdio server inherits from this process by default,
@@ -164,7 +166,7 @@ impl ServerConfig {
   }
 
   /// Resolve the transport, inferring it when `type` is absent.
-  fn transport(&self) -> anyhow::Result<TransportKind> {
+  fn transport(&self) -> crate::Result<TransportKind> {
     if let Some(kind) = self.kind {
       return Ok(kind);
     }
@@ -173,25 +175,32 @@ impl ServerConfig {
       (true, false) => Ok(TransportKind::Stdio),
       (false, true) => Ok(TransportKind::StreamableHttp),
       (true, true) => {
-        anyhow::bail!("both `command` and `url` are set; add `type` to disambiguate")
+        crate::error::bail!(
+          config,
+          "both `command` and `url` are set; add `type` to disambiguate"
+        )
       }
-      (false, false) => anyhow::bail!("needs either `command` (stdio) or `url` (http)"),
+      (false, false) => {
+        crate::error::bail!(config, "needs either `command` (stdio) or `url` (http)")
+      }
     }
   }
 }
 
 impl McpConfig {
   /// Parse from JSON text.
-  pub fn from_json(text: &str) -> anyhow::Result<Self> {
-    serde_json::from_str(text).context("failed to parse mcp.json")
+  pub fn from_json(text: &str) -> crate::Result<Self> {
+    serde_json::from_str(text).wrap_err(crate::Error::config, "failed to parse mcp.json")
   }
 
   /// Read and parse a config file.
-  pub async fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+  pub async fn load(path: impl AsRef<Path>) -> crate::Result<Self> {
     let path = path.as_ref();
     let text = tokio::fs::read_to_string(path)
       .await
-      .with_context(|| format!("failed to read MCP config `{}`", path.display()))?;
+      .wrap_err_with(crate::Error::config, || {
+        format!("failed to read MCP config `{}`", path.display())
+      })?;
 
     Self::from_json(&text)
   }
@@ -230,13 +239,15 @@ impl McpConfig {
 async fn connect_one(
   label: &str,
   server: &ServerConfig,
-) -> anyhow::Result<(McpConnection, Vec<Arc<dyn Tool>>)> {
+) -> crate::Result<(McpConnection, Vec<Arc<dyn Tool>>)> {
   let connection = match server.transport()? {
     TransportKind::Stdio => spawn_stdio(label, server).await?,
     TransportKind::Http | TransportKind::StreamableHttp => connect_http(label, server).await?,
     // rmcp supports it, but the feature is not enabled and the transport is deprecated in
     // favour of Streamable HTTP.
-    TransportKind::Sse => anyhow::bail!("the `sse` transport is not supported; use `http`"),
+    TransportKind::Sse => {
+      crate::error::bail!(config, "the `sse` transport is not supported; use `http`")
+    }
   };
 
   let tools = connection.tools().await?;
@@ -283,11 +294,11 @@ fn apply_allow_list(
     .collect()
 }
 
-async fn spawn_stdio(label: &str, server: &ServerConfig) -> anyhow::Result<McpConnection> {
+async fn spawn_stdio(label: &str, server: &ServerConfig) -> crate::Result<McpConnection> {
   let program = server
     .command
     .as_deref()
-    .context("stdio server needs `command`")?;
+    .ok_or_else(|| crate::Error::config("stdio server needs `command`"))?;
 
   let mut command = Command::new(expand(program)?);
   for arg in &server.args {
@@ -314,7 +325,7 @@ async fn spawn_stdio(label: &str, server: &ServerConfig) -> anyhow::Result<McpCo
 /// [`spawn_stdio`] as a pure function — returning the composed map instead of mutating a
 /// [`Command`] directly — so a test can check exactly what ends up in it without
 /// actually spawning a process.
-fn stdio_env(server: &ServerConfig) -> anyhow::Result<BTreeMap<String, String>> {
+fn stdio_env(server: &ServerConfig) -> crate::Result<BTreeMap<String, String>> {
   let mut env = BTreeMap::new();
   for var in INHERITED_ENV_VARS {
     if let Ok(value) = std::env::var(var) {
@@ -327,8 +338,11 @@ fn stdio_env(server: &ServerConfig) -> anyhow::Result<BTreeMap<String, String>> 
   Ok(env)
 }
 
-async fn connect_http(label: &str, server: &ServerConfig) -> anyhow::Result<McpConnection> {
-  let url = server.url.as_deref().context("http server needs `url`")?;
+async fn connect_http(label: &str, server: &ServerConfig) -> crate::Result<McpConnection> {
+  let url = server
+    .url
+    .as_deref()
+    .ok_or_else(|| crate::Error::config("http server needs `url`"))?;
 
   // Names are expanded too: some deployments key the header itself off the environment.
   let mut headers = BTreeMap::new();
@@ -347,7 +361,7 @@ async fn connect_http(label: &str, server: &ServerConfig) -> anyhow::Result<McpC
 ///
 /// Reusable anywhere else a config file needs the same substitution (e.g. a future
 /// deployment-specific config file that should not commit real credentials).
-pub(crate) fn expand(text: &str) -> anyhow::Result<String> {
+pub(crate) fn expand(text: &str) -> crate::Result<String> {
   let mut out = String::with_capacity(text.len());
   let mut rest = text;
 
@@ -356,12 +370,13 @@ pub(crate) fn expand(text: &str) -> anyhow::Result<String> {
     let after = &rest[start + 2..];
     let end = after
       .find('}')
-      .with_context(|| format!("unterminated `${{` in `{text}`"))?;
+      .ok_or_else(|| crate::Error::config(format!("unterminated `${{` in `{text}`")))?;
 
     let name = after[..end].trim();
     let name = name.strip_prefix("env:").unwrap_or(name);
-    let value = std::env::var(name)
-      .with_context(|| format!("`{text}` references undefined environment variable `{name}`"))?;
+    let value = std::env::var(name).wrap_err_with(crate::Error::config, || {
+      format!("`{text}` references undefined environment variable `{name}`")
+    })?;
 
     out.push_str(&value);
     rest = &after[end + 1..];
@@ -525,7 +540,7 @@ mod tests {
       serde_json::json!({})
     }
 
-    async fn execute(&self, _args_json: &str) -> anyhow::Result<String> {
+    async fn execute(&self, _args_json: &str) -> crate::Result<String> {
       unreachable!("apply_allow_list never calls a tool")
     }
   }

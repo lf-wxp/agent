@@ -72,7 +72,7 @@ impl Tool for ReadImageTool {
     crate::tools::schema_of::<ReadImageArgs>()
   }
 
-  async fn execute(&self, args_json: &str) -> anyhow::Result<String> {
+  async fn execute(&self, args_json: &str) -> crate::Result<String> {
     let provider = self.provider.as_ref().unwrap_or_else(|| Provider::shared());
     execute::run(provider, args_json).await
   }

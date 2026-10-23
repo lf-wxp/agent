@@ -38,7 +38,7 @@ impl Tool for WebSearch {
     definition::parameters()
   }
 
-  async fn execute(&self, args_json: &str) -> anyhow::Result<String> {
+  async fn execute(&self, args_json: &str) -> crate::Result<String> {
     execute::run(args_json).await
   }
 

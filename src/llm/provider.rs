@@ -124,6 +124,14 @@ impl Provider {
     self.semaphore.acquire().await
   }
 
+  /// [`Self::acquire`], as this crate's error. The semaphore is never closed, so this
+  /// only fails if that ever changes.
+  async fn permit(&self) -> crate::Result<SemaphorePermit<'_>> {
+    self.acquire().await.map_err(|err| {
+      crate::Error::other("the provider's concurrency budget is closed").with_source(err)
+    })
+  }
+
   /// Send one request, holding a slot of this tenant's budget until the response is in.
   ///
   /// No retry here: callers decide what is worth another attempt (see
@@ -136,10 +144,10 @@ impl Provider {
   ///
   /// Traced as a `chat` span (see [`crate::telemetry`]), waiting for the budget slot
   /// included — time spent queued behind other requests is part of what the caller waited.
-  pub async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+  pub async fn chat(&self, request: ChatRequest) -> crate::Result<ChatResponse> {
     let span = spans::chat_span(&request.request.model, false);
     let result = async {
-      let _permit = self.acquire().await?;
+      let _permit = self.permit().await?;
       self.backend.create(request).await
     }
     .instrument(span.clone())
@@ -157,10 +165,10 @@ impl Provider {
   ///
   /// The `chat` span lives as long as the returned stream, so it covers the whole
   /// response and records the usage the final chunk carries.
-  pub async fn chat_stream(&self, request: ChatRequest) -> anyhow::Result<ChatChunkStream> {
+  pub async fn chat_stream(&self, request: ChatRequest) -> crate::Result<ChatChunkStream> {
     let span = spans::chat_span(&request.request.model, true);
     let opened = async {
-      let _permit = self.acquire().await?;
+      let _permit = self.permit().await?;
       self.backend.create_stream(request).await
     }
     .instrument(span.clone())
@@ -213,7 +221,7 @@ mod tests {
 
   #[async_trait::async_trait]
   impl ChatBackend for BudgetProbe {
-    async fn create(&self, _request: ChatRequest) -> anyhow::Result<ChatResponse> {
+    async fn create(&self, _request: ChatRequest) -> crate::Result<ChatResponse> {
       let free = self.semaphore.get().map(|s| s.available_permits());
       *self.free_during_call.lock().unwrap() = free;
       crate::llm::backend::parse_response(serde_json::json!({
@@ -223,8 +231,8 @@ mod tests {
       }))
     }
 
-    async fn create_stream(&self, _request: ChatRequest) -> anyhow::Result<ChatChunkStream> {
-      anyhow::bail!("not used")
+    async fn create_stream(&self, _request: ChatRequest) -> crate::Result<ChatChunkStream> {
+      crate::error::bail!(other, "not used")
     }
   }
 

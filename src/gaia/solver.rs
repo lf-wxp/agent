@@ -5,8 +5,7 @@ use crate::{
   llm::{
     provider::Provider,
     retry::{is_transient, with_retry},
-    structured::{TruncatedOutput, chat_complete_structured_raw},
-    tool_loop::BudgetExhausted,
+    structured::chat_complete_structured_raw,
   },
   tools::ToolRegistry,
 };
@@ -17,18 +16,14 @@ pub async fn solve_problem_with_retry(
   system: &str,
   prompt: &str,
   registry: &ToolRegistry,
-) -> anyhow::Result<Solution> {
+) -> crate::Result<Solution> {
   with_retry(
     || solve_problem(provider, model, system, prompt, registry),
-    // Skip deterministic failures, where a retry only burns resources for the same outcome:
-    // a max_tokens truncation repeats token spend, and a budget-exhausted attempt replays
-    // the entire tool round budget. `is_transient` adds the provider-level half of the
-    // same rule (a rejected key, an unknown model, a malformed request).
-    |err: &anyhow::Error| {
-      is_transient(err)
-        && err.downcast_ref::<TruncatedOutput>().is_none()
-        && err.downcast_ref::<BudgetExhausted>().is_none()
-    },
+    // Skips deterministic failures, where a retry only burns resources for the same
+    // outcome: a max_tokens truncation repeats token spend, a budget-exhausted attempt
+    // replays the entire tool round budget, and a rejected key or an unknown model fails
+    // identically every time.
+    is_transient,
   )
   .await
 }
@@ -39,7 +34,7 @@ async fn solve_problem(
   system: &str,
   prompt: &str,
   registry: &ToolRegistry,
-) -> anyhow::Result<Solution> {
+) -> crate::Result<Solution> {
   // The structured approach (native schema / prompt injection) is decided automatically by the model; see `llm::structured`.
   let choice =
     chat_complete_structured_raw::<GaiaOutput>(provider, model, Some(system), prompt, registry)

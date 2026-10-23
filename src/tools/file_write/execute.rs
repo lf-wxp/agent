@@ -1,24 +1,23 @@
 use std::{io, path::Path};
 
-use anyhow::Context;
 use tokio::io::AsyncWriteExt;
 
-use crate::tools::file_write::WriteFileArgs;
+use crate::{error::ResultExt, tools::file_write::WriteFileArgs};
 
 /// Writes `content` to `file_path`, creating parent directories first.
 ///
 /// Refuses to write over a directory: `tokio::fs::write` would fail with an OS error
 /// anyway, but a message that names the actual problem lets the model correct itself.
-pub async fn run(args_json: &str) -> anyhow::Result<String> {
-  let WriteFileArgs { file_path, content } =
-    serde_json::from_str::<WriteFileArgs>(args_json).context("invalid file write arguments")?;
+pub async fn run(args_json: &str) -> crate::Result<String> {
+  let WriteFileArgs { file_path, content } = serde_json::from_str::<WriteFileArgs>(args_json)
+    .wrap_err(crate::Error::tool, "invalid file write arguments")?;
   let path = Path::new(&file_path);
 
   if tokio::fs::metadata(path)
     .await
     .is_ok_and(|meta| meta.is_dir())
   {
-    anyhow::bail!("`{file_path}` is a directory, not a file");
+    crate::error::bail!(tool, "`{file_path}` is a directory, not a file");
   }
   let existed = tokio::fs::try_exists(path).await.unwrap_or(false);
 
@@ -28,11 +27,15 @@ pub async fn run(args_json: &str) -> anyhow::Result<String> {
   {
     tokio::fs::create_dir_all(parent)
       .await
-      .with_context(|| format!("failed to create parent directory `{}`", parent.display()))?;
+      .wrap_err_with(crate::Error::tool, || {
+        format!("failed to create parent directory `{}`", parent.display())
+      })?;
   }
   write_atomic(path, content.as_bytes())
     .await
-    .with_context(|| format!("failed to write `{file_path}`"))?;
+    .wrap_err_with(crate::Error::tool, || {
+      format!("failed to write `{file_path}`")
+    })?;
 
   let action = if existed { "Overwrote" } else { "Created" };
   Ok(format!(

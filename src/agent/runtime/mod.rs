@@ -56,7 +56,7 @@ use crate::{
     },
     llm_request::LlmRequest,
   },
-  callback::context_optimizer::ContextOptimizer,
+  callback::context_optimizer::{ContextOptimizer, Encoding},
   config,
   llm::{
     backend::{ChatChunkStream, ChatResponse},
@@ -454,37 +454,7 @@ impl AgentRunState {
   }
 }
 
-/// The run was stopped through its [`ExecutionContext::cancellation`] token.
-///
-/// Returned as an error (downcast it from [`anyhow::Error`]) because the run did not
-/// finish, but it carries the transcript up to that point: every completed round, plus
-/// a result for each call that was cut short saying so. A caller that persists history
-/// can file [`Self::context`] and the conversation carries on from there; one that does
-/// not care just sees "the run was cancelled".
-///
-/// Only tools are cut short. A before-tool hook already waiting — typically an approval
-/// prompt — is left to its own timeout rather than dropped mid-wait, since dropping it
-/// would leave the prompt it raised dangling in every front-end showing it.
-#[derive(Debug)]
-pub struct Cancelled {
-  pub context: Box<ExecutionContext>,
-}
-
-impl Cancelled {
-  fn new(context: ExecutionContext) -> Self {
-    Self {
-      context: Box::new(context),
-    }
-  }
-}
-
-impl std::fmt::Display for Cancelled {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    write!(f, "the run was cancelled")
-  }
-}
-
-impl std::error::Error for Cancelled {}
+pub use crate::error::Cancelled;
 
 /// How a resumable run ended: with an answer, or with a question.
 #[derive(Debug)]
@@ -552,6 +522,9 @@ pub struct Agent {
   settings: ModelSettings,
   /// A label for traces; see [`Self::with_name`].
   name: Option<String>,
+  /// What the [`ContextOptimizer`] installed by [`Self::new`] counts the history budget
+  /// in; see [`Self::context_encoding`].
+  context_encoding: Encoding,
 }
 
 impl Agent {
@@ -567,30 +540,33 @@ impl Agent {
   ///
   /// A [`ContextOptimizer`] carrying [`config::max_history_tokens`] is registered as
   /// the first before-LLM hook, so an unbounded session cannot grow past the model's
-  /// context window by default. Use [`Self::clear_before_llm_callbacks`] to change or
-  /// drop it.
+  /// context window by default. It counts tokens in `model`'s own encoding when
+  /// `tiktoken` knows it (see [`ContextOptimizer::for_model`]). Use
+  /// [`Self::clear_before_llm_callbacks`] to change or drop it.
   pub fn new(
     provider: Provider,
     model: impl Into<String>,
     instructions: Option<impl Into<String>>,
     toolbox: Arc<ToolRegistry>,
   ) -> Self {
+    let model = model.into();
+    let optimizer = ContextOptimizer::new(config::max_history_tokens()).for_model(&model);
+    let context_encoding = optimizer.encoding();
     Self {
       provider,
-      model: model.into(),
+      model,
       instructions: instructions.map(Into::into),
       toolbox,
       max_steps: config::max_tool_rounds() as u32,
       before_tool_callbacks: Vec::new(),
       after_tool_callbacks: Vec::new(),
-      before_llm_callbacks: vec![Arc::new(
-        ContextOptimizer::new(config::max_history_tokens()),
-      )],
+      before_llm_callbacks: vec![Arc::new(optimizer)],
       checkpoint: None,
       tool_timeout: config::tool_timeout(),
       tool_concurrency: config::tool_max_concurrency(),
       settings: ModelSettings::from_config(),
       name: None,
+      context_encoding,
     }
   }
 
@@ -627,6 +603,19 @@ impl Agent {
   /// The model this agent sends its requests to.
   pub fn model(&self) -> &str {
     &self.model
+  }
+
+  /// What the [`ContextOptimizer`] installed by [`Self::new`] counts the history budget
+  /// in — the model's own encoding for a model `tiktoken` knows
+  /// ([`Encoding::for_model`]), `cl100k_base` otherwise.
+  ///
+  /// Reported rather than recomputed from [`Self::model`] because the two can differ: a
+  /// model only takes effect for the budget at construction, so an agent whose model was
+  /// swapped afterwards still counts the way it did when it was built.
+  ///
+  /// [`Encoding::for_model`]: crate::callback::context_optimizer::Encoding::for_model
+  pub fn context_encoding(&self) -> Encoding {
+    self.context_encoding
   }
 
   /// Name this agent in traces: its runs' `invoke_agent` spans carry it as
@@ -831,7 +820,7 @@ impl Agent {
   /// # let toolbox = Arc::new(ToolRegistry::empty());
   /// let agent = Agent::new(Provider::shared().clone(), "gpt-4o", Option::<String>::None, toolbox)
   ///   .clear_before_llm_callbacks()
-  ///   .with_before_llm_callback(Arc::new(ContextOptimizer::new(32_000)));
+  ///   .with_before_llm_callback(Arc::new(ContextOptimizer::new(32_000).for_model("gpt-4o")));
   /// ```
   ///
   /// Clearing without registering anything else disables trimming entirely: every round
@@ -871,7 +860,7 @@ impl Agent {
   ///
   /// Equivalent to [`Self::run_continuing`] with an empty history; use that instead to
   /// send a follow-up turn in an existing conversation.
-  pub async fn run(&self, user_input: &str) -> anyhow::Result<AgentResult> {
+  pub async fn run(&self, user_input: &str) -> crate::Result<AgentResult> {
     self.run_continuing(Vec::new(), user_input).await
   }
 
@@ -898,7 +887,7 @@ impl Agent {
     &self,
     conversation: impl Into<Conversation>,
     user_input: &str,
-  ) -> anyhow::Result<AgentResult> {
+  ) -> crate::Result<AgentResult> {
     let context = self.seed_context(conversation.into(), user_input);
     let mut outcome = self.drive(context).await?;
 
@@ -948,7 +937,7 @@ impl Agent {
     &self,
     conversation: impl Into<Conversation>,
     user_input: &str,
-  ) -> anyhow::Result<AgentOutcome> {
+  ) -> crate::Result<AgentOutcome> {
     let context = self.seed_context(conversation.into(), user_input);
     self.drive(context).await
   }
@@ -979,13 +968,13 @@ impl Agent {
     &self,
     state: AgentRunState,
     decisions: &HashMap<String, ResumedDecision>,
-  ) -> anyhow::Result<AgentOutcome> {
+  ) -> crate::Result<AgentOutcome> {
     if let Some(reason) = state.unresumable() {
-      anyhow::bail!("cannot resume this run: {reason}");
+      crate::error::bail!(invalid_input, "cannot resume this run: {reason}");
     }
     let current = self.fingerprint();
     if let Some(reason) = state.fingerprint.mismatch(&current) {
-      anyhow::bail!("cannot resume this run: {reason}");
+      crate::error::bail!(invalid_input, "cannot resume this run: {reason}");
     }
 
     let mut outcome = self
@@ -1018,7 +1007,7 @@ impl Agent {
     pending: &[SuspendedToolCall],
     decisions: &HashMap<String, ResumedDecision>,
     budget_exhausted: bool,
-  ) -> anyhow::Result<AgentOutcome> {
+  ) -> crate::Result<AgentOutcome> {
     let scope = observe::RunScope::new(self, &context);
     let result = scope
       .run(self.resume_rounds(context, pending, decisions, budget_exhausted))
@@ -1033,7 +1022,7 @@ impl Agent {
     pending: &[SuspendedToolCall],
     decisions: &HashMap<String, ResumedDecision>,
     budget_exhausted: bool,
-  ) -> anyhow::Result<AgentOutcome> {
+  ) -> crate::Result<AgentOutcome> {
     let calls = rebuild_tool_calls(pending);
     // Checkpointed like any other round, and this one needs it most: the caller took the
     // stored state out in order to get here (see [`crate::agent::ApprovalStore::take`]),
@@ -1084,14 +1073,14 @@ impl Agent {
   ///
   /// Runs inside an `invoke_agent` span and the run's usage ledger; see
   /// [`observe::RunScope`].
-  async fn drive(&self, context: ExecutionContext) -> anyhow::Result<AgentOutcome> {
+  async fn drive(&self, context: ExecutionContext) -> crate::Result<AgentOutcome> {
     let scope = observe::RunScope::new(self, &context);
     let result = scope.run(self.drive_rounds(context)).await;
     scope.finish(result)
   }
 
   /// The loop [`Self::drive`] runs.
-  async fn drive_rounds(&self, mut context: ExecutionContext) -> anyhow::Result<AgentOutcome> {
+  async fn drive_rounds(&self, mut context: ExecutionContext) -> crate::Result<AgentOutcome> {
     loop {
       let (tools_allowed, budget_exhausted) = self.round_budget(&context);
 
@@ -1120,9 +1109,11 @@ impl Agent {
 
       // Some providers send `Some(vec![])` rather than `None` for "no tool calls".
       let Some(tool_calls) = message.tool_calls.filter(|calls| !calls.is_empty()) else {
-        let content = message
-          .content
-          .ok_or_else(|| anyhow::anyhow!("No content in final response"))?;
+        let content = message.content.ok_or_else(|| {
+          crate::Error::from(crate::error::ProviderError::transient(
+            "No content in final response",
+          ))
+        })?;
         self.record_reasoning(&mut context, reasoning.as_deref());
         self.record_final_answer(&mut context, &content);
         return Ok(AgentOutcome::Done(AgentResult {
@@ -1199,7 +1190,7 @@ impl Agent {
   pub fn run_stream<'a>(
     &'a self,
     user_input: &'a str,
-  ) -> impl Stream<Item = anyhow::Result<AgentStreamEvent>> + 'a {
+  ) -> impl Stream<Item = crate::Result<AgentStreamEvent>> + 'a {
     self.run_continuing_stream(Vec::new(), user_input)
   }
 
@@ -1222,7 +1213,7 @@ impl Agent {
     &'a self,
     conversation: impl Into<Conversation>,
     user_input: &'a str,
-  ) -> impl Stream<Item = anyhow::Result<AgentStreamEvent>> + 'a {
+  ) -> impl Stream<Item = crate::Result<AgentStreamEvent>> + 'a {
     // Converted before the generator so the returned stream owns a plain `Conversation`
     // and borrows nothing from the caller's argument.
     let conversation = conversation.into();
@@ -1252,7 +1243,7 @@ impl Agent {
     &'a self,
     conversation: impl Into<Conversation>,
     user_input: &'a str,
-  ) -> impl Stream<Item = anyhow::Result<AgentStreamEvent>> + 'a {
+  ) -> impl Stream<Item = crate::Result<AgentStreamEvent>> + 'a {
     let conversation = conversation.into();
     stream! {
       let context = self.seed_context(conversation, user_input);
@@ -1290,15 +1281,15 @@ impl Agent {
     &self,
     state: AgentRunState,
     decisions: HashMap<String, ResumedDecision>,
-  ) -> impl Stream<Item = anyhow::Result<AgentStreamEvent>> + '_ {
+  ) -> impl Stream<Item = crate::Result<AgentStreamEvent>> + '_ {
     stream! {
       if let Some(reason) = state.unresumable() {
-        yield Err(anyhow::anyhow!("cannot resume this run: {reason}"));
+        yield Err(crate::Error::invalid_input(format!("cannot resume this run: {reason}")));
         return;
       }
       let current = self.fingerprint();
       if let Some(reason) = state.fingerprint.mismatch(&current) {
-        yield Err(anyhow::anyhow!("cannot resume this run: {reason}"));
+        yield Err(crate::Error::invalid_input(format!("cannot resume this run: {reason}")));
         return;
       }
 
@@ -1334,7 +1325,7 @@ impl Agent {
     decisions: HashMap<String, ResumedDecision>,
     on_suspend: OnSuspend,
     carried_budget_exhausted: bool,
-  ) -> impl Stream<Item = anyhow::Result<AgentStreamEvent>> + 'a {
+  ) -> impl Stream<Item = crate::Result<AgentStreamEvent>> + 'a {
     let scope = observe::RunScope::new(self, &context);
     scope.wrap_stream(self.drive_stream_rounds(
       context,
@@ -1353,7 +1344,7 @@ impl Agent {
     decisions: HashMap<String, ResumedDecision>,
     on_suspend: OnSuspend,
     carried_budget_exhausted: bool,
-  ) -> impl Stream<Item = anyhow::Result<AgentStreamEvent>> + 'a {
+  ) -> impl Stream<Item = crate::Result<AgentStreamEvent>> + 'a {
     stream! {
       // The resumed round, if this is one. Re-executed before any request is issued, so
       // the transcript is never sent to a model while it still holds calls with no
@@ -1591,7 +1582,7 @@ impl Agent {
   /// model or a request the provider considers malformed fails *identically* every time,
   /// so retrying one only spends the attempt budget and delays the real error reaching
   /// the caller by the whole backoff curve.
-  async fn complete(&self, builder: &RequestDraft) -> anyhow::Result<ChatResponse> {
+  async fn complete(&self, builder: &RequestDraft) -> crate::Result<ChatResponse> {
     with_retry(
       || async { self.provider.chat(builder.chat_request()?).await },
       is_transient,
@@ -1606,7 +1597,7 @@ impl Agent {
     &self,
     builder: &RequestDraft,
     token: &CancellationToken,
-  ) -> anyhow::Result<Option<ChatResponse>> {
+  ) -> crate::Result<Option<ChatResponse>> {
     tokio::select! {
       biased;
       () = token.cancelled() => Ok(None),
@@ -1625,7 +1616,7 @@ impl Agent {
   /// Providers that do not implement `stream_options` ignore the field and simply never
   /// send a usage chunk — the same as before it was asked for, so this cannot make a
   /// working provider stop working.
-  async fn complete_stream(&self, builder: &RequestDraft) -> anyhow::Result<ChatChunkStream> {
+  async fn complete_stream(&self, builder: &RequestDraft) -> crate::Result<ChatChunkStream> {
     let mut builder = builder.clone();
     builder.stream_options(ChatCompletionStreamOptions {
       include_usage: Some(true),
@@ -2219,7 +2210,7 @@ impl Agent {
   /// is attached to that message — but only when [`ModelSettings::replay_reasoning`] is
   /// on. One that has no assistant message after it (its message was trimmed away, or
   /// the transcript ends there) is dropped rather than handed to the wrong one.
-  fn build_messages(&self, request: LlmRequest) -> anyhow::Result<WireMessages> {
+  fn build_messages(&self, request: LlmRequest) -> crate::Result<WireMessages> {
     let LlmRequest {
       instructions,
       contents,

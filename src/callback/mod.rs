@@ -1,6 +1,7 @@
 pub mod approval;
 pub mod context_optimizer;
 pub mod dual_approval;
+#[cfg(feature = "mcp")]
 pub mod mcp_guard;
 pub mod path_guard;
 pub mod search_compressor;

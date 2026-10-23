@@ -110,7 +110,7 @@ impl Tool for UpdatePlanTool {
     crate::tools::schema_of::<UpdatePlanArgs>()
   }
 
-  async fn execute(&self, args_json: &str) -> anyhow::Result<String> {
+  async fn execute(&self, args_json: &str) -> crate::Result<String> {
     // Pure validation and formatting: nothing to await, nothing worth a blocking thread.
     execute::run(args_json)
   }

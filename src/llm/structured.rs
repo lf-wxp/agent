@@ -4,7 +4,7 @@
 //! - [`StructuredMode::NativeSchema`]: `response_format = json_schema`, server enforces the structure;
 //! - [`StructuredMode::JsonObject`]: `response_format = json_object` + prompt-injected Schema.
 
-use std::{fmt, str::FromStr};
+use std::str::FromStr;
 
 use async_openai::types::chat::{ChatChoice, FinishReason, ResponseFormat};
 use schemars::JsonSchema;
@@ -12,6 +12,7 @@ use serde::de::DeserializeOwned;
 
 use crate::{
   config,
+  error::ProviderError,
   llm::{
     client::{build_messages, ensure_valid_params},
     provider::Provider,
@@ -101,38 +102,24 @@ impl StructuredMode {
 }
 
 impl FromStr for StructuredMode {
-  type Err = anyhow::Error;
+  type Err = crate::Error;
 
   fn from_str(value: &str) -> Result<Self, Self::Err> {
     match value.trim().to_ascii_lowercase().as_str() {
       "native" | "native_schema" | "json_schema" => Ok(Self::NativeSchema),
       "json_object" | "prompt" => Ok(Self::JsonObject),
       other => {
-        anyhow::bail!("unknown structured mode `{other}`; expected `json_schema` or `json_object`")
+        crate::error::bail!(
+          config,
+          "unknown structured mode `{other}`; expected `json_schema` or `json_object`"
+        )
       }
     }
   }
 }
 
-/// Output was truncated by `max_tokens`. This is a deterministic failure; retrying only burns tokens again,
-/// so callers can skip retries accordingly (see `gaia::solver`).
-#[derive(Debug)]
-pub struct TruncatedOutput {
-  pub limit: u32,
-}
-
-impl fmt::Display for TruncatedOutput {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    write!(
-      f,
-      "output truncated by max_tokens ({}): the reasoning chain consumed the whole budget, so the \
-       JSON body is empty or incomplete",
-      self.limit
-    )
-  }
-}
-
-impl std::error::Error for TruncatedOutput {}
+/// Output truncated by `max_tokens`; see [`crate::error::Error::TruncatedOutput`].
+pub use crate::error::TruncatedOutput;
 
 /// The first choice returned by a structured request, along with the mode used to make it.
 ///
@@ -163,9 +150,11 @@ impl StructuredChoice {
 
   /// Parse the JSON text into `T`, converting every failure into a diagnosable error.
   ///
-  /// Failures are tagged with [`BudgetExhausted`] when the tool budget had run out, so
-  /// callers can skip a retry that would spend the whole budget again.
-  pub fn parse<T: DeserializeOwned>(self) -> anyhow::Result<T> {
+  /// Fails with [`crate::Error::TruncatedOutput`] when the answer was cut off, and with a
+  /// [`ProviderError`] when it is empty or does not parse as `T` — wrapped in
+  /// [`BudgetExhausted`] when the tool budget had run out, so callers can skip a retry
+  /// that would spend the whole budget again.
+  pub fn parse<T: DeserializeOwned>(self) -> crate::Result<T> {
     let finish_reason = self.finish_reason();
     let budget_exhausted = self.budget_exhausted;
 
@@ -182,17 +171,22 @@ impl StructuredChoice {
       .filter(|content| !content.trim().is_empty())
       .ok_or_else(|| {
         tag_budget(
-          anyhow::anyhow!("Empty content in response (finish_reason: {finish_reason:?})"),
+          ProviderError::transient(format!(
+            "Empty content in response (finish_reason: {finish_reason:?})"
+          ))
+          .into(),
           budget_exhausted,
         )
       })?;
 
     serde_json::from_str::<T>(strip_code_fence(&content)).map_err(|err| {
       tag_budget(
-        anyhow::anyhow!(
+        ProviderError::transient(format!(
           "Failed to parse structured output: {err}; raw content: {}",
           truncate_chars(&content, RAW_CONTENT_PREVIEW_CHARS)
-        ),
+        ))
+        .with_source(err)
+        .into(),
         budget_exhausted,
       )
     })
@@ -200,9 +194,9 @@ impl StructuredChoice {
 }
 
 /// Mark a failure as caused by a budget-exhausted attempt, so retries can be skipped.
-fn tag_budget(err: anyhow::Error, budget_exhausted: bool) -> anyhow::Error {
+pub(crate) fn tag_budget(err: crate::Error, budget_exhausted: bool) -> crate::Error {
   if budget_exhausted {
-    err.context(BudgetExhausted)
+    BudgetExhausted::new(err).into()
   } else {
     err
   }
@@ -221,7 +215,7 @@ pub async fn chat_complete_structured_raw<T: JsonSchema>(
   system: Option<&str>,
   prompt: &str,
   registry: &ToolRegistry,
-) -> anyhow::Result<StructuredChoice> {
+) -> crate::Result<StructuredChoice> {
   ensure_valid_params(model, prompt)?;
 
   let mode = StructuredMode::for_model(model);
@@ -263,7 +257,7 @@ pub async fn chat_complete_structured<T>(
   system: Option<&str>,
   prompt: &str,
   registry: &ToolRegistry,
-) -> anyhow::Result<T>
+) -> crate::Result<T>
 where
   T: JsonSchema + DeserializeOwned,
 {

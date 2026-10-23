@@ -33,7 +33,9 @@
 //! because in a long agentic run it *is* the task.
 //!
 //! The whole pipeline tokenizes the request once, through a [`tokens::Ledger`] that each
-//! stage updates with only what it changed.
+//! stage updates with only what it changed, in the optimizer's [`tokens::Encoding`]:
+//! the model's own when it is one `tiktoken` knows, `cl100k_base` otherwise (see
+//! [`ContextOptimizer::for_model`]).
 //!
 //! Everything operates on the per-round [`LlmRequest`] copy.
 //! [`ExecutionContext::events`] is the authoritative transcript and stays complete for
@@ -47,6 +49,7 @@ pub mod tokens;
 
 pub use compaction::{Compaction, Describe};
 pub use summarization::Summarization;
+pub use tokens::Encoding;
 
 use crate::{
   agent::{BeforeLlmCallback, ExecutionContext, llm_request::LlmRequest},
@@ -73,7 +76,8 @@ const DEFAULT_COMPACTION_KEEP_RECENT: usize = 4;
 ///
 /// See the module docs for the pipeline. Configured through the `with_*` builders;
 /// summarization is off unless [`Self::with_summarization`] is called, since it spends an
-/// extra model round per invocation.
+/// extra model round per invocation. Counts tokens with `cl100k_base` unless told the
+/// model ([`Self::for_model`]); the one [`crate::agent::Agent::new`] installs is.
 #[derive(Debug)]
 pub struct ContextOptimizer {
   /// Budget for the whole request — system prompt and instructions included, not just
@@ -85,6 +89,8 @@ pub struct ContextOptimizer {
   keep_recent_min: usize,
   compaction: Option<Compaction>,
   summarization: Option<Summarization>,
+  /// What the budget is counted in.
+  encoding: Encoding,
 }
 
 impl ContextOptimizer {
@@ -95,7 +101,31 @@ impl ContextOptimizer {
       keep_recent_min: DEFAULT_KEEP_RECENT_MIN,
       compaction: Some(Compaction::new(DEFAULT_COMPACTION_KEEP_RECENT)),
       summarization: None,
+      encoding: Encoding::default(),
     }
+  }
+
+  /// Count tokens the way `model` does (see [`Encoding::for_model`]): `o200k_base` for
+  /// GPT-4o, GPT-4.1, GPT-5 and the `o` series, `cl100k_base` for everything else.
+  ///
+  /// Matters most for text the two vocabularies split very differently — Chinese, for
+  /// one — where counting a GPT-4o conversation with `cl100k_base` trims it sooner than
+  /// it needs.
+  #[must_use]
+  pub fn for_model(self, model: &str) -> Self {
+    self.with_encoding(Encoding::for_model(model))
+  }
+
+  /// Count tokens with `encoding`, whatever the model.
+  #[must_use]
+  pub fn with_encoding(mut self, encoding: Encoding) -> Self {
+    self.encoding = encoding;
+    self
+  }
+
+  /// What the budget is counted in.
+  pub fn encoding(&self) -> Encoding {
+    self.encoding
   }
 
   /// Enable the summarization stage, which costs one auxiliary model call whenever
@@ -165,13 +195,14 @@ impl BeforeLlmCallback for ContextOptimizer {
     // BPE pass four or five times over a conversation that is, by definition, near the
     // context window. Every one of those passes is synchronous CPU work on a runtime
     // worker, so each is additionally wrapped in `tokens::offload` — see its docs.
-    let mut ledger = tokens::offload(|| tokens::Ledger::new(request));
+    let mut ledger = tokens::offload(|| tokens::Ledger::with_encoding(request, self.encoding));
     if ledger.total() <= self.max_tokens {
       return;
     }
     tracing::debug!(
       tokens = ledger.total(),
       budget = self.max_tokens,
+      encoding = self.encoding.name(),
       "context optimizer engaged"
     );
 
@@ -333,6 +364,55 @@ mod tests {
 
     assert_eq!(request.contents.len(), before.len());
     assert!(request.instructions.is_empty());
+  }
+
+  /// The budget is counted in the model's own tokens: a Chinese conversation that fits a
+  /// GPT-4o budget in `o200k_base` is left alone, where counting it in `cl100k_base`
+  /// would have trimmed it.
+  #[tokio::test]
+  async fn the_budget_is_counted_in_the_models_encoding() {
+    let sentence = "上下文窗口管理：在不丢失关键信息的前提下，把请求控制在模型的预算之内。";
+    let mut contents = Vec::new();
+    for turn in 0..12 {
+      contents.push(user_msg(&format!("{turn}：{sentence}")));
+      contents.push(assistant_msg(sentence));
+    }
+    let request = request_of(contents);
+    let budget = Encoding::O200kBase.count_request(&request);
+    assert!(
+      tokens::count_request(&request) > budget,
+      "the two encodings must disagree for this test to mean anything"
+    );
+
+    let optimizer = ContextOptimizer::new(budget)
+      .without_compaction()
+      .for_model("gpt-4o");
+    assert_eq!(optimizer.encoding(), Encoding::O200kBase);
+    let mut fitted = request.clone();
+    optimizer.call(&ExecutionContext::new(), &mut fitted).await;
+    assert_eq!(fitted.contents.len(), request.contents.len());
+
+    let mut trimmed = request.clone();
+    ContextOptimizer::new(budget)
+      .without_compaction()
+      .call(&ExecutionContext::new(), &mut trimmed)
+      .await;
+    assert!(trimmed.contents.len() < request.contents.len());
+  }
+
+  /// Not every model is one `tiktoken` knows; those keep the old count.
+  #[test]
+  fn an_unknown_model_keeps_the_default_encoding() {
+    assert_eq!(
+      ContextOptimizer::new(1_000)
+        .for_model("deepseek-v4-flash")
+        .encoding(),
+      Encoding::Cl100kBase
+    );
+    assert_eq!(
+      ContextOptimizer::new(1_000).encoding(),
+      Encoding::Cl100kBase
+    );
   }
 
   /// The gap the old two-strategy split left open: a single run never crosses a turn

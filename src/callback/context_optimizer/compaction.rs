@@ -46,7 +46,7 @@
 //! spelling out, because "was never considered" and "was considered and rejected" look
 //! identical from the registry:
 //!
-//! - [`crate::tools::file_delete`], [`crate::tools::file_upzip`],
+//! - [`crate::tools::file_delete`], `unzip_file`,
 //!   [`crate::tools::file_write`], [`crate::tools::file_edit`], [`crate::tools::shell`]
 //!   — side effects. Re-running deletes, overwrites or executes again, so the note would
 //!   be an instruction to redo work, not to re-fetch it.
@@ -387,7 +387,7 @@ mod tests {
   use crate::{
     agent::ToolResultStatus,
     callback::context_optimizer::tokens,
-    tools::{calculator, file_delete, file_edit, file_upzip, file_write, plan, read_image, shell},
+    tools::{calculator, file_delete, file_edit, file_write, plan, read_image, shell},
   };
 
   fn call(id: &str, name: &str, arguments: Value) -> ContentItem {
@@ -727,7 +727,9 @@ mod tests {
     let compaction = Compaction::new(0);
     for name in [
       file_delete::NAME,
-      file_upzip::NAME,
+      // By name rather than `file_upzip::NAME`, which only exists with the `zip` feature:
+      // the exclusion holds either way.
+      "unzip_file",
       file_write::NAME,
       file_edit::NAME,
       shell::NAME,
@@ -740,6 +742,14 @@ mod tests {
         "`{name}` must not be compacted by default"
       );
     }
+  }
+
+  /// The literal above is the tool's real name: asserting the two agree keeps a rename
+  /// from leaving this exclusion pointed at a name nothing answers to.
+  #[cfg(feature = "zip")]
+  #[test]
+  fn the_literal_name_is_the_unzip_tools_own() {
+    assert_eq!(crate::tools::file_upzip::NAME, "unzip_file");
   }
 
   /// Running twice must not stack notes on top of notes: the second pass rewrites an

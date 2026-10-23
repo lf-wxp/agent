@@ -10,7 +10,6 @@ use std::{
   time::Duration,
 };
 
-use anyhow::Context;
 use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::{
   RoleClient, ServiceExt,
@@ -24,13 +23,13 @@ use rmcp::{
 use serde_json::Value;
 use tokio::process::Command;
 
-use crate::tools::tool::Tool;
+use crate::{
+  error::ResultExt,
+  tools::tool::{MAX_TOOL_NAME_CHARS, Tool},
+};
 
 /// Separates the server label from the remote tool name in the local name.
 const LABEL_SEPARATOR: &str = "__";
-
-/// The chat completions API rejects function names longer than this.
-const MAX_NAME_CHARS: usize = 64;
 
 /// How long to wait for the TCP/TLS handshake with a remote MCP server.
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -63,11 +62,12 @@ impl McpConnection {
   /// Connect over stdio, spawning `command` as a child process.
   ///
   /// `label` namespaces the server's tools locally; see [`local_name`].
-  pub async fn spawn(label: &str, command: Command) -> anyhow::Result<Self> {
+  pub async fn spawn(label: &str, command: Command) -> crate::Result<Self> {
     Self::check_label(label)?;
 
-    let transport = TokioChildProcess::new(command)
-      .with_context(|| format!("failed to spawn MCP server `{label}`"))?;
+    let transport = TokioChildProcess::new(command).wrap_err_with(crate::Error::mcp, || {
+      format!("failed to spawn MCP server `{label}`")
+    })?;
 
     Self::serve(label, transport).await
   }
@@ -80,9 +80,13 @@ impl McpConnection {
     label: &str,
     url: &str,
     headers: &BTreeMap<String, String>,
-  ) -> anyhow::Result<Self> {
+  ) -> crate::Result<Self> {
     Self::check_label(label)?;
-    anyhow::ensure!(!url.trim().is_empty(), "server url must not be empty");
+    crate::error::ensure!(
+      !url.trim().is_empty(),
+      invalid_input,
+      "server url must not be empty"
+    );
 
     let mut config = StreamableHttpClientTransportConfig::with_uri(url.trim().to_owned());
     let headers = build_headers(headers)?;
@@ -95,23 +99,29 @@ impl McpConnection {
     Self::serve(label, transport).await
   }
 
-  fn check_label(label: &str) -> anyhow::Result<()> {
-    anyhow::ensure!(!label.trim().is_empty(), "server label must not be empty");
+  fn check_label(label: &str) -> crate::Result<()> {
+    crate::error::ensure!(
+      !label.trim().is_empty(),
+      invalid_input,
+      "server label must not be empty"
+    );
     Ok(())
   }
 
   /// Run the MCP handshake over an already-built transport.
-  async fn serve<T, E, A>(label: &str, transport: T) -> anyhow::Result<Self>
+  async fn serve<T, E, A>(label: &str, transport: T) -> crate::Result<Self>
   where
     T: rmcp::transport::IntoTransport<RoleClient, E, A>,
     E: std::error::Error + Send + Sync + 'static,
   {
     // `()` is the client handler: this agent exposes no sampling, roots or elicitation
     // back to the server, it only calls tools.
-    let service = ()
-      .serve(transport)
-      .await
-      .with_context(|| format!("failed to initialize MCP server `{label}`"))?;
+    let service =
+      ().serve(transport)
+        .await
+        .wrap_err_with(crate::Error::mcp, || {
+          format!("failed to initialize MCP server `{label}`")
+        })?;
 
     let info = service.peer_info();
     tracing::info!(label, ?info, "connected to MCP server");
@@ -123,12 +133,14 @@ impl McpConnection {
   }
 
   /// Discover the server's tools, adapted to the local trait.
-  pub async fn tools(&self) -> anyhow::Result<Vec<Arc<dyn Tool>>> {
+  pub async fn tools(&self) -> crate::Result<Vec<Arc<dyn Tool>>> {
     let tools = self
       .service
       .list_all_tools()
       .await
-      .with_context(|| format!("failed to list tools of MCP server `{}`", self.label))?;
+      .wrap_err_with(crate::Error::mcp, || {
+        format!("failed to list tools of MCP server `{}`", self.label)
+      })?;
 
     let adapted = tools
       .into_iter()
@@ -175,16 +187,20 @@ impl McpConnection {
   ///
   /// Fails when tools from this server are still registered somewhere, since shutting
   /// down would leave them unusable. Drop the registry first.
-  pub async fn shutdown(self) -> anyhow::Result<()> {
+  pub async fn shutdown(self) -> crate::Result<()> {
     let label = self.label;
     let service = Arc::try_unwrap(self.service).map_err(|_| {
-      anyhow::anyhow!("cannot shut down MCP server `{label}` while its tools are still in use")
+      crate::Error::mcp(format!(
+        "cannot shut down MCP server `{label}` while its tools are still in use"
+      ))
     })?;
 
     service
       .cancel()
       .await
-      .with_context(|| format!("failed to shut down MCP server `{label}`"))?;
+      .wrap_err_with(crate::Error::mcp, || {
+        format!("failed to shut down MCP server `{label}`")
+      })?;
 
     tracing::info!(%label, "disconnected from MCP server");
     Ok(())
@@ -224,7 +240,7 @@ impl Tool for McpTool {
     self.parameters.clone()
   }
 
-  async fn execute(&self, args_json: &str) -> anyhow::Result<String> {
+  async fn execute(&self, args_json: &str) -> crate::Result<String> {
     let request = CallToolRequestParams::new(self.remote_name.clone())
       .with_arguments(parse_arguments(args_json)?);
 
@@ -232,15 +248,18 @@ impl Tool for McpTool {
       .service
       .call_tool(request)
       .await
-      .with_context(|| format!("MCP tool `{}` call failed", self.remote_name))?;
+      .wrap_err_with(crate::Error::mcp, || {
+        format!("MCP tool `{}` call failed", self.remote_name)
+      })?;
 
     let rendered = render_content(&result.content, result.structured_content.as_ref());
 
     // MCP reports tool-level failures in-band rather than as protocol errors; turn them
     // into an `Err` so the registry feeds the text back to the model like any other
     // tool failure.
-    anyhow::ensure!(
+    crate::error::ensure!(
       !result.is_error.unwrap_or(false),
+      mcp,
       "MCP tool `{}` reported an error: {rendered}",
       self.remote_name
     );
@@ -263,15 +282,18 @@ impl Tool for McpTool {
 /// Messages name the offending header but never quote its value, which is often a secret.
 fn build_headers(
   headers: &BTreeMap<String, String>,
-) -> anyhow::Result<HashMap<HeaderName, HeaderValue>> {
+) -> crate::Result<HashMap<HeaderName, HeaderValue>> {
   let mut built = HashMap::with_capacity(headers.len());
 
   for (name, value) in headers {
     let name = name.trim();
-    let header_name = HeaderName::try_from(name)
-      .with_context(|| format!("`{name}` is not a valid HTTP header name"))?;
+    let header_name = HeaderName::try_from(name).wrap_err_with(crate::Error::mcp, || {
+      format!("`{name}` is not a valid HTTP header name")
+    })?;
     let header_value = HeaderValue::from_str(value.trim())
-      .with_context(|| format!("header `{name}` has a value the HTTP layer rejects"))?;
+      .wrap_err_with(crate::Error::mcp, || {
+        format!("header `{name}` has a value the HTTP layer rejects")
+      })?;
 
     built.insert(header_name, header_value);
   }
@@ -302,14 +324,14 @@ pub(crate) fn local_name(label: &str, remote_name: &str) -> String {
         '_'
       }
     })
-    .take(MAX_NAME_CHARS)
+    .take(MAX_TOOL_NAME_CHARS)
     .collect::<String>();
 
-  if sanitized.chars().count() == MAX_NAME_CHARS {
+  if sanitized.chars().count() == MAX_TOOL_NAME_CHARS {
     tracing::warn!(
       label,
       remote_name,
-      "tool name truncated to {MAX_NAME_CHARS} chars to fit the API limit"
+      "tool name truncated to {MAX_TOOL_NAME_CHARS} chars to fit the API limit"
     );
   }
 
@@ -334,13 +356,16 @@ pub(crate) fn is_mcp_tool_name(name: &str) -> bool {
 ///
 /// Models send an empty string or `null` for tools that take no arguments, neither of
 /// which deserializes into an object.
-fn parse_arguments(args_json: &str) -> anyhow::Result<JsonObject> {
+fn parse_arguments(args_json: &str) -> crate::Result<JsonObject> {
   let trimmed = args_json.trim();
   if trimmed.is_empty() || trimmed == "null" {
     return Ok(JsonObject::default());
   }
 
-  serde_json::from_str(trimmed).context("MCP tool arguments must be a JSON object")
+  serde_json::from_str(trimmed).wrap_err(
+    crate::Error::mcp,
+    "MCP tool arguments must be a JSON object",
+  )
 }
 
 /// Flatten the result into the text a chat tool message can carry.
@@ -475,7 +500,7 @@ mod tests {
   #[test]
   fn truncates_names_over_the_api_limit() {
     let name = local_name("demo", &"x".repeat(100));
-    assert_eq!(name.chars().count(), MAX_NAME_CHARS);
+    assert_eq!(name.chars().count(), MAX_TOOL_NAME_CHARS);
     assert!(name.starts_with("demo__"));
   }
 

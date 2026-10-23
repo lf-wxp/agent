@@ -22,7 +22,7 @@
 | 工具循环、并行工具调用、流式输出 | ✅ | `Agent::drive` / `drive_stream`、`execute_tool_calls`（`join_all`） |
 | 结构化输出 | ✅ | `src/llm/structured.rs`、`src/agent/runtime/structured.rs`（`final_answer` 工具，或 `response_format`） |
 | 人工审批 / 挂起恢复 / checkpoint | ✅ | `DualApprovalCallback`、`ApprovalStore`、`RunFingerprint`、`RunCheckpoint`；审批时改写参数（`edit`）未做 |
-| 上下文压缩、摘要、截断 | ✅ | `src/callback/context_optimizer/`；tokenizer 固定为 `cl100k_base`；摘要默认关闭 |
+| 上下文压缩、摘要、截断 | ✅ | `src/callback/context_optimizer/`；按模型选择 tokenizer（OpenAI 的新模型用 `o200k_base`，其余用 `cl100k_base` 估算）；摘要默认关闭 |
 | MCP 客户端 | ⚠️ | 支持 stdio 和 Streamable HTTP；不支持 SSE；不支持 resources、prompts、sampling、elicitation；不支持 `list_changed` 通知；不会断线重连 |
 | 会话持久化 | ⚠️ | 只有 `FileSessionStore` 这一种后端 |
 | 写入和执行类工具 | ❌ | 内置工具只能读、删、解压，没有 `write_file`、`edit_file`、shell、`grep` |
@@ -35,11 +35,11 @@
 | 多 agent | ⚠️ | 有 agent-as-tool（`AgentTool`，`src/agent/sub_agent.rs`）；handoff、workflow / graph 编排没有 |
 | 长期记忆 / RAG | ✅ | SQLite 持久化向量库（`knowledge_base::store`，增量索引、复用已算过的向量）、`retrieve` 工具、跨会话记忆（`memory`：remember / forget / recall + 每轮自动召回）；检索是精确余弦，不是 ANN；没有混合检索和重排 |
 | 可观测性 | ✅ | GenAI 约定的 span（`invoke_agent` / `chat` / `execute_tool`），`--features otel` 导出 OTLP；按模型统计用量（含缓存、推理 token），子 agent / 工具 / 摘要的消耗计入所在运行；按价格表估算成本。没有 metrics |
-| 类型化错误 | ❌ | 全部使用 `anyhow` |
-| Cargo features | ❌ | 没有 feature，MCP、web、gaia、CLI 相关依赖都会强制编译 |
-| 工具定义体验 | ⚠️ | `simple_tool!` 只在 crate 内可见，没有 `#[tool]` 过程宏；`Tool` trait 和 `async-openai` 耦合 |
+| 类型化错误 | ✅ | `agent::Error`（thiserror，`#[non_exhaustive]`，按调用方能怎么处理分 11 类），公开 API 和可实现的 trait 全部返回 `agent::Result`；库内部不再用 `anyhow`，二进制、示例、集成测试仍用它 |
+| Cargo features | ✅ | `cli` / `mcp` / `sqlite` / `zip` / `otel`，默认除 `otel` 外全开；`default-features = false` 时依赖从约 260 个降到约 180 个；CI 检查每个 feature 单独开启和全部关闭 |
+| 工具定义体验 | ✅ | `Tool` 只依赖自有的 `ToolDefinition`，与 `async-openai` 解耦；`FnTool` 用参数结构体加 async 闭包定义工具；注册时校验工具名。没有 `#[tool]` 过程宏（讨论后选了泛型构造器） |
 | 服务化 | ⚠️ | Web UI 只监听 127.0.0.1，没有鉴权，只支持单用户 |
-| 测试 | ⚠️ | 约 530 个单测和集成测试；没有真实 LLM 的端到端回归测试；`stream.rs`、`complete.rs`、`embed.rs` 基本没有测试覆盖 |
+| 测试 | ⚠️ | 全部 feature 下根 crate 约 850 个测试（库内 769、CLI 53、集成测试 21、doctest），另有 `shared` / `web-ui` 33 个；没有真实 LLM 的端到端回归测试（第 14 项）；`llm::complete` 没有单元测试；CI 没跑示例里的测试和 `shared` / `web-ui`（第 15 项） |
 
 ## 3. 缺口详述（按优先级）
 
@@ -56,7 +56,7 @@
    - 支持 reasoning；
    - 可以配置 `temperature`、`top_p`、`max_tokens`；
    - 用一张模型能力表代替按关键字判断。
-4. **多模态**：
+4. **多模态**：（→ 执行项第 13 项）
    - 用户消息支持图片；
    - `read_image` 改为走 `Provider`；
    - MCP 返回的图片透传给模型。
@@ -67,8 +67,8 @@
 6. **多 agent**：先做 agent-as-tool（把 `Agent` 包装成 `Tool`），再考虑 handoff 和 workflow 编排。
 7. **长期记忆和 RAG**：持久化向量库（例如 SQLite 或 LanceDB）、`retrieve` 工具、跨会话记忆。
 8. **可观测性**：用 `#[instrument]` 加 span，接入 OpenTelemetry，统计成本。
-9. **补全 MCP**：SSE 传输、resources 和 prompts、`list_changed`、断线重连；把 Agent 本身作为 MCP Server 对外提供。
-10. **审批时改写参数（`edit`）**：方案见 `docs/approval-hitl.md` 12.1。
+9. **补全 MCP**：SSE 传输、resources 和 prompts、`list_changed`、断线重连；把 Agent 本身作为 MCP Server 对外提供。（→ 执行项第 8、9 项）
+10. **审批时改写参数（`edit`）**：方案见 `docs/approval-hitl.md` 12.1。（→ 执行项第 12 项）
 
 ### P2：工程化
 
@@ -77,9 +77,9 @@
 - 公开工具宏，或提供 `#[tool]` 过程宏；
 - 让 `Tool` 和 `async-openai` 解耦；
 - token 计数按模型选择 tokenizer；
-- LLM 重试时读取 `Retry-After`；
-- 提供服务化的 HTTP API 和鉴权；
-- 增加端到端回归评测；
+- LLM 重试时读取 `Retry-After`；（→ 执行项第 10 项）
+- 提供服务化的 HTTP API 和鉴权；（→ 执行项第 11 项）
+- 增加端到端回归评测；（→ 执行项第 14 项）
 - 修正 README 中测试数量不一致的问题：徽章写 418，正文写 528。
 
 ## 4. 执行项
@@ -93,8 +93,350 @@
 | 3 | LLM Provider 抽象和模型参数 | Provider trait、reasoning、采样参数与 `max_tokens` 可配置、修复 `read_image` 绕过 `Provider` 的问题 | ✅ 已完成 |
 | 4 | 子 agent 与规划 | agent-as-tool、todo / plan 工具 | ✅ 已完成 |
 | 5 | 可观测性 | span 埋点、接入 OTel、成本统计 | ✅ 已完成 |
-| 6 | 持久化检索和长期记忆 | 持久化向量库、`retrieve` 工具、跨会话记忆 | ✅ 已完成，待审批 |
-| 7 | 工程化 | `thiserror`、Cargo features、MCP 补全、公开工具宏等（可以按需再拆分） | ⏳ 待开始 |
+| 6 | 持久化检索和长期记忆 | 持久化向量库、`retrieve` 工具、跨会话记忆 | ✅ 已完成 |
+| 7a | 工程化：Cargo features | `cli` / `mcp` / `zip` 三个 feature，默认全开；CI 检查各种组合 | ✅ 已完成 |
+| 7b | 工程化：工具定义体验 | `Tool` 与 `async-openai` 解耦（自有 `ToolDefinition`）；`FnTool` 泛型构造器（结构体参数 + async 闭包） | ✅ 已完成 |
+| 7c | 工程化：类型化错误 | 用 `thiserror` 定义 `agent::Error`，公开 API 全面改为返回 `agent::Result<T>` | ✅ 已完成 |
+| 7d | 工程化：小修 | tokenizer 按模型选择（gpt-4o / o 系列用 `o200k_base`）；README 测试数不再写死 | ✅ 已完成，待审批 |
+
+### 后续计划（第 8–15 项）
+
+第 8–11 项在第 7 项讨论时确认，第 12–15 项是 2026-10-22 补充的（原来散落在第 2、3 节和 7c 的遗留里）。都暂未排期。下面每项都列了现状、子任务、开始前要确认的问题和验收标准，用来追踪进度。
+
+| # | 执行项 | 范围 | 规模 | 依赖 | 状态 |
+|---|---|---|---|---|---|
+| 8 | 补全 MCP | 断线重连、`list_changed` 通知、resources / prompts、SSE 传输（待定） | 中–大 | 无 | ⏳ 待开始 |
+| 9 | Agent 作为 MCP Server | 把一个 `Agent` 作为 MCP 工具暴露给其他客户端 | 中 | HTTP 传输的鉴权与第 11 项共用 | ⏳ 待开始 |
+| 10 | LLM 重试读取 `Retry-After` | 自己实现聊天和 embedding 的 HTTP 层，按服务端要求的时间等待 | 小–中 | 无 | ⏳ 待开始 |
+| 11 | 服务化 HTTP API 与鉴权 | 多用户、带鉴权的对外 API；Web UI 不再只能本机访问 | 大 | 无；第 9 项的 HTTP 传输复用它的鉴权 | ⏳ 待开始 |
+| 12 | 审批时改写参数（`edit`） | 审批人修改工具参数后放行，对话记录与实际执行的参数保持一致 | 中 | 无 | ⏳ 待开始 |
+| 13 | 多模态输入 | 用户消息带图片；工具（含 MCP）返回的图片交给模型 | 大 | 与第 8 项都改 MCP 结果的处理，先做的一方定接口 | ⏳ 待开始 |
+| 14 | 真实 LLM 的端到端回归评测 | 一组固定任务，用真实模型定期跑，按通过率判断是否退化 | 中 | 需要 API key 和预算 | ⏳ 待开始 |
+| 15 | 补全 CI 覆盖 | CI 补上示例里的测试、`shared` / `web-ui` 的测试和 wasm 端 clippy | 小 | 无 | ⏳ 待开始 |
+
+**建议顺序**：15 → 14 → 10 → 8 → 12 → 13 → 9 → 11。
+
+- 第 15 项最小，补上之后后面每一项都受益；做的时候发现 CI 漏掉的不止示例（见第 15 项现状）。
+- 第 14 项给后面几项一张用真实模型兜底的安全网：第 10 项要换掉 HTTP 层，第 13 项要改消息类型，都只靠假服务测试不够放心。它需要先定 API key 和预算，定不下来就往后挪。
+- 第 10 项改动集中在两个后端，和其他项互不依赖，直接改善被限流时的表现。
+- 第 8 项只改现有的 MCP 客户端。
+- 第 12 项方案已有（见 `docs/approval-hitl.md` 12.1），改动集中在审批链路。
+- 第 13 项最好排在第 8 项之后：两者都要改 MCP 返回内容的处理。
+- 第 9 项要先决定「非交互场景下需要审批的工具怎么办」，第 11 项也要用到这个决定。
+- 第 11 项最大；它的鉴权方案定下后，第 9 项的 HTTP 传输可以直接复用。
+
+**状态约定**：⏳ 待开始 → 🚧 进行中 → ✅ 已完成，待审批 → ✅ 已完成。
+
+- 开始一项时，把上表的状态改为 🚧，并先和你确认该项的「开始前要确认」。
+- 每完成一个子任务，就勾选对应的复选框。
+- 做完后在下方「执行记录」补一节，并同步更新第 2 节「现状对照」。
+
+#### 第 8 项：补全 MCP
+
+**现状**
+- `src/tools/mcp/client.rs`：
+  - `McpConnection::spawn` 走 stdio（`TokioChildProcess`），`McpConnection::connect` 走 Streamable HTTP；
+  - 只用到 `list_all_tools` 和 `call_tool`；
+  - 客户端处理器是 `()`，服务端发来的通知（工具列表变化、日志、进度）全部被忽略。
+- `src/tools/mcp/config.rs`：`mcp.json` 里写 `"type": "sse"` 时直接报错。
+- **rmcp 3.5.1 已不提供旧版 HTTP+SSE 客户端传输**（`src/transport/` 下只有 Streamable HTTP 客户端），要支持 SSE 只能自己实现。MCP 规范从 2025-03-26 版起已用 Streamable HTTP 取代 HTTP+SSE。
+- **工具集是静态的**：
+  - 工具列表只在 `ToolRegistry::with_mcp_over` 连接时取一次；
+  - `Agent` 持有不可变的 `Arc<ToolRegistry>`；
+  - 运行指纹包含工具名：挂起的运行恢复时，新增工具没有影响，少了工具会被拒绝。
+- **不会重连**：子进程退出或 HTTP 会话失效后，对应的 `McpTool` 每次调用都会失败，直到进程重启。
+
+**子任务**
+- [ ] 8.1 断线重连：
+  - 调用因连接断开而失败时，按原配置重连再重试一次；
+  - 能检测到 stdio 子进程已退出；
+  - 重连次数和退避有上限，重连失败时返回 `Error::Mcp`。
+- [ ] 8.2 `list_changed`：实现 `ClientHandler::on_tool_list_changed`，收到后重新 `list_all_tools`，让新的工具集生效（生效方式见「开始前要确认」）。
+- [ ] 8.3 resources：`list_resources` / `read_resource`。
+- [ ] 8.4 prompts：`list_prompts` / `get_prompt`，在 CLI 里给一个入口（例如 `/prompt`）。
+- [ ] 8.5 SSE 传输：决定做不做；做的话自己实现客户端（GET 建立事件流，向服务端给出的端点 POST 消息）。
+- [ ] 8.6（可选）sampling / elicitation：处理服务端反向发来的「调用模型」「向用户要输入」请求；elicitation 可以接到现有的审批界面。
+- [ ] 8.7 文档、`examples/mcp_*` 和测试同步更新。
+
+**开始前要确认**
+- 工具列表变化后怎么生效：
+  - 让 `Agent` 的工具集可以热替换；
+  - 或者只在下一次运行时生效。
+  - 两种做法都要考虑和运行指纹的关系。
+- resources 给谁用：
+  - 做成工具交给模型（例如 `<server>__read_resource`）；
+  - 或者只作为 API 给调用方读取。
+- SSE 值不值得做：旧协议的服务器在减少，自己实现还要长期维护。
+
+**验收标准**
+- 用 `examples/shared` 的 demo server 验证：
+  - 杀掉子进程后，下一次调用自动重连并成功；
+  - 服务端增删工具后，下一轮请求里的工具定义随之变化；
+  - resources 和 prompts 能列出并读取。
+- 6 种 feature 组合的 clippy 和测试全部通过；关掉 `mcp` feature 时编译不受影响。
+
+**不在本项范围**：MCP 返回的图片透传给模型，放到多模态一起做（见第 2 节「多模态输入」）。
+
+#### 第 9 项：Agent 作为 MCP Server
+
+**现状**
+- `AgentTool`（`src/agent/sub_agent.rs`）已经能把 `Agent` 包装成工具，但只能给同一进程里的另一个 agent 用：参数是一个 `task`，每次调用都是一次全新的运行。
+- rmcp 的服务端部分（`server`、`macros`、`transport-io`、Streamable HTTP 服务端）只在 `[dev-dependencies]` 里，给 `examples/mcp_server.rs`、`examples/mcp_http_server.rs` 和 `examples/shared/demo_server.rs` 用。
+- **审批模型不匹配**：需要审批时运行会挂起（`AgentOutcome::Suspended`），而 MCP 的 `tools/call` 是一次请求对应一次响应。
+
+**子任务**
+- [ ] 9.1 新增 feature（暂名 `mcp-server`），把 rmcp 的服务端 feature 从 dev-dependencies 移进来；不开这个 feature 时，库的依赖不变。
+- [ ] 9.2 `AgentMcpServer`（暂名）实现 `ServerHandler`：
+  - 每个 `Agent` 暴露成一个 MCP 工具，参数和 `AgentTool` 一致；
+  - `tools/call` 执行一次运行，把回答作为文本返回；
+  - 失败时设置 `is_error`。
+- [ ] 9.3 取消：把 MCP 的 `notifications/cancelled` 接到运行的 `CancellationToken`。
+- [ ] 9.4 进度：把 `AgentStreamEvent`（工具调用、计划更新）转成 `notifications/progress`。
+- [ ] 9.5 审批：按「开始前要确认」定下的方式处理需要审批的工具。
+- [ ] 9.6 传输：
+  - stdio 必做；
+  - Streamable HTTP 需要鉴权：可以等第 11 项定下鉴权后再做，也可以先做最简单的 bearer token。
+- [ ] 9.7 可执行入口（例如 `cli --mcp-server`，或单独的示例 / 二进制），能直接配置进 Claude Desktop、Cursor 等 MCP 客户端。
+- [ ] 9.8 文档和测试。
+
+**开始前要确认**
+- 需要审批的工具怎么办，三选一：
+  - 默认拒绝；
+  - 用 elicitation 让 MCP 客户端那边的用户确认；
+  - 只暴露不需要审批的工具集。
+- 会话：每次调用都是新运行（和 `AgentTool` 一致），还是支持带会话 ID 的连续对话。
+- 暴露粒度：只暴露 agent 本身，还是把它的工具也一起暴露出去。
+- 用量：每次调用的 token 用量要不要随结果返回（例如放在 `_meta` 里）。
+
+**验收标准**
+- 用本 crate 自己的 MCP 客户端（`McpConnection::spawn`）连上它：
+  - `tools/list` 能看到 agent 工具；
+  - `tools/call` 能拿到回答；
+  - 客户端取消后，服务端的运行被取消。
+- 在一个真实的 MCP 客户端里手动验证一次。
+- 不开 `mcp-server` feature 时，默认构建的依赖数不变。
+
+#### 第 10 项：LLM 重试读取 `Retry-After`
+
+**现状**
+- `src/llm/retry.rs`：`with_retry` 用 `backon` 做指数退避，完全不看 `Retry-After`（文档里写了这一限制）。
+- **根本原因**：`async-openai` 的 `ApiErrorResponse` 只保留状态码和错误体，响应头在错误到达我们之前就被丢掉了。用到它的地方有两处：
+  - `OpenAiCompatible`（`src/llm/backend.rs`），通过 `create_byot` / `create_stream_byot`；
+  - `OpenAiEmbedder`（`src/knowledge_base/embed.rs`）。
+- **有利条件**：
+  - `backon` 1.6 有 `adjust(|err, default_delay| ...)`，可以按错误修改下一次的等待时间；
+  - `ProviderError` 是自有类型（7c），可以直接加字段；
+  - `ChatRequest::to_body`、`parse_response`、`parse_chunk` 已经基于原始 JSON，自己发 HTTP 不需要重写解析；
+  - `crate::http::client()` 已有共享的 reqwest 客户端。
+
+**子任务**
+- [ ] 10.1 `ProviderError` 增加 `retry_after: Option<Duration>`，以及 `with_retry_after` / `retry_after()`。
+- [ ] 10.2 `with_retry` 用 `adjust`：
+  - 有 `retry_after` 时，等待 `max(retry_after, 默认退避)`；
+  - 超过上限时不再重试，直接返回错误。
+- [ ] 10.3 聊天请求改用 reqwest 自己发：
+  - 实现 `OpenAiCompatible::create` / `create_stream`，流式部分自己解析 SSE；
+  - 从响应头读 `Retry-After`，支持秒数和 HTTP 日期两种格式；
+  - 部分服务（如 Azure OpenAI）还会发 `retry-after-ms`，一并支持。
+- [ ] 10.4 embedding 请求同样处理。
+- [ ] 10.5 行为保持不变：
+  - 错误分类（状态码 → 能否重试）不变；
+  - `OpenAIConfig` 的配置方式不变（base URL、key、组织、项目、自定义头）；
+  - `OPENAI_*` 环境变量照常生效。
+- [ ] 10.6 文档（去掉 `retry.rs` 里的「已知限制」）和测试。
+
+**开始前要确认**
+- 自己实现 HTTP 层，还是给 `async-openai` 提 PR、让它保留响应头：
+  - 自己实现工作量更大，但不受上游节奏影响；
+  - 提 PR 改动小，但要等上游合并和发版。
+- 自己实现之后，`async-openai` 基本只剩请求 / 响应的类型定义，要不要顺便减少对它的依赖。
+- 等待上限设多少（例如 60 秒）；超过上限时是直接失败，还是按上限等待后再试。
+
+**验收标准**
+- 本地假服务返回 `429` 加 `Retry-After: 2`：第二次请求在约 2 秒后才发出。
+- `Retry-After` 超过上限时不再重试。
+- 流式和非流式、聊天和 embedding 四种情况都有测试。
+- 错误分类、reasoning 字段、缓存 token 归一化相关的现有测试全部通过，发出的请求体不变。
+
+#### 第 11 项：服务化 HTTP API 与鉴权
+
+**现状**
+- Web 服务（`src/bin/cli/web.rs`）只是 CLI 的一部分：
+  - 只绑定 `127.0.0.1`，靠 CORS 和 Host 头检查防 DNS rebinding，**没有任何鉴权**；
+  - 路由（`/api/chat`、`/api/history`、`/api/stream`、`/api/approvals`、`/api/approve/{id}`、`/api/suspended` 等）都面向单个会话（`--session`）和单个作用域（`LOCAL_SCOPE = "local"`）；
+  - 用全局的 `turn_lock` 串行处理每一轮。
+- **库里已为多用户留好接口**：
+  - `SessionStore`、`ApprovalStore`、`MemoryStore` 都按 `scope` 隔离；
+  - `Provider` 可以按租户各建一个，凭证和并发预算互相隔离（`examples/multi_tenant.rs`）；
+  - `Agent::run_structured_raw` 接受运行时传入的 JSON Schema。
+- 会话存储只有文件实现（`FileSessionStore`），多个实例之间无法共享。
+
+**子任务**
+- [ ] 11.1 设计 API：
+  - 资源和路由覆盖会话、消息、流式事件（SSE）、审批、挂起的运行、结构化输出；
+  - 决定请求 / 响应类型放在哪里（是否复用 `crates/shared`）。
+- [ ] 11.2 鉴权：
+  - API key / bearer token 映射到用户（即 `scope`）；
+  - key 的存储和吊销；
+  - 每个请求只能访问自己 scope 下的会话、审批和记忆。
+- [ ] 11.3 独立的服务入口：新二进制（暂名 `server`）加对应 feature，不和 CLI 的本机 Web UI 混在一起；CLI 的本机模式保持不变。
+- [ ] 11.4 多用户并发：
+  - 每个会话一把锁，取代全局 `turn_lock`；
+  - 每个用户的并发数和速率限制。
+- [ ] 11.5 部署相关：
+  - 监听地址可配置；
+  - TLS，或明确要求部署在反向代理之后；
+  - CORS 白名单、请求体大小限制、健康检查接口。
+- [ ] 11.6 工具安全：服务端以什么权限、在哪个工作区执行 `run_command` 和文件写入类工具。
+- [ ] 11.7（视需要）共享存储：基于 SQLite 或 Postgres 的 `SessionStore` / `ApprovalStore`。
+- [ ] 11.8（后续）Web UI 能连接远程服务（登录或填写 token）。
+- [ ] 11.9 文档、部署说明、端到端测试。
+
+**开始前要确认**
+- 多用户下文件和 shell 工具怎么隔离：每个用户一个工作区目录，还是服务端默认关闭这些工具。
+- 鉴权做到什么程度：静态 API key 列表，还是接入 OIDC 或外部身份系统。
+- 要不要支持多实例部署：这决定共享存储（11.7）是否必须做。
+
+**验收标准**
+- 两个用户用各自的 key，只能看到自己的会话、审批和记忆。
+- 不带 key 或 key 错误时返回 `401`。
+- 挂起 → 审批 → 恢复、以及取消的完整流程都能通过 HTTP 跑通。
+- 有基于本地假模型服务的端到端测试。
+
+#### 第 12 项：审批时改写参数（`edit`）
+
+**现状**
+- 审批只有「批准」和「带理由拒绝」两种结果：
+  - 钩子返回 `ToolCallDecision`（`Proceed` / `ShortCircuit` / 挂起），恢复时是 `ResumedDecision`（`Approved` / `Refused(String)`）；
+  - Web 端协议 `ApprovalDecision`（`crates/shared`）只有 `approved`、`sticky`、`reason` 三个字段。
+- 现在要改参数，只能拒绝并在理由里写清楚（例如 `n: 路径应该是 /tmp/x`），让模型自己重新调用一次，多花一轮。
+- 设计已经分析过（`docs/approval-hitl.md` 12.1，当时因为「带理由拒绝」已够用而推迟），结论：
+  - 给决定类型加一个变体几乎没有成本，难点在**对话记录的一致性**；
+  - `record_tool_calls` 在审批之前就把原始参数写进了记录，`build_messages` 又会原样发回模型。如果执行的是改写后的参数，模型会看到「自己的原始参数 + 一个成功结果」，以为原始参数已经执行过。这是正确性问题。
+  - 往记录里追加一条「更正」是最差的做法：同一个 `tool_call_id` 会在一个请求里出现两次，多数 provider 直接拒绝。
+
+**子任务**
+- [ ] 12.1 决定类型：`ToolCallDecision` 和 `ResumedDecision` 各加一个带新参数的变体（暂名 `Edited(Value)`）。
+- [ ] 12.2 回填记录：按 12.1 的倾向方案，审批阶段收集 `call_id → 新参数`，在 `execute_tool_calls` 末尾**只为真正执行了的调用**回填记录；被拒绝的保留原始参数。
+- [ ] 12.3 挂起与恢复：`SuspendedToolCall.raw_arguments` 带上改写后的值，否则恢复时改写会悄悄丢失；没被批准的改写不保留。
+- [ ] 12.4 校验：新参数必须是 JSON object；是否按工具的 schema 校验见「开始前要确认」；校验失败时让审批人重新填写，而不是直接执行。
+- [ ] 12.5 `edit` 与「总是允许」（sticky）互斥：一次改写只针对这一次调用。
+- [ ] 12.6 归因：模型要能知道参数被人改过（例如工具结果前加一句「参数已由用户修改为 …」），和拒绝理由的 `User denied …` 前缀同一个思路（见 `docs/approval-hitl.md` 第 10 节）。
+- [ ] 12.7 前端：
+  - 终端：在审批提示里加一个「编辑」选项，用预填好原参数的输入行修改；
+  - Web UI：审批卡片里可编辑的 JSON 文本框；
+  - `ApprovalDecision` 加 `arguments: Option<Value>`，带 `#[serde(default)]`，旧版前端照常能用。
+- [ ] 12.8 文档（`docs/approval-hitl.md` 12.1 改为已实现、README）和测试。
+
+**开始前要确认**
+- 归因的写法：只在工具结果里注明，还是同时改写记录里的调用参数（推荐两者都做：记录里是实际执行的参数，结果里说明是用户改的）。
+- 新参数要不要按工具的 JSON Schema 严格校验：要的话需要引入 JSON Schema 校验库。
+- MCP 工具和 `AgentTool` 是否同样允许改写。
+
+**验收标准**
+- 改写后执行的调用：对话记录、发回模型的请求、落盘的会话三处都是改写后的参数，结果里注明了修改。
+- 被拒绝的调用保留原始参数。
+- 挂起 → 在 Web UI 里改参数 → 恢复，执行的是改写后的值。
+- 同一轮里有多个并发调用、只改其中一个时，其他调用不受影响。
+
+#### 第 13 项：多模态输入
+
+**现状**
+- 消息和工具结果都只有文本：`ContentItem::Message { content: String }`、`ContentItem::ToolResult { content: String }`，`Tool::execute` 返回 `crate::Result<String>`，`Agent::run` 只接收 `&str`。
+- MCP 工具返回的图片被替换成 `[image content omitted]`（`render_content`，`src/tools/mcp/client.rs`），音频和内嵌资源同样被丢弃。
+- `read_image` 的做法是绕开：单独发一次视觉请求，只把文字描述放进对话（`src/tools/read_image/`）。
+- **协议限制**：Chat Completions 的 tool 消息只能放文本（`ChatCompletionRequestToolMessageContentPart` 只有 `Text`），图片只能放在 user 消息里（`ImageUrl`）。所以工具返回的图片要另外附一条 user 消息。
+- 没有模型能力表：不知道当前模型是否支持图片，发过去不支持的话只能靠 provider 报错。
+- 会话以 JSON 文件保存，图片若以 base64 直接写进去，文件会迅速变大。
+
+**子任务**
+- [ ] 13.1 内容类型：消息内容支持「文本 + 图片」多段，图片可以是 URL 或数据（data URL / 字节 + MIME 类型）。旧的纯文本记录要能继续读取。
+- [ ] 13.2 输入入口：`Agent` 提供接收多段内容的运行方法（`run` / `run_continuing` 的多模态版本），原来接收 `&str` 的方法保持不变。
+- [ ] 13.3 发送：组装请求时把图片转成 `image_url` 片段；工具返回的图片放进紧跟在 tool 消息之后的 user 消息，并说明来自哪个工具调用。
+- [ ] 13.4 工具返回图片：扩展 `Tool` 的返回值（或新增可选方法），MCP 工具把 `ContentBlock::Image` 交出来，不再丢弃。
+- [ ] 13.5 存储：图片按内容哈希存成单独的文件，会话记录里只存引用；`/reset` 和删除会话时一起清理。
+- [ ] 13.6 上下文预算：图片按固定成本估算 token，压缩和裁剪时能把旧图片换成占位文字。
+- [ ] 13.7 模型能力：配置项或模型表说明是否支持图片；不支持时给出明确错误，或自动退回 `read_image` 的做法。
+- [ ] 13.8 前端：
+  - Web UI：上传、粘贴图片，消息里显示缩略图，历史记录里能看到；
+  - 终端：用命令或路径语法附加本地图片（例如 `/image path`）。
+- [ ] 13.9 文档和测试。
+
+**开始前要确认**
+- `ContentItem` 怎么改：
+  - 给 `Message` 增加可选的附件字段，旧数据不受影响；
+  - 或者把 `content` 改成多段内容，改动更彻底，但所有读 `content` 的地方都要跟着改。
+- `Tool` 的返回值怎么扩展：改 `execute` 的返回类型（不兼容变更），还是新增一个带默认实现的方法。
+- 图片存在哪里：会话目录下按哈希存文件，还是交给调用方提供的存储。
+- 支持哪些格式和大小上限；音频、PDF 是否一起做（建议先只做图片）。
+
+**验收标准**
+- 用户发图片提问，请求里带上了 `image_url`，回答基于图片内容（本地假服务校验请求格式，再用真实视觉模型手动验证一次）。
+- MCP demo server 返回图片的工具，图片出现在下一次请求里，而不是 `[image content omitted]`。
+- 带图片的会话保存后重启能完整恢复，会话文件里没有 base64 图片数据。
+- 旧版本写出的会话文件照常能读。
+
+#### 第 14 项：真实 LLM 的端到端回归评测
+
+**现状**
+- 所有测试都用假的模型：库内用 `ScriptedBackend`（`src/llm/testing.rs`），集成测试（`tests/`）用本地 HTTP 假服务。它们验证的是我们发出的请求和对响应的处理，不能说明换了提示词、工具描述或 HTTP 层之后，真实模型是否还能完成任务。
+- 现有的 `gaia` 二进制能用真实模型跑 GAIA 基准并打印正确率，但：
+  - 数据集是需要申请权限的 HF 数据集（`HF_TOKEN`），题目难、耗时长、费用高；
+  - 只打印结果，不和上一次比较，也不作为失败条件。
+- CI 没有任何需要 API key 的任务。
+- 覆盖不均：`llm::complete` 没有单元测试，`llm::stream` 只有 4 个。
+
+**子任务**
+- [ ] 14.1 任务集：在仓库里放一组固定的小任务（例如 `evals/` 目录），覆盖：
+  - 纯问答、单次和多次工具调用、并行工具调用；
+  - 结构化输出（两种模式）、流式输出、子 agent、`update_plan`；
+  - 挂起 → 审批 → 恢复、取消；
+  - 上下文压缩（长对话）、长期记忆的保存与召回、`retrieve`。
+- [ ] 14.2 判定：每个任务用程序判断结果，例如答案包含某个值、调用了某个工具、结构化输出能解析、结果文件内容正确；尽量不用另一个模型打分。
+- [ ] 14.3 运行器：新二进制或 `cargo make eval`：
+  - 并发和总费用有上限；
+  - 每个任务可跑多次，按通过率判断，减少模型随机性带来的误报；
+  - 输出 JSON 结果（通过率、耗时、token 用量和估算费用，复用第 5 项的用量统计）。
+- [ ] 14.4 和上一次比较：保存基线，通过率下降或费用明显上升时报告。
+- [ ] 14.5 CI：手动触发和定时（例如每晚）的 workflow，API key 放在仓库 secrets 里，不在 PR 上自动跑。
+- [ ] 14.6 （可选）多模型矩阵：同一组任务在 2–3 个模型上跑（例如 DeepSeek、GPT-4o-mini、一个本地模型）。
+- [ ] 14.7 顺便补上 `llm::complete` 和 `llm::stream` 的单元测试。
+- [ ] 14.8 文档：怎么在本地跑、怎么加任务、怎么更新基线。
+
+**开始前要确认**
+- 用哪个 provider 和模型、每次运行的费用上限是多少。
+- 多久跑一次：每晚、每次合并到 `main`，还是只手动触发。
+- 判定「退化」的标准：通过率低于固定阈值，还是比基线下降超过一定比例。
+- 是否把 GAIA 的一个小子集纳入（需要 `HF_TOKEN`，题目更难更贵）。
+
+**验收标准**
+- `cargo make eval`（或对应命令）在本地用一个 API key 能跑完全部任务，输出通过率和费用。
+- 故意改坏一处（例如删掉某个工具的描述），评测能报告退化。
+- CI 里的评测 workflow 能手动触发，且没配 secrets 时直接跳过而不是失败。
+
+#### 第 15 项：补全 CI 覆盖
+
+**现状**（`.github/workflows/ci.yml` 有 `fmt`、`clippy`、`test`、`features`、`test-minimal` 五个任务）
+- **示例里的测试没人跑**：`cargo test` 会编译示例，但不会编译其中的 `#[cfg(test)]` 模块；`examples/rag.rs` 里有 5 个测试，只有 `cargo test --examples` 才会跑（7c 时就是这样漏掉一处的）。
+- **`shared` 和 `web-ui` 的测试没人跑**：CI 的 `cargo test --all-features` 只跑根 crate（852 个），加上 `--workspace` 是 885 个，差的 33 个是这两个 crate 的。
+- **wasm 端 clippy 不在 CI 里**：`Makefile.toml` 的 `ci` 任务包含 `clippy-wasm`，GitHub Actions 里却没有对应任务。
+- **README 有一处说法不对**：README 说「用 `cargo make test` 或 `cargo test --workspace` 跑全部测试」，但 `Makefile.toml` 设了 `default_to_workspace = false`，`cargo make test` 实际只跑根 crate。
+
+**子任务**
+- [ ] 15.1 测试任务改为同时覆盖示例和整个 workspace（例如 `cargo test --workspace --all-features --all-targets`，再单独跑 doctest；或者在 `[[example]] rag` 上设 `test = true`）。
+- [ ] 15.2 新增 wasm 任务：安装 `wasm32-unknown-unknown` target，跑和 `cargo make clippy-wasm` 相同的检查。
+- [ ] 15.3 `Makefile.toml` 的 `test` 任务同步修改，让本地和 CI 跑的是同一组。
+- [ ] 15.4 修正 README 里关于 `cargo make test` 覆盖范围的说法。
+- [ ] 15.5 （可选）前端构建检查：在 CI 里跑一次 `trunk build`，发现 `crates/web-ui` 编译不过的问题。
+
+**开始前要确认**
+- 示例测试用 `--examples` 还是 `test = true`：前者对以后新加的示例自动生效，后者只对标记过的示例生效。
+- 要不要做 15.5：需要在 CI 里安装 `trunk`，会多花一些时间。
+
+**验收标准**
+- 在示例的测试里故意写一个失败的断言，CI 会失败。
+- 在 `crates/shared` 里故意写一个失败的测试、或在 `crates/web-ui` 里留一个 clippy 警告，CI 会失败。
+- `cargo make ci` 和 GitHub Actions 跑的检查一致。
 
 ### 执行记录
 
@@ -358,3 +700,123 @@
   - 记忆编号永不复用（`AUTOINCREMENT`，旧库首次打开时原地升级并保留编号）；`forget` 必须带上那条记忆的原文，对不上就不删，审批提示因此能看到将要删除的内容。
   - `remember` 在用过可能带第三方文字的工具（网页、文件、命令、MCP）的那一轮会被拒绝（`RememberGuard`），直到用户确认；`forget` 的"总是允许"选项在提示里去掉（它本来就不会被记住）。
   - 快照重建分页读取、同一集合同一时刻只重建一次；批量嵌入同时受条数和字节数限制；凭证规则补了 `DB_PASSWORD=` 一类带前缀的字段、Stripe/Google/npm 密钥与带口令的 URL。
+
+#### 第 7a 项：Cargo features 裁剪
+
+- **拆分**：第 7 项按讨论拆成 7a–7d 四个子项，逐个审批；补全 MCP、Agent 作为 MCP Server、`Retry-After`、服务化 API 四块列为后续的第 8–11 项（见上表）。
+- **新增三个 feature**，和原有的 `sqlite`、`otel` 一起：
+  - `cli`：`axum`、`tower-http`、`reedline`、`crossterm`、与前端共用的 `shared` 类型，以及 tokio 的 `net` / `signal`。库本身从不使用它们，现在只有 `cli` 二进制会编译这些依赖。`cli` 会同时开启 `mcp` 和 `sqlite`。
+  - `mcp`：`tools::mcp`、`ToolRegistry::with_mcp` / `with_mcp_over`、`callback::mcp_guard`。`rmcp` 现在只开客户端相关的 feature；示例里用到的服务端部分（`server`、`macros`、`transport-io`、Streamable HTTP 服务端）移到了 `[dev-dependencies]`，按 resolver 2 的规则不会进入普通构建。
+  - `zip`：`unzip_file` 工具。关掉后 `builtin` / `builtin_all` 里没有它，`select` 遇到这个名字报「unknown tool」。
+- **默认全开**（`cli`、`mcp`、`sqlite`、`zip`），所以 `cargo build`、`cargo run --bin cli` 的行为和以前一样。
+- **依赖数**（`cargo tree` 去重后的运行时依赖）：
+  - 改动前默认 265 个；改动后默认 262 个（`rmcp` 少了服务端部分）；
+  - `default-features = false` 时 180 个（改动前同样设置是 259 个）；
+  - 单独开 `mcp` 189 个、`sqlite` 186 个、`zip` 220 个、`cli` 223 个。
+- **目标声明 `required-features`**，不满足时 Cargo 直接跳过，而不是编译失败：
+  - `cli` 二进制需要 `cli`；`gaia` 二进制需要 `zip`（评测的工具集是固定的，包括 `unzip_file`；如果它随 feature 悄悄变少，两次跑分就没法比较）；
+  - `rag` 示例需要 `sqlite`，`file_tools` 需要 `zip`，`mcp_agent` / `mcp_config` / `mcp_http_agent` / `mcp_inspect` 需要 `mcp`。`mcp_server` / `mcp_http_server` 只用 dev-dependency 里的 `rmcp`，不需要 feature。
+- **代码改动**：
+  - `tools::file_upzip`、`tools::mcp`、`callback::mcp_guard` 三个模块按 feature 编译；`registry.rs` 中相关的导入、注册和 `select` 分支加了 `cfg`。
+  - `WorkspaceGuardCallback::guarded_fields` / `is_write` 从 if-else 链改成 `match`，`unzip_file` 那一支加 `cfg`，其他判断逻辑不变。
+  - 测试：`unzip_file` 相关的用例加 `cfg`；「路径不存在时按字面解析」的用例改用 `write_file`，这样两种配置下都覆盖到；新增一个只在关闭 `zip` 时运行的测试，确认三个入口都拿不到 `unzip_file`。compaction 的排除列表测试改为直接写工具名，两种配置下都检查。
+- **CI 与本地检查**：
+  - `ci.yml` 新增 `features` 任务（矩阵：不开任何 feature，以及 `cli` / `mcp` / `otel` / `sqlite` / `zip` 各自单独开启，跑 `clippy -D warnings`）和 `test-minimal` 任务（不开 feature 跑测试）。
+  - `Makefile.toml` 新增同样内容的 `check-features`，并加入 `ci` 和 `dev`，保证本地和 CI 跑的是同一组检查。
+- **验证**：上面 6 种组合加上默认和 `--all-features`，clippy 都没有警告；默认与 `--all-features` 下库内 741 个测试、CLI 53 个通过，关闭全部 feature 时库内 623 个测试通过；wasm 端 clippy 无警告；CLI 冒烟（`--list`）正常。
+- **遗留**：
+  - 不开 feature 生成文档时有 8 处内部链接指向被关掉的模块（3 处是这次的 `mcp`，5 处是之前的 `sqlite`），文档任务用的是 `--all-features`，不受影响。
+  - `zip` 依赖本身仍开着 bzip2、zstd、lzma、AES 等全部压缩格式，可以只留 `deflate` 再省几十个依赖，但那会让部分压缩包解不开，所以没动。
+  - 原来自己设置了 `default-features = false`（为了去掉 `sqlite`）的下游，现在也会同时失去 `mcp` 和 `zip`，需要显式加回来；CHANGELOG 里已经写明。
+
+#### 第 7b 项：工具定义体验
+
+- **`ToolDefinition`**（`src/tools/tool.rs`）：工具对模型的描述，只有名称、描述、JSON Schema 三个字段，与任何提供商的请求格式无关。
+  - `Tool::definition()` 改为返回 `ToolDefinition`，并且不会再失败（原来返回 `anyhow::Result<ChatCompletionTools>`，失败只可能来自 `async-openai` 的 builder）。
+  - `ToolRegistry::definitions()` 返回 `&[ToolDefinition]`。
+  - 只在 `llm::client::request_builder` 组装请求时转成 chat completions 的 `{"type": "function", "function": {...}}`；新增测试锁定转换后的 JSON，与改动前发出的完全一致。
+  - `final_answer` 合成工具（结构化输出用）同样改为 `ToolDefinition`；`final_answer_tool_from_schema` 不再返回 `Result`。
+  - 改完后 `src/tools` 里只剩 `read_image` 用到 `async-openai`，那是它自己发视觉请求，不属于工具抽象。
+- **工具名校验**：新增 `validate_tool_name` 和 `MAX_TOOL_NAME_CHARS`（64），`ToolRegistry::add` 对每个工具都做校验。名字不合法时在注册时报错并指出是哪个工具，而不是之后每个请求都被 API 拒绝、看不出原因。内置工具、MCP 工具（客户端已做清洗）和子 agent 工具（构造时已校验）都满足要求。`examples/mcp_inspect` 里重复的名称长度检查随之去掉。
+- **`FnTool`**（`src/tools/fn_tool.rs`）：一个参数结构体加一个 async 闭包就是一个工具。
+  - 参数 schema 由 `schema_of::<A>()` 生成，字段上的文档注释就是模型看到的参数说明。
+  - 闭包返回 `crate::Result<R>`（当时是 `anyhow::Result<R>`，7c 统一改成 `agent::Result`），`R: Into<String>`；`Err` 和其他工具一样作为错误结果交给模型。没有把错误类型做成泛型：那样在闭包里用 `?` 时 Rust 推断不出错误类型，每个闭包都要手写类型标注。
+  - 参数解析失败时，serde 给出的原因（缺字段、类型不对）直接写进错误信息本身——模型只看得到最外层那条消息，只写「参数无效」它无从改正。空参数按 `{}` 处理，有些模型对无参工具会发空串。
+  - `FnTool::new` 返回 `Result`（与 `AgentTool::new` 一致）：工具名不合法，或参数类型的 schema 不是 object（例如用了单元结构体 `struct NoArgs;`，它只能从 `null` 反序列化，模型发来的 `{}` 永远解析失败）时，在构造时就报错。
+  - `.with_timeout(..)` / `.read_only()` 对应 `Tool::timeout` / `Tool::concurrency_safe`，默认与其他工具一样不并发、使用调用方的超时。
+  - 模块文档里的示例是会编译的 doctest。
+- **文档**：README（中英文）新增「自定义工具」小节；CHANGELOG 记录了新增项和不兼容变更。
+- **验证**：
+  - 新增 `FnTool` 9 个测试（schema 来源、正常调用、参数错误的提示、空参数、处理函数报错、超时与只读、构造时校验、闭包状态、经 agent 端到端调用并核对发出的工具定义和工具结果）、工具定义与名称校验 2 个、请求里工具 JSON 的格式 1 个。
+  - 全部 feature 时库内 753 个、CLI 53 个通过；不开 feature 时库内 635 个通过；doctest 通过；6 种 feature 组合和 wasm 端 clippy 都没有警告；文档没有失效链接。
+- **未做 / 遗留**：
+  - 没有 `#[tool]` 过程宏，内部的 `simple_tool!` 宏仍不公开（已有 `FnTool` 覆盖同样的用途）。
+  - 内置工具没有改写成 `FnTool`：它们有各自的名称常量、手写 schema 或额外的状态，改写收益不大。
+  - `Tool::execute` 仍然接收原始 JSON 字符串、返回 `anyhow::Result<String>`（错误类型留到 7c 一起处理，现为 `crate::Result<String>`）。
+  - 对 `Tool` 的实现方、`ToolRegistry::definitions()` 和 `request_builder` 的调用方来说是不兼容变更（见 CHANGELOG），发给模型的请求内容不变。
+
+#### 第 7c 项：类型化错误
+
+- **方案**（与你确认过）：单一的 `agent::Error` 枚举；调用方实现的 trait 方法（`Tool::execute`、`ChatBackend::create` / `create_stream`、`Embedder::embed`）也全部改为返回 `agent::Result`；库内部不再使用 `anyhow`；一次做完再审批。
+- **`agent::Error`**（`src/error.rs`，thiserror 2.0，原本就在依赖树里）：`#[non_exhaustive]`，按调用方能怎么处理分 11 类：
+  - `Cancelled`（带截至此刻的记录）、`BudgetExhausted`（包着真正的失败）、`TruncatedOutput`（带输出上限）：调用方要匹配并读取其中数据的三类；
+  - `Provider(ProviderError)`：带 HTTP 状态码和「重试是否可能成功」；
+  - `InvalidInput`、`Config`、`Tool`、`Mcp`、`Storage`、`Io`、`Other`：信息加可选的原因。
+  - `{err}` 只打印最外层信息（工具出错时模型看到的就是这一句，和以前一致），`{err:#}` 打印完整原因链；`source()` 走的是同一条链，所以转成 `anyhow` 后打印也不会重复。
+  - `Error::context` 在前面加一层说明但保留原有类别，例如 `Provider` 错误加了几层说明后，仍然能判断是否可重试。
+  - `Error::downcast_ref` 沿原因链查找具体类型，例如 `Io` 背后的 `std::io::Error`、向量库背后的 `rusqlite::Error`。
+  - 构造方式：`Error::tool(..)` 等构造函数；`ResultExt::wrap_err(Error::tool, "正在做什么")` 包装其他库的错误；`err_as` 只换类别、不加说明；`?` 可以直接转换 `std::io::Error`、`OpenAIError`（按状态码分类）、`rusqlite::Error`。
+  - 库内部用 `bail!` / `ensure!` 两个宏（`ensure!(cond, invalid_input, "...")`），不对外公开。
+- **重试判断**（`llm::retry::is_transient`）改为按类别判断，不再 downcast：
+  - `Provider` 看它自己标的可否重试（`async-openai` 的错误仍按原规则分类：429 / 408 / 409 / 5xx / 网络错误 / 响应解析失败可重试，其他 4xx 不可重试）；
+  - `InvalidInput`、`Config`、`Cancelled`、`TruncatedOutput`、`BudgetExhausted` 不重试；其余仍然重试，与以前「认不出的错误照样重试」一致。
+  - 删除了 `llm::retry::Permanent`，自定义后端改用 `ProviderError::transient` / `permanent` 表达。
+  - GAIA 求解器原来手动排除截断和预算用尽两种情况，现在 `is_transient` 本身就会排除，直接传它即可。
+- **类别的选取**：迁移脚本按文件给出默认类别，之后逐处复查调整。例如工具名、schema 名、空 prompt、chunk 参数、记忆内容不合规归为 `InvalidInput`；缺少 `TAVILY_API_KEY` / `HF_TOKEN` / `EMBED_MODEL`、`mcp.json` 写错、工作区目录不存在归为 `Config`；模型返回空内容、没有 choices、结构化输出解析失败、embedding 数量或维度不对归为 `ProviderError::transient`。`wrap_err` 只包装其他库的错误，不会把本 crate 的 `Provider` 错误改成别的类别。
+- **相关类型**：`Cancelled`、`BudgetExhausted`、`TruncatedOutput` 移到 `agent::error`，原路径 re-export。`BudgetExhausted` 从「附加在错误上的标记」改为「包着真正失败的错误」。trace 的 `error.type` 对非模型服务的错误改为类别名（`tool`、`storage` 等），原来是 `_OTHER`。
+- **调用方的变化**：
+  - 二进制、示例、集成测试仍用 `anyhow`，`?` 照常转换。只有 CLI 里由 agent 产出的流的元素类型改成 `agent::Result`。
+  - 判断取消从 `downcast_ref::<Cancelled>()` 改为匹配 `Err(agent::Error::Cancelled(c))`，README 中的示例已同步修改。
+- **规模**：71 个文件，新增约 1500 行、删除约 900 行；库代码（除 `error.rs` 里讲与 anyhow 互通的文档和测试）中 `anyhow` 出现次数为 0。
+- **验证**：
+  - `error.rs` 9 个单测（单层与完整链的打印、I/O 错误透明转换与 downcast、经 anyhow 打印不重复、`Provider` 加说明后仍保留状态码和可否重试、OpenAI 错误按状态码分类、三种特殊类别不被 `context` / `with_source` 改变、宏、`kind`、`Send + Sync + 'static`），另有 4 个 doctest；`retry` 8 个单测改为按类别判断；`FnTool` 新增一个「闭包里用 `wrap_err` 包装其他库错误」的测试。
+  - 全部 feature：库内 763 个、CLI 53 个、集成测试和 doctest 全部通过；不开 feature：库内 645 个通过；示例里的测试 5 个通过。
+  - 6 种 feature 组合、全部 feature 和 wasm 端的 clippy（`-D warnings`）都没有警告。
+  - 端到端：用返回 401 的本地假服务跑 `agent` 二进制，1 秒内失败、只发了 1 次请求，打印 `401 Unauthorized invalid_request_error: Incorrect API key provided (code: invalid_api_key)`；指向无人监听的端口时按退避重试两次后失败，`Caused by` 打印出完整原因链。
+- **未做 / 遗留**：
+  - **对下游是大范围的不兼容变更**：所有返回类型、三个 trait 的签名、`Permanent` 被删除、`is_transient` 的参数类型都变了；CHANGELOG 里逐项写了迁移方法。
+  - CI 跑的 `cargo test` 不会编译示例里的 `#[cfg(test)]` 模块（这次 `examples/rag.rs` 里的一个测试替身就是靠 `cargo test --examples` 才发现的），可以考虑把它加进 CI。
+  - 没有给 `Tool` 错误再细分（例如「参数无效」和「执行失败」），模型看到的都只是文字。
+
+#### 第 7d 项：小修
+
+- **tokenizer 按模型选择**（`src/callback/context_optimizer/tokens.rs`）：
+  - 新增 `Encoding`（`Cl100kBase` / `O200kBase`，`#[non_exhaustive]`）。`Encoding::for_model` 直接用 `tiktoken-rs` 自带的模型表判断：GPT-4o、GPT-4.1、GPT-5、`o` 系列、`gpt-oss` 用 `o200k_base`，其余（GPT-4、GPT-3.5，以及 DeepSeek、Qwen、Claude 等其他提供商的模型）用 `cl100k_base`。以后 OpenAI 出新模型，升级 `tiktoken-rs` 即可，不用改这里。
+  - 模型名不区分大小写，忽略提供商前缀（OpenRouter 的 `openai/gpt-4o` 当作 `gpt-4o`）和微调模型的 `ft:` 包装。`o200k_harmony` 与 `o200k_base` 词表相同、只差特殊 token（这里不计），所以按 `o200k_base` 算。
+  - `ContextOptimizer` 新增 `for_model(model)` / `with_encoding(..)` / `encoding()`；`Ledger` 记住自己的编码，`refresh` / `rebuild` 都用它重新计数，各阶段的计数单位一致。
+  - `Agent::new` 安装的默认优化器按 agent 的模型选编码。手动构造的 `ContextOptimizer::new(n)`、`tokens` 里的自由函数和 `eviction::evict_middle` 仍用 `cl100k_base`，和以前一样。
+  - 「字节数 ≥ token 数」这个上界对两种编码都成立（每个 BPE token 至少一个字节），跳过分词的快速判断不受影响，测试对两种编码都做了验证。
+- **README 不再写死测试数**：中英文 README 顶部写死的 `tests-418 passing` 徽章换成 GitHub Actions 的 CI 状态徽章（`lf-wxp/agent` 的 `ci.yml`）；正文里原来的 528 已经不在了，README 中不再有具体测试数量。
+- **最小示例的守卫**：中英文 README 的最小示例由 `telemetry::init()?;` 改为 `let _telemetry = telemetry::init()?;`，并注明守卫要持有到程序结束。把示例代码抽成临时 example 编译过，没有警告（之前会有 `must_use` 警告），用完已删除。
+- **文档**：README「上下文管理」一节补充了按模型计数的说明；CHANGELOG 记录了新增 API 和行为变化。
+- **验证**：
+  - 新增 6 个测试：OpenAI 新模型映射到 `o200k_base`（13 个模型名，含大小写、前缀、`ft:`）；其他模型回退 `cl100k_base`；两种编码对同一段中文计数不同且默认是 `cl100k_base`；`Ledger` 在 `refresh` / `rebuild` 后仍用自己的编码；同一段中文对话按 `o200k_base` 计正好在预算内、优化器不动它，按 `cl100k_base` 计则会被裁剪；未知模型保持默认编码。上界测试扩展到两种编码。
+  - 全部 feature：库内 769 个、CLI 53 个、集成测试、doctest 通过；不开 feature：库内 651 个通过；示例里的测试 5 个通过；6 种 feature 组合、全部 feature 和 wasm 端的 clippy 都没有警告；文档没有失效链接。
+- **未做 / 遗留**：
+  - **行为变化**：对 GPT-4o 等模型，同一段对话现在计得更少（中文尤其明显），裁剪会比以前晚一些开始；`LLM_MAX_HISTORY_TOKENS` 的含义没变，仍然是请求大小的软上限。
+  - ~~没有为 Agent 级别的默认安装单独写测试~~：审核后补了 `Agent::context_encoding` 与对应测试（`gpt-4o` / `gpt-4` / 未知模型三种）。安装的优化器本身仍是 trait object，取不出编码，所以这个访问器报告的是构造时记下的值。
+  - 其他提供商的模型仍用 `cl100k_base` 估算，没有接入它们各自的 tokenizer。
+  - `examples/vector_search.rs`、`examples/callback_search_compressor.rs` 演示分块时仍直接用 `cl100k_base`，没改。
+  - 新徽章依赖仓库公开且 CI 在 `main` 上跑过；仓库若是私有的，徽章不会显示状态。
+  - 7c 遗留的「CI 没有跑 `cargo test --examples`」仍未处理。
+
+#### 审核修复（2026-10-23）
+
+对本次全部未提交改动的审核见 [code-review-uncommitted-2026-10-23.md](code-review-uncommitted-2026-10-23.md)。除 7a–7d 的记录外，审核还发现并修复了下面这些，都属于同一批改动：
+
+- `ResultExt::{wrap_err, wrap_err_with, err_as}` 会把本 crate 的 `Error` 重新归类（`Cancelled` 变 `Tool`、不可重试的 `Provider` 变得可重试），现在只对其他 crate 的错误生效。
+- CI 的 feature 矩阵补了 `cargo check --lib --bins`：`--all-targets` 会把 dev-dependencies 的 feature 合并进来，缺 `cfg` 的库代码在它下面照样能编译。
+- 工具名规则统一到 `MAX_TOOL_NAME_CHARS` / `validate_tool_name`，不再有两份常量和一份手写规则；`FnTool` 与 `AgentTool` 都要求描述非空。
+- `with_mcp_over` 的「坏工具只记日志并跳过」抽成 `add_skipping` 并有测试；`ToolRegistry::add` 拒绝非法名字也有测试。
+- embedder 契约违约（数量不符、空向量、长度不一致）由 `transient` 改为 `permanent`：同一输入重试只会失败得一样。
+- `file_read` / `file_upzip` 的裸 `?` 补了路径上下文，模型能看到是哪个文件失败。

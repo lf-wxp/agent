@@ -5,7 +5,7 @@
 //! (`gen_ai.request.model`, `gen_ai.usage.input_tokens`, ...), and `otel.*` fields are
 //! the ones `tracing-opentelemetry` maps onto the exported span's name, kind and status.
 
-use async_openai::{error::OpenAIError, types::chat::FinishReason};
+use async_openai::types::chat::FinishReason;
 use tracing::{Span, field::Empty};
 
 use crate::{
@@ -104,7 +104,7 @@ fn record_usage(span: &Span, usage: &crate::agent::TokenUsage) {
 
 /// Mark `span` failed. Shared with the agent and tool spans, which declare the same
 /// `otel.status_*` / `error.type` fields.
-pub(crate) fn record_error(span: &Span, err: &anyhow::Error) {
+pub(crate) fn record_error(span: &Span, err: &crate::Error) {
   span.record("otel.status_code", "error");
   span.record(
     "otel.status_description",
@@ -113,26 +113,26 @@ pub(crate) fn record_error(span: &Span, err: &anyhow::Error) {
   span.record("error.type", error_type(err));
 }
 
-/// A low-cardinality class for `err`, as `error.type` asks for: the HTTP status when the
-/// provider answered with one, otherwise a coarse kind.
-fn error_type(err: &anyhow::Error) -> String {
-  match err.downcast_ref::<OpenAIError>() {
-    Some(OpenAIError::ApiError(response)) => response.status_code.as_u16().to_string(),
-    Some(OpenAIError::Reqwest(_)) => "transport".to_owned(),
-    Some(OpenAIError::StreamError(_)) => "stream".to_owned(),
-    Some(OpenAIError::JSONDeserialize(..)) => "invalid_response".to_owned(),
-    Some(_) => "openai_error".to_owned(),
-    None => "_OTHER".to_owned(),
+/// A low-cardinality class for `err`, as `error.type` asks for: for a provider failure
+/// the HTTP status when it answered with one, otherwise a coarse kind (`transport`,
+/// `stream`, `invalid_response`, `provider`); for anything else the error's
+/// [`crate::Error::kind`].
+fn error_type(err: &crate::Error) -> String {
+  match err.as_provider() {
+    Some(provider) => provider.class(),
+    None => err.kind().to_owned(),
   }
 }
 
 #[cfg(test)]
 mod tests {
+  use async_openai::error::OpenAIError;
+
   use super::*;
 
   #[test]
   fn an_api_error_is_classed_by_its_status() {
-    let err = anyhow::Error::new(OpenAIError::ApiError(
+    let err = crate::Error::from(OpenAIError::ApiError(
       async_openai::error::ApiErrorResponse {
         status_code: reqwest::StatusCode::TOO_MANY_REQUESTS,
         api_error: async_openai::error::ApiError {
@@ -145,7 +145,7 @@ mod tests {
       },
     ));
     assert_eq!(error_type(&err), "429");
-    assert_eq!(error_type(&anyhow::anyhow!("other")), "_OTHER");
+    assert_eq!(error_type(&crate::Error::tool("other")), "tool");
   }
 
   #[test]

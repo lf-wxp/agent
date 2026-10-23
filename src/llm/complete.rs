@@ -23,7 +23,7 @@ pub async fn chat_complete(
   system: Option<&str>,
   prompt: &str,
   registry: &ToolRegistry,
-) -> anyhow::Result<String> {
+) -> crate::Result<String> {
   ensure_valid_params(model, prompt)?;
 
   let completion = tool_loop::run(
@@ -41,5 +41,5 @@ pub async fn chat_complete(
     .message
     .content
     .filter(|content| !content.trim().is_empty())
-    .ok_or_else(|| anyhow::anyhow!("No content in response"))
+    .ok_or_else(|| crate::error::ProviderError::transient("No content in response").into())
 }

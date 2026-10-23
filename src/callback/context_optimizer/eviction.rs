@@ -94,6 +94,9 @@ fn tail_start_within(
 /// uphold and nothing it can be called with that panics.
 /// [`evict_middle_with_costs`] is the crate-internal variant for a caller that already has
 /// per-item costs and does not want to pay for them twice.
+///
+/// Counts with the default encoding (`cl100k_base`); [`super::ContextOptimizer`] counts
+/// in the model's own when it knows it (see [`super::tokens::Encoding`]).
 pub fn evict_middle(
   contents: &mut Vec<ContentItem>,
   available: usize,

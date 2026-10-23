@@ -23,8 +23,10 @@ use async_openai::{
 use tracing::Instrument;
 
 use crate::{
+  Error, Result,
   agent::{TokenUsage, usage},
   config,
+  error::ProviderError,
   llm::retry::{is_transient, with_retry},
 };
 
@@ -53,29 +55,36 @@ pub trait Embedder: Send + Sync {
 
   /// One vector per text, in the same order. Implementations must return exactly
   /// `texts.len()` vectors or fail — callers match them back to their texts by position.
-  async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>>;
+  async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
 
   /// [`Self::embed`], checking that promise instead of trusting it: a count that does not
   /// match would shift every vector after it onto the wrong text, and nothing downstream
   /// could tell. What callers that match vectors to texts by position should use.
-  async fn embed_checked(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+  ///
+  /// A mismatch is [`ProviderError::permanent`], not transient: the same model given the
+  /// same texts answers the same way, so a retry spends the request to fail identically.
+  async fn embed_checked(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
     let vectors = self.embed(texts).await?;
-    anyhow::ensure!(
-      vectors.len() == texts.len(),
-      "the embedder returned {} vectors for {} texts",
-      vectors.len(),
-      texts.len()
-    );
+    if vectors.len() != texts.len() {
+      return Err(
+        ProviderError::permanent(format!(
+          "the embedder returned {} vectors for {} texts",
+          vectors.len(),
+          texts.len()
+        ))
+        .into(),
+      );
+    }
     Ok(vectors)
   }
 
   /// The vector of a single text.
-  async fn embed_one(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+  async fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
     self
       .embed_checked(&[text.to_owned()])
       .await?
       .pop()
-      .ok_or_else(|| anyhow::anyhow!("the embedder returned no vector"))
+      .ok_or_else(|| ProviderError::permanent("the embedder returned no vector").into())
   }
 }
 
@@ -156,13 +165,13 @@ impl OpenAiEmbedder {
   ///
   /// When `EMBED_MODEL` is not set — there is no sensible default, since the right model
   /// depends entirely on the provider.
-  pub fn from_config() -> anyhow::Result<Self> {
-    let model = config::embed_model().ok_or_else(|| anyhow::anyhow!("EMBED_MODEL is not set"))?;
+  pub fn from_config() -> Result<Self> {
+    let model = config::embed_model().ok_or_else(|| Error::config("EMBED_MODEL is not set"))?;
     Ok(Self::with_model(model))
   }
 
   /// Send a single request for one batch from [`plan_batches`].
-  async fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+  async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
     let span = tracing::info_span!(
       "embeddings",
       otel.name = %format!("embeddings {}", self.model),
@@ -178,7 +187,7 @@ impl OpenAiEmbedder {
           .model(&self.model)
           .input(EmbeddingInput::StringArray(texts.to_vec()))
           .build()?;
-        anyhow::Ok(self.client.embeddings().create(request).await?)
+        Ok::<_, Error>(self.client.embeddings().create(request).await?)
       },
       is_transient,
     )
@@ -203,13 +212,18 @@ impl OpenAiEmbedder {
 
     // Callers match embeddings back to their source texts purely by position, so a silent
     // count mismatch would shift every vector after it out of alignment and corrupt
-    // search results without ever raising an error.
-    anyhow::ensure!(
-      data.len() == texts.len(),
-      "embedding API returned {} vectors for {} inputs",
-      data.len(),
-      texts.len()
-    );
+    // search results without ever raising an error. Permanent: the same request against
+    // the same model does it again.
+    if data.len() != texts.len() {
+      return Err(
+        ProviderError::permanent(format!(
+          "embedding API returned {} vectors for {} inputs",
+          data.len(),
+          texts.len()
+        ))
+        .into(),
+      );
+    }
 
     Ok(
       data
@@ -226,7 +240,7 @@ impl Embedder for OpenAiEmbedder {
     &self.model
   }
 
-  async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+  async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
     let mut embeddings = Vec::with_capacity(texts.len());
     for batch in plan_batches(texts) {
       embeddings.extend(self.embed_batch(&texts[batch]).await?);
@@ -240,7 +254,7 @@ impl Embedder for OpenAiEmbedder {
 /// Kept so code written against the earlier free functions still compiles; it is
 /// [`OpenAiEmbedder::with_model`] plus [`Embedder::embed`] and nothing more.
 #[deprecated(note = "use `OpenAiEmbedder::with_model(model).embed(texts)`")]
-pub async fn embed_texts(texts: &[String], model: &str) -> anyhow::Result<Vec<Vec<f32>>> {
+pub async fn embed_texts(texts: &[String], model: &str) -> Result<Vec<Vec<f32>>> {
   OpenAiEmbedder::with_model(model).embed(texts).await
 }
 
@@ -248,7 +262,7 @@ pub async fn embed_texts(texts: &[String], model: &str) -> anyhow::Result<Vec<Ve
 ///
 /// See [`embed_texts`].
 #[deprecated(note = "use `OpenAiEmbedder::with_model(model).embed(..)`")]
-pub async fn embed_text(text: &str, model: &str) -> anyhow::Result<Vec<f32>> {
+pub async fn embed_text(text: &str, model: &str) -> Result<Vec<f32>> {
   OpenAiEmbedder::with_model(model).embed_one(text).await
 }
 
@@ -325,7 +339,7 @@ mod tests {
       fn model(&self) -> &str {
         "short"
       }
-      async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+      async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         Ok(vec![vec![1.0]; texts.len().saturating_sub(1)])
       }
     }

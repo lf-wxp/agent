@@ -72,11 +72,11 @@ use std::{
   time::Duration,
 };
 
-use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::Value;
 
 use crate::{
+  error::ResultExt,
   knowledge_base::{
     chunk::fixed_length_chunking,
     embed::Embedder,
@@ -182,7 +182,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// step is idempotent, and the version check and what follows from it are one write
 /// transaction, taken up front, so processes opening the same file at the same moment
 /// queue there instead of all finding "no version yet" (or "version 1") and all acting on it.
-fn initialize(conn: &mut Connection, location: &str) -> anyhow::Result<()> {
+fn initialize(conn: &mut Connection, location: &str) -> crate::Result<()> {
   // Returns the mode it ended up in (`memory` for an in-memory database), hence a query.
   conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
     row.get::<_, String>(0)
@@ -211,7 +211,8 @@ fn initialize(conn: &mut Connection, location: &str) -> anyhow::Result<()> {
       )?;
     }
     Some(version) if version == SCHEMA_VERSION => {}
-    Some(version) => anyhow::bail!(
+    Some(version) => crate::error::bail!(
+      storage,
       "the vector store `{location}` has schema version {version}, but this build reads \
        version {SCHEMA_VERSION}"
     ),
@@ -228,7 +229,7 @@ fn initialize(conn: &mut Connection, location: &str) -> anyhow::Result<()> {
 /// upgrading to a write on a snapshot another writer has since moved past, fail at once
 /// with "database is locked" however long the timeout is — retrying is the documented
 /// answer. Several processes opening one new file together is exactly when it happens.
-fn retry_while_busy<T>(mut attempt: impl FnMut() -> anyhow::Result<T>) -> anyhow::Result<T> {
+fn retry_while_busy<T>(mut attempt: impl FnMut() -> crate::Result<T>) -> crate::Result<T> {
   let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
   loop {
     match attempt() {
@@ -240,7 +241,7 @@ fn retry_while_busy<T>(mut attempt: impl FnMut() -> anyhow::Result<T>) -> anyhow
   }
 }
 
-fn is_busy(err: &anyhow::Error) -> bool {
+fn is_busy(err: &crate::Error) -> bool {
   err
     .downcast_ref::<rusqlite::Error>()
     .and_then(rusqlite::Error::sqlite_error_code)
@@ -361,23 +362,27 @@ impl VectorStore {
   ///
   /// When the file cannot be opened or created, or was written by an incompatible
   /// version of this crate.
-  pub fn open(path: impl AsRef<Path>, embedder: Arc<dyn Embedder>) -> anyhow::Result<Self> {
+  pub fn open(path: impl AsRef<Path>, embedder: Arc<dyn Embedder>) -> crate::Result<Self> {
     let path = path.as_ref();
     if let Some(parent) = path
       .parent()
       .filter(|parent| !parent.as_os_str().is_empty())
     {
-      std::fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create `{}`", parent.display()))?;
+      std::fs::create_dir_all(parent).wrap_err_with(crate::Error::storage, || {
+        format!("failed to create `{}`", parent.display())
+      })?;
     }
-    create_private(path).with_context(|| format!("failed to create `{}`", path.display()))?;
-    let conn = Connection::open(path)
-      .with_context(|| format!("failed to open the vector store `{}`", path.display()))?;
+    create_private(path).wrap_err_with(crate::Error::storage, || {
+      format!("failed to create `{}`", path.display())
+    })?;
+    let conn = Connection::open(path).wrap_err_with(crate::Error::storage, || {
+      format!("failed to open the vector store `{}`", path.display())
+    })?;
     Self::from_connection(conn, path.display().to_string(), embedder)
   }
 
   /// A store that lives only as long as this value — for tests and throwaway indexes.
-  pub fn open_in_memory(embedder: Arc<dyn Embedder>) -> anyhow::Result<Self> {
+  pub fn open_in_memory(embedder: Arc<dyn Embedder>) -> crate::Result<Self> {
     Self::from_connection(
       Connection::open_in_memory()?,
       ":memory:".to_owned(),
@@ -389,7 +394,7 @@ impl VectorStore {
     mut conn: Connection,
     location: String,
     embedder: Arc<dyn Embedder>,
-  ) -> anyhow::Result<Self> {
+  ) -> crate::Result<Self> {
     conn.busy_timeout(BUSY_TIMEOUT)?;
     retry_while_busy(|| initialize(&mut conn, &location))?;
     Ok(Self {
@@ -425,7 +430,7 @@ impl VectorStore {
     source: &str,
     chunks: Vec<String>,
     metadata: Value,
-  ) -> anyhow::Result<IndexReport> {
+  ) -> crate::Result<IndexReport> {
     let chunks: Vec<String> = chunks
       .into_iter()
       .filter(|chunk| !chunk.trim().is_empty())
@@ -461,7 +466,10 @@ impl VectorStore {
     let vectors: Vec<Vec<f32>> = vectors.into_iter().flatten().collect();
     ensure_usable(&vectors)?;
 
-    let metadata = serde_json::to_string(&metadata)?;
+    let metadata = serde_json::to_string(&metadata).wrap_err(
+      crate::Error::invalid_input,
+      "the document metadata could not be serialized",
+    )?;
     let (collection_owned, source) = (collection.to_owned(), source.to_owned());
     let ids = self
       .blocking(move |inner| {
@@ -502,7 +510,7 @@ impl VectorStore {
     text: &str,
     metadata: Value,
     max_documents: usize,
-  ) -> anyhow::Result<Inserted> {
+  ) -> crate::Result<Inserted> {
     // Already there: no reason to embed anything.
     if let Some(existing) = self.find_text(collection, text).await? {
       return Ok(Inserted::Existing(existing));
@@ -523,7 +531,10 @@ impl VectorStore {
     };
     ensure_usable(std::slice::from_ref(&vector))?;
 
-    let metadata = serde_json::to_string(&metadata)?;
+    let metadata = serde_json::to_string(&metadata).wrap_err(
+      crate::Error::invalid_input,
+      "the document metadata could not be serialized",
+    )?;
     let (collection, source, text) = (collection.to_owned(), source.to_owned(), text.to_owned());
     self
       .blocking(move |inner| {
@@ -556,9 +567,10 @@ impl VectorStore {
     chunk_size: usize,
     overlap: usize,
     metadata: Value,
-  ) -> anyhow::Result<IndexReport> {
-    anyhow::ensure!(
+  ) -> crate::Result<IndexReport> {
+    crate::error::ensure!(
       chunk_size > 0 && overlap < chunk_size,
+      invalid_input,
       "chunk_size must be positive and larger than overlap"
     );
     let chunks = fixed_length_chunking(text, chunk_size, overlap);
@@ -574,7 +586,7 @@ impl VectorStore {
     query: &str,
     limit: usize,
     min_similarity: f32,
-  ) -> anyhow::Result<Vec<ScoredDocument>> {
+  ) -> crate::Result<Vec<ScoredDocument>> {
     if limit == 0 || query.trim().is_empty() {
       return Ok(Vec::new());
     }
@@ -585,8 +597,9 @@ impl VectorStore {
     }
 
     let query_vector = self.inner.embedder.embed_one(query).await?;
-    anyhow::ensure!(
+    crate::error::ensure!(
       query_vector.len() == snapshot.dim,
+      storage,
       "the query embedding has {} dimensions but the stored ones have {} — did the model \
        behind `{}` change without its name changing?",
       query_vector.len(),
@@ -633,7 +646,7 @@ impl VectorStore {
   }
 
   /// Every document in `collection`, oldest first.
-  pub async fn list(&self, collection: &str) -> anyhow::Result<Vec<Document>> {
+  pub async fn list(&self, collection: &str) -> crate::Result<Vec<Document>> {
     let collection = collection.to_owned();
     self
       .blocking(move |inner| {
@@ -648,7 +661,7 @@ impl VectorStore {
   }
 
   /// How many documents `collection` holds, whatever model embedded them.
-  pub async fn count(&self, collection: &str) -> anyhow::Result<usize> {
+  pub async fn count(&self, collection: &str) -> crate::Result<usize> {
     let collection = collection.to_owned();
     self
       .blocking(move |inner| {
@@ -663,7 +676,7 @@ impl VectorStore {
   }
 
   /// The document in `collection` whose text is exactly `text`, if there is one.
-  pub async fn find_text(&self, collection: &str, text: &str) -> anyhow::Result<Option<Document>> {
+  pub async fn find_text(&self, collection: &str, text: &str) -> crate::Result<Option<Document>> {
     let (collection, text) = (collection.to_owned(), text.to_owned());
     self
       .blocking(move |inner| {
@@ -680,7 +693,7 @@ impl VectorStore {
 
   /// Delete one document of `collection`, returning it — `None` when there was no such
   /// document *in that collection*, so an id cannot reach across collections.
-  pub async fn delete(&self, collection: &str, id: i64) -> anyhow::Result<Option<Document>> {
+  pub async fn delete(&self, collection: &str, id: i64) -> crate::Result<Option<Document>> {
     Ok(match self.delete_if(collection, id, |_| true).await? {
       DeleteOutcome::Deleted(document) => Some(document),
       DeleteOutcome::Refused(_) | DeleteOutcome::Missing => None,
@@ -698,7 +711,7 @@ impl VectorStore {
     collection: &str,
     id: i64,
     allow: impl FnOnce(&Document) -> bool + Send + 'static,
-  ) -> anyhow::Result<DeleteOutcome> {
+  ) -> crate::Result<DeleteOutcome> {
     let collection = collection.to_owned();
     self
       .blocking(move |inner| {
@@ -726,7 +739,7 @@ impl VectorStore {
   }
 
   /// Delete every chunk of `source` in `collection`; returns how many there were.
-  pub async fn delete_source(&self, collection: &str, source: &str) -> anyhow::Result<usize> {
+  pub async fn delete_source(&self, collection: &str, source: &str) -> crate::Result<usize> {
     let (collection, source) = (collection.to_owned(), source.to_owned());
     self
       .blocking(move |inner| {
@@ -753,7 +766,7 @@ impl VectorStore {
 
   /// The distinct sources that have documents in `collection`, sorted — for a caller that
   /// wants to find the ones that no longer exist where they came from.
-  pub async fn sources(&self, collection: &str) -> anyhow::Result<Vec<String>> {
+  pub async fn sources(&self, collection: &str) -> crate::Result<Vec<String>> {
     let collection = collection.to_owned();
     self
       .blocking(move |inner| {
@@ -768,7 +781,7 @@ impl VectorStore {
   }
 
   /// The collection's searchable vectors, rebuilt only when something changed.
-  async fn snapshot(&self, collection: &str) -> anyhow::Result<Arc<Snapshot>> {
+  async fn snapshot(&self, collection: &str) -> crate::Result<Arc<Snapshot>> {
     let collection = collection.to_owned();
     let model = self.inner.embedder.model().to_owned();
     self
@@ -780,7 +793,7 @@ impl VectorStore {
   /// use, and so cannot be found by [`Self::search`] until [`Self::reindex`] runs.
   ///
   /// Zero in the ordinary case, which is what makes it cheap enough to check on startup.
-  pub async fn stale_count(&self, collection: &str) -> anyhow::Result<usize> {
+  pub async fn stale_count(&self, collection: &str) -> crate::Result<usize> {
     let (collection, model) = (
       collection.to_owned(),
       self.inner.embedder.model().to_owned(),
@@ -810,7 +823,7 @@ impl VectorStore {
   /// When the embedder fails, or returns a different number of vectors than it was given
   /// texts, or vectors whose length disagrees with each other. Nothing is written in that
   /// case: the collection is either fully migrated or left exactly as it was.
-  pub async fn reindex(&self, collection: &str) -> anyhow::Result<usize> {
+  pub async fn reindex(&self, collection: &str) -> crate::Result<usize> {
     let model = self.inner.embedder.model().to_owned();
     let pending = {
       let collection = collection.to_owned();
@@ -857,7 +870,7 @@ impl VectorStore {
   /// For a caller that has found one particular document and needs *it* to be searchable
   /// (a repeated `remember`) without paying for — or silently doing — a migration of
   /// everything else.
-  pub async fn reindex_document(&self, collection: &str, id: i64) -> anyhow::Result<bool> {
+  pub async fn reindex_document(&self, collection: &str, id: i64) -> crate::Result<bool> {
     let model = self.inner.embedder.model().to_owned();
     let (collection_owned, model_owned) = (collection.to_owned(), model.clone());
     let stale_text = self
@@ -894,22 +907,22 @@ impl VectorStore {
   /// Exposed so a caller that caches something derived from a collection
   /// ([`crate::memory`] does) can tell when it changed underneath — see the module docs for
   /// how the store itself uses it.
-  pub async fn version(&self, collection: &str) -> anyhow::Result<i64> {
+  pub async fn version(&self, collection: &str) -> crate::Result<i64> {
     let collection = collection.to_owned();
     self
       .blocking(move |inner| Ok(read_version(&inner.conn(), &collection)?))
       .await
   }
 
-  async fn blocking<T, F>(&self, f: F) -> anyhow::Result<T>
+  async fn blocking<T, F>(&self, f: F) -> crate::Result<T>
   where
     T: Send + 'static,
-    F: FnOnce(&Inner) -> anyhow::Result<T> + Send + 'static,
+    F: FnOnce(&Inner) -> crate::Result<T> + Send + 'static,
   {
     let inner = Arc::clone(&self.inner);
     tokio::task::spawn_blocking(move || f(&inner))
       .await
-      .context("a vector store task panicked")?
+      .wrap_err(crate::Error::storage, "a vector store task panicked")?
   }
 }
 
@@ -943,7 +956,7 @@ impl Inner {
     model: &str,
     chunks: &[String],
     hashes: &[String],
-  ) -> anyhow::Result<Vec<Option<Vec<f32>>>> {
+  ) -> crate::Result<Vec<Option<Vec<f32>>>> {
     let conn = self.conn();
     let mut statement = conn.prepare_cached(
       "SELECT text, embedding FROM documents WHERE model = ?1 AND text_hash = ?2 LIMIT 8",
@@ -979,7 +992,7 @@ impl Inner {
     metadata: &str,
     model: &str,
     max_documents: usize,
-  ) -> anyhow::Result<Inserted> {
+  ) -> crate::Result<Inserted> {
     let created_at = chrono::Utc::now().to_rfc3339();
     let outcome = {
       let mut conn = self.conn();
@@ -1043,7 +1056,7 @@ impl Inner {
     vectors: &[Vec<f32>],
     metadata: &str,
     model: &str,
-  ) -> anyhow::Result<Vec<i64>> {
+  ) -> crate::Result<Vec<i64>> {
     let created_at = chrono::Utc::now().to_rfc3339();
     let ids = {
       let mut conn = self.conn();
@@ -1079,7 +1092,7 @@ impl Inner {
 
   /// The documents embedded with a model other than `model`, with the text to embed
   /// again — the input of [`VectorStore::reindex`].
-  fn stale_documents(&self, collection: &str, model: &str) -> anyhow::Result<Vec<(i64, String)>> {
+  fn stale_documents(&self, collection: &str, model: &str) -> crate::Result<Vec<(i64, String)>> {
     let conn = self.conn();
     let mut statement = conn.prepare_cached(
       "SELECT id, text FROM documents WHERE collection = ?1 AND model != ?2 ORDER BY id",
@@ -1096,7 +1109,7 @@ impl Inner {
     collection: &str,
     updates: &[(i64, Vec<f32>)],
     model: &str,
-  ) -> anyhow::Result<()> {
+  ) -> crate::Result<()> {
     {
       let mut conn = self.conn();
       let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1123,12 +1136,12 @@ impl Inner {
   }
 
   /// The collection's searchable vectors, rebuilt only when something changed.
-  fn snapshot(&self, collection: &str, model: &str) -> anyhow::Result<Arc<Snapshot>> {
+  fn snapshot(&self, collection: &str, model: &str) -> crate::Result<Arc<Snapshot>> {
     self.snapshot_paged(collection, model, SNAPSHOT_PAGE, &mut || {})
   }
 
   /// The cached copy of `collection`, if it is still the current version.
-  fn current_snapshot(&self, collection: &str) -> anyhow::Result<Option<Arc<Snapshot>>> {
+  fn current_snapshot(&self, collection: &str) -> crate::Result<Option<Arc<Snapshot>>> {
     let version = read_version(&self.conn(), collection)?;
     Ok(
       self
@@ -1154,7 +1167,7 @@ impl Inner {
     model: &str,
     page: usize,
     between: &mut dyn FnMut(),
-  ) -> anyhow::Result<Arc<Snapshot>> {
+  ) -> crate::Result<Arc<Snapshot>> {
     if let Some(current) = self.current_snapshot(collection)? {
       return Ok(current);
     }
@@ -1201,7 +1214,7 @@ impl Inner {
     version: i64,
     page: usize,
     between: &mut dyn FnMut(),
-  ) -> anyhow::Result<Snapshot> {
+  ) -> crate::Result<Snapshot> {
     let expected: i64 = self.conn().query_row(
       "SELECT COUNT(*) FROM documents WHERE collection = ?1 AND model = ?2",
       params![collection, model],
@@ -1387,13 +1400,21 @@ fn read_version(connection: &Connection, collection: &str) -> rusqlite::Result<i
 /// What a vector set has to be before it is stored: non-empty vectors, all one length.
 /// A misbehaving embedder is caught here, rather than as a search that errors for every
 /// query afterwards.
-fn ensure_usable(vectors: &[Vec<f32>]) -> anyhow::Result<()> {
+///
+/// Both failures are [`crate::error::ProviderError::permanent`]: they describe an embedder
+/// breaking its own contract, which the same input reproduces, so retrying cannot help.
+fn ensure_usable(vectors: &[Vec<f32>]) -> crate::Result<()> {
+  use crate::error::ProviderError;
+
   if let Some(first) = vectors.first() {
-    anyhow::ensure!(!first.is_empty(), "the embedder returned an empty vector");
-    anyhow::ensure!(
-      vectors.iter().all(|vector| vector.len() == first.len()),
-      "the embedder returned vectors of different lengths"
-    );
+    if first.is_empty() {
+      return Err(ProviderError::permanent("the embedder returned an empty vector").into());
+    }
+    if vectors.iter().any(|vector| vector.len() != first.len()) {
+      return Err(
+        ProviderError::permanent("the embedder returned vectors of different lengths").into(),
+      );
+    }
   }
   Ok(())
 }

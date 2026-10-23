@@ -10,12 +10,17 @@ use async_openai::{
   error::OpenAIError,
   types::chat::{
     ChatChoice, ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-    ChatCompletionRequestUserMessageArgs, ChatCompletionTools, CreateChatCompletionRequestArgs,
-    CreateChatCompletionResponse,
+    ChatCompletionRequestUserMessageArgs, ChatCompletionTool, ChatCompletionTools,
+    CreateChatCompletionRequestArgs, CreateChatCompletionResponse, FunctionObject,
   },
 };
 
-use crate::llm::{backend::ChatRequest, settings::ModelSettings};
+use crate::{
+  Error, Result,
+  error::{ProviderError, ensure},
+  llm::{backend::ChatRequest, settings::ModelSettings},
+  tools::ToolDefinition,
+};
 
 /// Output token budget for normal conversations, when `LLM_MAX_TOKENS` is not set (see
 /// [`ModelSettings`]). Defined in [`crate::llm::settings`], re-exported here so the old
@@ -79,7 +84,7 @@ pub struct RequestDraft {
 impl RequestDraft {
   /// The finished request, with the reasoning to replay. Builds a fresh value each call,
   /// so a retried request is constructed anew rather than reusing one already consumed.
-  pub fn chat_request(&self) -> Result<ChatRequest, OpenAIError> {
+  pub fn chat_request(&self) -> std::result::Result<ChatRequest, OpenAIError> {
     Ok(ChatRequest {
       request: self.args.build()?,
       reasoning: self.reasoning.clone(),
@@ -102,9 +107,17 @@ impl DerefMut for RequestDraft {
 }
 
 /// Empty parameters cause a request that is guaranteed to fail; intercept early.
-pub fn ensure_valid_params(model: &str, prompt: &str) -> anyhow::Result<()> {
-  anyhow::ensure!(!model.trim().is_empty(), "model must not be empty");
-  anyhow::ensure!(!prompt.trim().is_empty(), "prompt must not be empty");
+pub fn ensure_valid_params(model: &str, prompt: &str) -> Result<()> {
+  ensure!(
+    !model.trim().is_empty(),
+    invalid_input,
+    "model must not be empty"
+  );
+  ensure!(
+    !prompt.trim().is_empty(),
+    invalid_input,
+    "prompt must not be empty"
+  );
   Ok(())
 }
 
@@ -112,7 +125,7 @@ pub fn ensure_valid_params(model: &str, prompt: &str) -> anyhow::Result<()> {
 pub fn build_messages(
   system: Option<&str>,
   prompt: &str,
-) -> anyhow::Result<Vec<ChatCompletionRequestMessage>> {
+) -> Result<Vec<ChatCompletionRequestMessage>> {
   let mut messages = Vec::with_capacity(2);
   if let Some(system) = system.map(str::trim).filter(|s| !s.is_empty()) {
     messages.push(
@@ -135,13 +148,15 @@ pub fn build_messages(
 /// sampling, reasoning effort); callers can keep appending params before sending it
 /// (see [`RequestDraft`]).
 ///
-/// An empty `tools` slice is left unset rather than sent as `"tools": []`: the API
-/// requires at least one entry when the field is present, so an empty array is rejected.
+/// `tools` are converted to the API's `{"type": "function", "function": ...}` entries
+/// here — the one place a [`ToolDefinition`] takes a provider's shape. An empty slice is
+/// left unset rather than sent as `"tools": []`: the API requires at least one entry when
+/// the field is present, so an empty array is rejected.
 pub fn request_builder(
   model: &str,
   messages: impl Into<WireMessages>,
   settings: &ModelSettings,
-  tools: &[ChatCompletionTools],
+  tools: &[ToolDefinition],
 ) -> RequestDraft {
   let WireMessages {
     messages,
@@ -151,18 +166,31 @@ pub fn request_builder(
   args.model(model).messages(messages);
   settings.apply(&mut args);
   if !tools.is_empty() {
-    args.tools(tools.to_vec());
+    args.tools(tools.iter().map(chat_tool).collect::<Vec<_>>());
   }
   RequestDraft { args, reasoning }
 }
 
-/// Take the first choice from the response.
-pub fn first_choice(response: CreateChatCompletionResponse) -> anyhow::Result<ChatChoice> {
+/// `definition` as a chat-completions function tool.
+fn chat_tool(definition: &ToolDefinition) -> ChatCompletionTools {
+  ChatCompletionTools::Function(ChatCompletionTool {
+    function: FunctionObject {
+      name: definition.name.clone(),
+      description: Some(definition.description.clone()),
+      parameters: Some(definition.parameters.clone()),
+      strict: None,
+    },
+  })
+}
+
+/// Take the first choice from the response. A response without one is a
+/// [`ProviderError::transient`]: the provider answered with nothing usable.
+pub fn first_choice(response: CreateChatCompletionResponse) -> Result<ChatChoice> {
   response
     .choices
     .into_iter()
     .next()
-    .ok_or_else(|| anyhow::anyhow!("No choices in response"))
+    .ok_or_else(|| Error::from(ProviderError::transient("No choices in response")))
 }
 
 /// The full response can be long; only log metadata to help inspect usage and trace id.
@@ -263,6 +291,32 @@ mod tests {
     .unwrap();
     let tools = request.tools.unwrap();
     assert_eq!(tools.len(), registry.definitions().len());
+  }
+
+  /// The provider-neutral definition becomes exactly the function-tool entry the chat
+  /// completions API expects — the same JSON the tools produced before they had their
+  /// own definition type.
+  #[test]
+  fn a_tool_definition_goes_on_the_wire_as_a_function_tool() {
+    let definition = ToolDefinition {
+      name: "weather".to_owned(),
+      description: "Look up the weather".to_owned(),
+      parameters: json!({ "type": "object", "properties": { "city": { "type": "string" } } }),
+    };
+    let request = request_builder("gpt-test", Vec::new(), &settings(16), &[definition])
+      .build()
+      .unwrap();
+    assert_eq!(
+      serde_json::to_value(&request.tools.unwrap()[0]).unwrap(),
+      json!({
+        "type": "function",
+        "function": {
+          "name": "weather",
+          "description": "Look up the weather",
+          "parameters": { "type": "object", "properties": { "city": { "type": "string" } } },
+        },
+      })
+    );
   }
 
   #[test]

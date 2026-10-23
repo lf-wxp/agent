@@ -1,8 +1,9 @@
 use std::path::Path;
 
-use anyhow::Context;
-
-use crate::tools::{file_edit::EditFileArgs, file_write::execute::write_atomic};
+use crate::{
+  error::ResultExt,
+  tools::{file_edit::EditFileArgs, file_write::execute::write_atomic},
+};
 
 /// Replaces `old_string` with `new_string` in `file_path`.
 ///
@@ -17,34 +18,41 @@ use crate::tools::{file_edit::EditFileArgs, file_write::execute::write_atomic};
 /// prevented one level up, by this tool not being
 /// [`concurrency_safe`](crate::tools::Tool::concurrency_safe): edits within a round take
 /// turns.
-pub async fn run(args_json: &str) -> anyhow::Result<String> {
+pub async fn run(args_json: &str) -> crate::Result<String> {
   let EditFileArgs {
     file_path,
     old_string,
     new_string,
     replace_all,
-  } = serde_json::from_str::<EditFileArgs>(args_json).context("invalid file edit arguments")?;
+  } = serde_json::from_str::<EditFileArgs>(args_json)
+    .wrap_err(crate::Error::tool, "invalid file edit arguments")?;
 
-  anyhow::ensure!(
+  crate::error::ensure!(
     !old_string.is_empty(),
+    tool,
     "old_string must not be empty; use write_file to create a file"
   );
-  anyhow::ensure!(
+  crate::error::ensure!(
     old_string != new_string,
+    tool,
     "old_string and new_string are identical; nothing to change"
   );
 
   let content = tokio::fs::read_to_string(&file_path)
     .await
-    .with_context(|| format!("failed to read `{file_path}`"))?;
+    .wrap_err_with(crate::Error::tool, || {
+      format!("failed to read `{file_path}`")
+    })?;
 
   let occurrences = content.matches(old_string.as_str()).count();
   match occurrences {
-    0 => anyhow::bail!(
+    0 => crate::error::bail!(
+      tool,
       "old_string was not found in `{file_path}`; read the file again and copy the text \
        exactly, including whitespace"
     ),
-    n if n > 1 && !replace_all => anyhow::bail!(
+    n if n > 1 && !replace_all => crate::error::bail!(
+      tool,
       "old_string occurs {n} times in `{file_path}`; include more surrounding context to \
        make it unique, or set replace_all to true"
     ),
@@ -58,7 +66,9 @@ pub async fn run(args_json: &str) -> anyhow::Result<String> {
   };
   write_atomic(Path::new(&file_path), updated.as_bytes())
     .await
-    .with_context(|| format!("failed to write `{file_path}`"))?;
+    .wrap_err_with(crate::Error::tool, || {
+      format!("failed to write `{file_path}`")
+    })?;
 
   let replaced = if replace_all { occurrences } else { 1 };
   Ok(format!(

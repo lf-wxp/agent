@@ -53,11 +53,11 @@ macro_rules! simple_tool {
   ) => {
     $crate::tools::macros::impl_simple_tool!(
       $tool, $args, $name, $description, [$($timeout)?], [$($safe)?], {
-        async fn execute(&self, args_json: &str) -> anyhow::Result<String> {
+        async fn execute(&self, args_json: &str) -> crate::Result<String> {
           let args_json = args_json.to_owned();
           tokio::task::spawn_blocking(move || $run(&args_json))
             .await
-            .map_err(|err| anyhow::anyhow!("tool task panicked: {err}"))?
+            .map_err(|err| crate::Error::tool(format!("tool task panicked: {err}")))?
         }
       }
     );
@@ -74,7 +74,7 @@ macro_rules! simple_tool {
   ) => {
     $crate::tools::macros::impl_simple_tool!(
       $tool, $args, $name, $description, [$($timeout)?], [$($safe)?], {
-        async fn execute(&self, args_json: &str) -> anyhow::Result<String> {
+        async fn execute(&self, args_json: &str) -> crate::Result<String> {
           $run(args_json).await
         }
       }

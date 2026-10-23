@@ -32,13 +32,14 @@ pub enum TokenLimitField {
 }
 
 impl FromStr for TokenLimitField {
-  type Err = anyhow::Error;
+  type Err = crate::Error;
 
   fn from_str(value: &str) -> Result<Self, Self::Err> {
     match value.trim().to_ascii_lowercase().as_str() {
       "max_tokens" => Ok(Self::MaxTokens),
       "max_completion_tokens" => Ok(Self::MaxCompletionTokens),
-      other => anyhow::bail!(
+      other => crate::error::bail!(
+        config,
         "unknown token limit field `{other}`; expected `max_tokens` or `max_completion_tokens`"
       ),
     }
@@ -46,7 +47,7 @@ impl FromStr for TokenLimitField {
 }
 
 /// Parse a `reasoning_effort` name, as accepted by the API.
-pub fn parse_reasoning_effort(value: &str) -> anyhow::Result<ReasoningEffort> {
+pub fn parse_reasoning_effort(value: &str) -> crate::Result<ReasoningEffort> {
   Ok(match value.trim().to_ascii_lowercase().as_str() {
     "none" => ReasoningEffort::None,
     "minimal" => ReasoningEffort::Minimal,
@@ -55,7 +56,8 @@ pub fn parse_reasoning_effort(value: &str) -> anyhow::Result<ReasoningEffort> {
     "high" => ReasoningEffort::High,
     "xhigh" => ReasoningEffort::Xhigh,
     "max" => ReasoningEffort::Max,
-    other => anyhow::bail!(
+    other => crate::error::bail!(
+      config,
       "unknown reasoning effort `{other}`; expected one of none, minimal, low, medium, high, \
        xhigh, max"
     ),
@@ -188,7 +190,7 @@ impl ModelSettings {
   }
 }
 
-fn warn_on_error<T>(key: &str, parsed: anyhow::Result<T>) -> Option<T> {
+fn warn_on_error<T>(key: &str, parsed: crate::Result<T>) -> Option<T> {
   parsed
     .inspect_err(|err| tracing::warn!("ignoring {key}: {err}"))
     .ok()
