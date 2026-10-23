@@ -97,20 +97,9 @@ const ENV_HF_TOKEN: &str = "HF_TOKEN";
 /// Environment variable: Tavily search depth, `basic` / `advanced` / `fast` / `ultra-fast`.
 const ENV_TAVILY_SEARCH_DEPTH: &str = "TAVILY_SEARCH_DEPTH";
 
-/// Environment variable: Tavily search depth, `basic` / `advanced` / `fast` / `ultra-fast`.
+/// Environment variable: the embedding model, used by retrieval, search compression and
+/// `--memory`. Served from the chat provider's own endpoint.
 const ENV_EMBED_MODEL: &str = "EMBED_MODEL";
-
-/// Environment variable: base URL for the embeddings API.
-///
-/// Chat completions and embeddings often need different providers (e.g. a reasoning-only
-/// model has no embeddings endpoint), so this is deliberately separate from
-/// `OPENAI_BASE_URL`. Unset falls back to it, so a single OpenAI-compatible provider that
-/// serves both still works with no extra configuration.
-const ENV_EMBED_BASE_URL: &str = "EMBED_BASE_URL";
-
-/// Environment variable: API key for the embeddings API. Unset falls back to `OPENAI_API_KEY`,
-/// see [`ENV_EMBED_BASE_URL`].
-const ENV_EMBED_API_KEY: &str = "EMBED_API_KEY";
 
 /// Model used when `LLM_MODEL` is not configured.
 const DEFAULT_MODEL: &str = "deepseek-v4-flash";
@@ -427,39 +416,71 @@ pub fn tavily_search_depth() -> String {
   non_empty_var(ENV_TAVILY_SEARCH_DEPTH).unwrap_or_else(|| DEFAULT_TAVILY_SEARCH_DEPTH.to_owned())
 }
 
-/// Tavily API key used by the `web_search` tool. `None` when unset.
+/// The embedding model. `None` when `EMBED_MODEL` is unset.
 pub fn embed_model() -> Option<String> {
   non_empty_var(ENV_EMBED_MODEL)
 }
 
-/// Base URL for the embeddings API. Override with `EMBED_BASE_URL`; `None` when unset,
-/// letting the caller fall back to the default OpenAI-compatible base URL.
-pub fn embed_base_url() -> Option<String> {
-  non_empty_var(ENV_EMBED_BASE_URL)
-}
-
-/// API key for the embeddings API. Override with `EMBED_API_KEY`; `None` when unset,
-/// letting the caller fall back to `OPENAI_API_KEY`.
-pub fn embed_api_key() -> Option<String> {
-  non_empty_var(ENV_EMBED_API_KEY)
-}
-
 /// Where text sent for embedding goes, in a form fit to print: the host (and port) of the
-/// embeddings endpoint, and whether that is the chat provider's or a separate one.
+/// embeddings endpoint, which is the chat provider's own.
 ///
-/// Mirrors how the client picks its endpoint — `EMBED_BASE_URL`, else `OPENAI_BASE_URL`,
-/// else the OpenAI default — but prints only the authority, never the path or anything
-/// before an `@`: a base URL can carry credentials (`https://user:key@host/v1`), and a
-/// line meant to tell people where their data goes must not become a place a key shows up.
+/// Mirrors how the client picks its endpoint — `OPENAI_BASE_URL`, else the OpenAI default —
+/// but prints only the authority, never the path or anything before an `@`: a base URL can
+/// carry credentials (`https://user:key@host/v1`), and a line meant to tell people where
+/// their data goes must not become a place a key shows up.
 pub fn embed_endpoint_label() -> String {
-  let (url, source) = match embed_base_url() {
-    Some(url) => (url, "EMBED_BASE_URL"),
-    None => match non_empty_var("OPENAI_BASE_URL") {
-      Some(url) => (url, "the chat provider"),
-      None => ("https://api.openai.com/v1".to_owned(), "the default"),
-    },
+  let (url, source) = match non_empty_var("OPENAI_BASE_URL") {
+    Some(url) => (url, "the chat provider"),
+    None => ("https://api.openai.com/v1".to_owned(), "the default"),
   };
   format!("{} via {source}", url_authority(&url))
+}
+
+/// The environment variables that used to point embeddings at a provider of their own.
+///
+/// They were removed when embeddings were unified onto the chat provider's endpoint. Kept
+/// as names so [`removed_embed_overrides`] can tell the user their setting stopped doing
+/// anything: the alternative is a silent redirect of their documents and memory queries to
+/// a host they did not choose.
+const REMOVED_EMBED_OVERRIDES: &[&str] = &["EMBED_BASE_URL", "EMBED_API_KEY"];
+
+/// Which of the removed embedding overrides are still set, by name.
+///
+/// Returns names only, never values: one of them is a credential, and this feeds a line
+/// printed to a terminal and, under `--mode web`, to a log. An empty result means nothing
+/// to say.
+pub fn removed_embed_overrides() -> Vec<&'static str> {
+  set_removed_overrides(|name| non_empty_var(name).is_some())
+}
+
+fn set_removed_overrides(is_set: impl Fn(&str) -> bool) -> Vec<&'static str> {
+  REMOVED_EMBED_OVERRIDES
+    .iter()
+    .copied()
+    .filter(|name| is_set(name))
+    .collect()
+}
+
+/// The warning for a removed embedding override that is still set, or `None` when there is
+/// nothing to warn about.
+///
+/// One place builds the sentence so the CLI and the examples cannot drift apart. `None`
+/// when `EMBED_MODEL` is unset too: nothing is embedded then, so no text goes anywhere and
+/// the warning would be noise. Names only, see [`removed_embed_overrides`].
+pub fn removed_embed_overrides_warning() -> Option<String> {
+  embed_model()?;
+  embed_override_warning(&removed_embed_overrides(), &embed_endpoint_label())
+}
+
+fn embed_override_warning(ignored: &[&str], endpoint: &str) -> Option<String> {
+  if ignored.is_empty() {
+    return None;
+  }
+  let verb = if ignored.len() == 1 { "is" } else { "are" };
+  Some(format!(
+    "warning: {} {verb} set but no longer read; embeddings go to {endpoint}.",
+    ignored.join(" and ")
+  ))
 }
 
 /// `host[:port]` of `url`, without scheme, path, query or userinfo; `url` itself, trimmed
@@ -484,12 +505,7 @@ const ENV_OPENAI_API_KEY: &str = "OPENAI_API_KEY";
 /// Derived from the same constants the getters above use rather than retyped where it is
 /// needed, so a credential added to this module cannot be forgotten by a consumer that
 /// has to strip them (see `run_command`).
-pub const SECRET_ENV_VARS: &[&str] = &[
-  ENV_OPENAI_API_KEY,
-  ENV_TAVILY_API_KEY,
-  ENV_EMBED_API_KEY,
-  ENV_HF_TOKEN,
-];
+pub const SECRET_ENV_VARS: &[&str] = &[ENV_OPENAI_API_KEY, ENV_TAVILY_API_KEY, ENV_HF_TOKEN];
 
 /// Whether an environment variable *name* looks like it holds a credential.
 ///
@@ -643,6 +659,47 @@ mod tests {
     // cost of never guessing wrong in the other direction.
     assert!(!is_secret_env_name("PASSWORD_STORE_DIR"));
     assert!(is_secret_env_name("PASSWORD_STORE_DIR_IS_NOT_A_PASSWORD"));
+  }
+
+  /// A removed override that is still set is reported; the ones that are not, are not.
+  /// Takes the lookup as a closure so no test has to touch the process environment.
+  #[test]
+  fn removed_embed_overrides_lists_only_the_ones_still_set() {
+    assert!(set_removed_overrides(|_| false).is_empty());
+    assert_eq!(
+      set_removed_overrides(|name| name == "EMBED_BASE_URL"),
+      ["EMBED_BASE_URL"]
+    );
+    assert_eq!(
+      set_removed_overrides(|_| true),
+      ["EMBED_BASE_URL", "EMBED_API_KEY"]
+    );
+  }
+
+  /// The warning names the variables and the endpoint, agrees in number, and says nothing
+  /// at all when there is nothing to say. It must not be able to carry a value: it is built
+  /// from names only.
+  #[test]
+  fn embed_override_warning_names_the_variables_and_the_endpoint() {
+    assert_eq!(
+      embed_override_warning(&[], "host via the chat provider"),
+      None
+    );
+
+    let one = embed_override_warning(&["EMBED_BASE_URL"], "api.example.com via the chat provider")
+      .expect("one override set");
+    assert_eq!(
+      one,
+      "warning: EMBED_BASE_URL is set but no longer read; embeddings go to \
+       api.example.com via the chat provider."
+    );
+
+    let both = embed_override_warning(
+      &["EMBED_BASE_URL", "EMBED_API_KEY"],
+      "api.example.com via the chat provider",
+    )
+    .expect("both overrides set");
+    assert!(both.contains("EMBED_BASE_URL and EMBED_API_KEY are set"));
   }
 
   #[test]

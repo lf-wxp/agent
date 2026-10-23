@@ -39,7 +39,7 @@
 | Cargo features | ✅ | `cli` / `mcp` / `sqlite` / `zip` / `otel`，默认除 `otel` 外全开；`default-features = false` 时依赖从约 260 个降到约 180 个；CI 检查每个 feature 单独开启和全部关闭 |
 | 工具定义体验 | ✅ | `Tool` 只依赖自有的 `ToolDefinition`，与 `async-openai` 解耦；`FnTool` 用参数结构体加 async 闭包定义工具；注册时校验工具名。没有 `#[tool]` 过程宏（讨论后选了泛型构造器） |
 | 服务化 | ⚠️ | Web UI 只监听 127.0.0.1，没有鉴权，只支持单用户 |
-| 测试 | ⚠️ | 全部 feature 下根 crate 约 850 个测试（库内 769、CLI 53、集成测试 21、doctest），另有 `shared` / `web-ui` 33 个；没有真实 LLM 的端到端回归测试（第 14 项）；`llm::complete` 没有单元测试；CI 没跑示例里的测试和 `shared` / `web-ui`（第 15 项） |
+| 测试 | ⚠️ | CI 跑全部 workspace 成员和示例里的测试，共 900 个（全部 feature：892 个 `--all-targets` + 8 个 doctest；无 feature 时 689 个）；没有真实 LLM 的端到端回归测试（第 14 项）；`llm::complete` 没有单元测试；没有 `web-ui` 的浏览器端测试 |
 
 ## 3. 缺口详述（按优先级）
 
@@ -112,7 +112,7 @@
 | 12 | 审批时改写参数（`edit`） | 审批人修改工具参数后放行，对话记录与实际执行的参数保持一致 | 中 | 无 | ⏳ 待开始 |
 | 13 | 多模态输入 | 用户消息带图片；工具（含 MCP）返回的图片交给模型 | 大 | 与第 8 项都改 MCP 结果的处理，先做的一方定接口 | ⏳ 待开始 |
 | 14 | 真实 LLM 的端到端回归评测 | 一组固定任务，用真实模型定期跑，按通过率判断是否退化 | 中 | 需要 API key 和预算 | ⏳ 待开始 |
-| 15 | 补全 CI 覆盖 | CI 补上示例里的测试、`shared` / `web-ui` 的测试和 wasm 端 clippy | 小 | 无 | ⏳ 待开始 |
+| 15 | 补全 CI 覆盖 | CI 补上示例里的测试、`shared` / `web-ui` 的测试和 wasm 端 clippy | 小 | 无 | ✅ 已完成（15.5 可选项未做） |
 
 **建议顺序**：15 → 14 → 10 → 8 → 12 → 13 → 9 → 11。
 
@@ -423,11 +423,11 @@
 - **README 有一处说法不对**：README 说「用 `cargo make test` 或 `cargo test --workspace` 跑全部测试」，但 `Makefile.toml` 设了 `default_to_workspace = false`，`cargo make test` 实际只跑根 crate。
 
 **子任务**
-- [ ] 15.1 测试任务改为同时覆盖示例和整个 workspace（例如 `cargo test --workspace --all-features --all-targets`，再单独跑 doctest；或者在 `[[example]] rag` 上设 `test = true`）。
-- [ ] 15.2 新增 wasm 任务：安装 `wasm32-unknown-unknown` target，跑和 `cargo make clippy-wasm` 相同的检查。
-- [ ] 15.3 `Makefile.toml` 的 `test` 任务同步修改，让本地和 CI 跑的是同一组。
-- [ ] 15.4 修正 README 里关于 `cargo make test` 覆盖范围的说法。
-- [ ] 15.5 （可选）前端构建检查：在 CI 里跑一次 `trunk build`，发现 `crates/web-ui` 编译不过的问题。
+- [x] 15.1 测试任务改为同时覆盖示例和整个 workspace（例如 `cargo test --workspace --all-features --all-targets`，再单独跑 doctest；或者在 `[[example]] rag` 上设 `test = true`）。
+- [x] 15.2 新增 wasm 任务：安装 `wasm32-unknown-unknown` target，跑和 `cargo make clippy-wasm` 相同的检查。
+- [x] 15.3 `Makefile.toml` 的 `test` 任务同步修改，让本地和 CI 跑的是同一组。
+- [x] 15.4 修正 README 里关于 `cargo make test` 覆盖范围的说法。
+- [ ] 15.5（未做）（可选）前端构建检查：在 CI 里跑一次 `trunk build`，发现 `crates/web-ui` 编译不过的问题。
 
 **开始前要确认**
 - 示例测试用 `--examples` 还是 `test = true`：前者对以后新加的示例自动生效，后者只对标记过的示例生效。
@@ -650,7 +650,7 @@
 
 - **方案选择**（与你确认过）：SQLite（`rusqlite` 0.40，`bundled`，不依赖系统里装的 SQLite）；CLI 记忆默认关闭，`--memory` 开启；写入记忆不需要审批，但每次写入都是可见的工具调用，并且可以用 `/memory` 查看。
 - **Embedding 接口**（`src/knowledge_base/embed.rs`）：
-  - 新增 `Embedder` trait（`model()` + `embed(texts)`），内置实现 `OpenAiEmbedder`，沿用 `EMBED_BASE_URL` / `EMBED_API_KEY` 的配置。
+  - 新增 `Embedder` trait（`model()` + `embed(texts)`），内置实现 `OpenAiEmbedder`，复用聊天模型的端点与凭据。
   - 现在每个请求都有重试、`embeddings` span，用量按 embedding 模型计入所在的运行（第 5 项的账本）。
   - 原有的 `vector_search` 保留，`SearchCompressorCallback` 不受影响；`vector_search` 把查询和文本块合并成一次请求。`embed_texts` / `embed_text` 两个自由函数已由 `OpenAiEmbedder` 取代，保留为 `#[deprecated]` 的薄包装以免破坏下游（见 `CHANGELOG.md`）。
 - **向量库**（`src/knowledge_base/store.rs`，`VectorStore`）：
@@ -820,3 +820,38 @@
 - `with_mcp_over` 的「坏工具只记日志并跳过」抽成 `add_skipping` 并有测试；`ToolRegistry::add` 拒绝非法名字也有测试。
 - embedder 契约违约（数量不符、空向量、长度不一致）由 `transient` 改为 `permanent`：同一输入重试只会失败得一样。
 - `file_read` / `file_upzip` 的裸 `?` 补了路径上下文，模型能看到是哪个文件失败。
+
+#### 第 15 项：补全 CI 覆盖
+
+- **实测发现的漏洞**（改之前，全部 feature）：
+
+  | 命令 | 跑到的测试 |
+  |---|---|
+  | CI 原来的 `cargo test --all-features` | 860 |
+  | 加 `--workspace` | 893（多出 `shared` 27、`web-ui` 6） |
+  | `cargo make test` 原来的命令 | 同 CI，860 |
+  | 本次改后：`--workspace --all-features --all-targets` + `--doc` | 898（再多出 `examples/rag.rs` 的 5 个） |
+
+  - `shared` 和 `web-ui` 是 workspace 成员，裸 `cargo test` 不碰它们。
+  - 示例里的 `#[cfg(test)]` 模块，裸 `cargo test` 只编译、不运行（实测：不加 `--examples` 时看不到 `examples/rag.rs` 的测试）。
+  - wasm 端 clippy 在 `cargo make ci` 里有，GitHub Actions 里没有。
+  - 原来 `Makefile.toml` 里的注释说 `web-ui`「没有测试、也不能在宿主上编译」，与实际不符：它在宿主上能编译，6 个测试原生就能跑，不需要 wasm 运行器。注释已改。
+- **改动**：
+  - `ci.yml` 的 `test` 任务改为两条命令：`cargo test --workspace --all-features --all-targets --no-fail-fast` 和 `cargo test --workspace --all-features --doc --no-fail-fast`（`--all-targets` 不含 doctest，所以要分开）。
+  - 新增 `clippy-wasm` 任务：安装 `wasm32-unknown-unknown`，跑 `cargo clippy -p web-ui -p shared --target wasm32-unknown-unknown --all-targets -- -D warnings`，与 `Makefile.toml` 里的 `clippy-wasm` 同一条命令。
+  - `Makefile.toml` 的 `test` 任务改成同样的两条命令，本地 `cargo make test` 和 CI 跑的一致。
+  - README 中英文：任务表里 `cargo make test` 的说明改为实际覆盖范围；「裸 `cargo test` 只覆盖根 package」那条陷阱补上「也不运行示例里的测试」。
+- **`--no-fail-fast` 是实测后加的**：同时在 `examples/rag.rs` 和 `crates/shared` 里各埋一个失败测试，默认模式在 `rag` 处就停了，`shared` 的失败要等前一个修好才会暴露；加 `--no-fail-fast` 一次报出两处（`error: 2 targets failed`）。
+- **`Makefile.toml` 的两条命令不能串在 `set -e` 下**（初审后修）：第一条失败就退出，doctest 一个都不跑，正好抵消 `--no-fail-fast` 的意义，也让它与 CI 的两个独立 step 不一致。现在两条都跑、失败按位或汇总到退出码。
+- **初审后的数字变化**：上表和下面「验收」里的 898 / 687 是第 15 项落地时的实测。随后的审查修复新增了 2 个 `config` 单测（旧变量告警），所以当前是 900（892 + 8）和 689；概览表（第 2 节「测试」）已按当前值更新。审查修复的完整清单见 `docs/change-review.md`。
+- **验收**（均在本地实测，改动随即还原）：
+  - 示例测试里埋一个失败断言：原来的 `cargo test --all-features` 没抓到，新命令抓到；
+  - `crates/shared` 里埋一个失败测试：新命令抓到；
+  - `crates/web-ui` 里埋 clippy 警告（`len() == 0`、多余的 `vec!`）：wasm 命令报错退出；
+  - `cargo make test` 实际跑了 898 个测试，含 `examples/rag.rs`、`shared`、`web-ui` 和两个 crate 的 doctest；
+  - 其余检查不变：fmt、全 feature clippy、6 种 feature 组合、无 feature 的 687 个测试；`ci.yml` 能被 YAML 解析，六个任务：`fmt`、`clippy`、`test`、`clippy-wasm`、`features`、`test-minimal`。
+- **没改的**：
+  - `check-features` 和 CI 的 `test-minimal` 保持原样。无 feature 时 `--all-targets` 不会多出测试（`rag` 需要 `sqlite`，本来就被跳过），实测前后都是 687 个。
+  - 15.5（CI 里跑 `trunk build`）没做：需要在 CI 里安装 `trunk`，多花时间，而 wasm clippy 已经覆盖了编译错误。要做的话再说。
+  - 没有 `web-ui` 的浏览器端测试：现有 6 个测试在宿主上跑，测的是翻译表和命令表这类纯逻辑；渲染、事件流这些要 `wasm-bindgen-test` 加浏览器才能测，本机虽然装了 `wasm-bindgen-test-runner`，CI 里还没配。
+  - 新 workflow 本身没有在 GitHub 上跑过：这里只验证了 YAML 能解析、各条命令在本地等价运行。第一次推送后要看一下 `clippy-wasm` 任务（`targets:` 的写法和 rust-cache 的 key）是否一次通过。

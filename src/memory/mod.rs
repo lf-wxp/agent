@@ -20,11 +20,10 @@
 //! [`VectorStore::open`]; elsewhere it gets what the directory grants) — nothing is
 //! encrypted beyond that, so the *file* is protected by file permissions. The *text* is another matter: to be searched by meaning, every
 //! fact is sent to the embedding provider when it is saved, and every recall sends the
-//! opening of the user's message there as the query (see [`RecallCallback`]). Under the
-//! default configuration (`EMBED_BASE_URL` / `EMBED_API_KEY` unset) that provider is the
-//! chat model's own, so it sees nothing it was not already sent — but point the embedding
-//! variables at a different provider and your memories and, every turn, your messages go
-//! to that one as well. Use a local or self-hosted endpoint when that matters.
+//! opening of the user's message there as the query (see [`RecallCallback`]). That provider
+//! is the chat model's own (embeddings go to `OPENAI_BASE_URL` / `OPENAI_API_KEY`), so it
+//! sees nothing it was not already sent. Use a local or self-hosted endpoint when that
+//! matters.
 //!
 //! A fact that looks like a credential (an API key, a private key, a token, a labelled
 //! password) is refused outright rather than stored, and the `remember` tool's

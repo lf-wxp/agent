@@ -112,21 +112,11 @@ fn plan_batches(texts: &[String]) -> Vec<std::ops::Range<usize>> {
 /// Reuse a single client within the process: avoid rebuilding the connection pool and
 /// re-reading env vars on every call.
 ///
-/// Built from its own config rather than `OpenAIConfig::default()`: chat completions and
-/// embeddings frequently need different providers (e.g. a reasoning-only model has no
-/// embeddings endpoint), so `EMBED_BASE_URL` / `EMBED_API_KEY` let them be pointed at a
-/// separate provider. Either falls back to the default `OPENAI_BASE_URL` / `OPENAI_API_KEY`
-/// when unset, so a single provider that serves both still works unchanged.
-static CLIENT: LazyLock<Client<OpenAIConfig>> = LazyLock::new(|| {
-  let mut config = OpenAIConfig::default();
-  if let Some(base_url) = config::embed_base_url() {
-    config = config.with_api_base(base_url);
-  }
-  if let Some(api_key) = config::embed_api_key() {
-    config = config.with_api_key(api_key);
-  }
-  Client::with_config(config)
-});
+/// The chat provider's own client: embeddings are served from the same endpoint and
+/// credentials as chat completions, which `OpenAIConfig::default()` reads from
+/// `OPENAI_BASE_URL` / `OPENAI_API_KEY`.
+static CLIENT: LazyLock<Client<OpenAIConfig>> =
+  LazyLock::new(|| Client::with_config(OpenAIConfig::default()));
 
 /// Any server speaking the OpenAI embeddings API.
 ///
@@ -149,8 +139,7 @@ impl OpenAiEmbedder {
     }
   }
 
-  /// `model` on the process-wide embeddings endpoint (`EMBED_BASE_URL` /
-  /// `EMBED_API_KEY`, falling back to the chat ones).
+  /// `model` on the chat provider's endpoint.
   pub fn with_model(model: impl Into<String>) -> Self {
     Self {
       client: CLIENT.clone(),

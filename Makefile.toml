@@ -16,9 +16,10 @@
 [config]
 min_version = "0.37.0"
 # The workspace members are the wasm half, and they are handled deliberately (see
-# `clippy-wasm`/`web`), not by running every task once per member: `cargo make test`
-# fanned out across the workspace would try to run the native test suite inside
-# `crates/web-ui`, which has no test suite and does not build for the host target.
+# `clippy-wasm`/`web`), not by running every task once per member: letting cargo-make fan
+# a task out across the workspace would run each one per crate, in the wrong order and
+# with the wrong target for the wasm members. Tasks that do span the workspace (`test`)
+# say so with `--workspace` themselves.
 default_to_workspace = false
 # cargo-make ships a large set of predefined tasks (coverage, release automation,
 # CI provisioning, ...) that this repo does not use and whose names (`build`, `check`,
@@ -88,12 +89,37 @@ command = "cargo"
 args = ["clippy", "--all-targets", "--all-features", "--", "-D", "warnings"]
 
 [tasks.test]
-description = "Run unit tests, integration tests and doctests"
+description = "Run every crate's unit, integration and example tests, then the doctests"
 category = "CI"
-command = "cargo"
+script_runner = "@shell"
+# Same two commands as CI's `test` job; keep them in step.
+#
+# `--workspace`: `crates/shared` and `crates/web-ui` have tests of their own (the wire
+# types' round trips, the translation tables) that plain `cargo test` at the root never
+# reaches. `web-ui` builds for the host too, so those run natively; nothing here needs a
+# wasm runner.
+#
+# `--all-targets`: includes the `#[cfg(test)]` modules inside `examples/`, which a plain
+# `cargo test` compiles around but does not run.
+#
+# `--doc` separately, because `--all-targets` leaves doctests out.
+#
+# `--no-fail-fast`: report every failing target in one run, not just the first.
+#
+# Both commands run even when the first fails, and the exit status is the OR of the two:
+# with a plain `set -e` the first failure would end the script and the doctests would not
+# run at all, which is the opposite of what `--no-fail-fast` is for (and the two steps are
+# separate in CI, so `set -e` would also make local runs differ from CI).
+#
 # `--all-features`: the `otel` tests and the exporter's own code only exist with it on,
 # and CI runs them.
-args = ["test", "--all-features"]
+script = '''
+set -u
+status=0
+cargo test --workspace --all-features --all-targets --no-fail-fast || status=1
+cargo test --workspace --all-features --doc --no-fail-fast || status=1
+exit "${status}"
+'''
 
 # `--all-features` alone never notices a `cfg` that only compiles because some other
 # feature happens to be on, so each optional part is linted on its own, plus none at all,

@@ -414,7 +414,7 @@ match agent.run(input).await {
 - **成本**：把 `LLM_PRICING_FILE` 指向一个 JSON 价格表（按每百万 token 计价，格式见 `llm::pricing`），`PriceTable::estimate` 就能算出一次运行的费用。代码里不内置任何价格。
 - **显示**：CLI 每轮结束时打印一行暗色的 `[usage] … in · … out · ≈ … USD`，Web UI 在回答下方显示同样的信息。
 
-**检索与长期记忆**（需要 embedding 模型：`EMBED_MODEL`；如果和聊天模型不是同一个提供商，再设置 `EMBED_BASE_URL` / `EMBED_API_KEY`）：
+**检索与长期记忆**（需要 embedding 模型：`EMBED_MODEL`，由聊天模型所在的端点提供服务）：
 - **向量库**：`knowledge_base::store::VectorStore` 把文本块和它的 embedding 存在 SQLite 里，按集合（collection）分组，集合内再按来源（一个文件、一个网页）区分。
   - `put_source` / `index_text` 原子地替换一个来源的全部文本块，并且**复用库里已有的、同一文本同一模型的向量**，所以重建索引时只会为有变化的内容计算 embedding。
   - 检索是对内存中缓存的向量做精确余弦相似度计算，几万个文本块以内都很快。
@@ -427,7 +427,7 @@ match agent.run(input).await {
   - `memory::RecallCallback`（一个 before-LLM 钩子）每轮自动找出和新消息相关的记忆，放到模型面前。
   - 召回的记忆放在一条普通消息里，并标明是参考资料、可能来自不可信来源，**不会作为 system 指令**，也不写入对话记录。
   - 看起来像密钥、口令的内容会被拒绝保存（含带标签的密码、`my password is …`、中文写法和 `Bearer`），这是兜底而不是保证；单条长度和总条数都有上限，库文件新建时只对属主可读（这是 Unix 权限位；其他平台取决于所在目录的权限，请放在只有自己能读的地方）。
-  - **隐私**：库文件留在本机，但每条事实在保存时都会发给 embedding 提供方，每一轮还会把用户消息的开头作为召回查询发过去。`EMBED_BASE_URL` 未设置时就是聊天模型的提供方；设置了则是那一个。介意的话请用本地或自建的 embedding 端点。
+  - **隐私**：库文件留在本机，但每条事实在保存时都会发给 embedding 提供方，每一轮还会把用户消息的开头作为召回查询发过去。也就是聊天模型的提供方。介意的话请用本地或自建的 embedding 端点。
   - 换过 `EMBED_MODEL` 后，旧模型保存的记忆无法被召回：`remember` 只会重新嵌入它碰到的那一条（不会把召回不到的记忆说成"已经记住"），其余的只在你明确要求时迁移（`--reindex-memory`），绝不静默进行。
   - `forget` 是破坏性操作，前端应像对待其他破坏性工具一样给它加审批（`memory::tools::GATED` 列出了需要审批的工具）；CLI 默认就会询问。
   - `forget` 除了编号还要带上那条记忆的原文（整条，或不少于 12 个字符的一段），原文对不上就什么也不删——审批提示里看到的就是将要删掉的内容，模型记错编号也不会误删；记忆编号永远不会被重复使用。
@@ -540,8 +540,7 @@ agent.run_continuing(
 | `AGENT_CLI_SESSION_DIR` | `.agent/sessions` | CLI 会话落盘目录 |
 | `AGENT_CLI_APPROVAL_DIR` | `.agent/approvals` | 挂起轮次的落盘目录（与会话目录分开：两者生命周期相反，清空历史不该顺手丢掉一个待批准的操作） |
 | `AGENT_CLI_MEMORY_PATH` | `.agent/memory.db` | `--memory` 使用的 SQLite 文件，相对 `--workspace` 解析——默认按工作区隔离，绝对路径可跨工作区共用一个库 |
-| `EMBED_MODEL` | - | 检索、搜索结果压缩和 `--memory` 使用的 embedding 模型 |
-| `EMBED_BASE_URL` / `EMBED_API_KEY` | 同聊天模型 | embedding 服务的地址和密钥（与聊天模型不同时才需要） |
+| `EMBED_MODEL` | - | 检索、搜索结果压缩和 `--memory` 使用的 embedding 模型（由聊天模型端点提供） |
 | `AGENT_CLI_WEB_PORT` | `4173` | `--mode web`/`both` 本地 Web 服务器端口（始终绑定 `127.0.0.1`） |
 | `AGENT_CLI_WEB_DIST_DIR` | `crates/web-ui/dist` | Web UI 静态资源目录（`trunk build` 产物） |
 | `AGENT_APPROVAL_TIMEOUT_SECS` | `300` | 审批等待人工决策的上限。超时**不按拒绝处理**，而是挂起该轮并落盘（见「挂起与恢复」）；这个上界的作用是释放会话的轮次锁 |
@@ -600,7 +599,7 @@ cargo make                  # = cargo make ci：fmt 检查 + clippy（原生 + w
 | `cargo make ci` | 提 PR 前的完整门禁：`fmt-check` → `clippy` → `clippy-wasm` → `test` → `check-features`（默认任务） |
 | `cargo make dev` | 同上，但先直接格式化而不是报错；改代码过程中跑的版本 |
 | `cargo make check` / `check-wasm` | 只做类型检查（含 `examples/`；wasm 侧针对 `crates/shared` + `crates/web-ui`） |
-| `cargo make test` | 单测 + 集成测试 + doctest |
+| `cargo make test` | 各 crate 的单测和集成测试、`examples/` 里的测试，以及 doctest（`--workspace --all-features --all-targets`，再跑 `--doc`；和 CI 完全一致） |
 | `cargo make check-features` | 不开任何 feature、以及每个 feature 单独开启时各跑一遍 clippy，再在不开 feature 时跑一遍测试；用来发现某段 `cfg` 代码只因为别的 feature 恰好开着才能编译的问题 |
 | `cargo make fmt` / `fmt-check` | 格式化 / 只检查不改写 |
 | `cargo make web` / `web-release` / `web-serve` | `trunk` 构建 Web UI 到 `crates/web-ui/dist` / 体积优化版 / 热重载开发服务器 |
@@ -615,7 +614,7 @@ cargo make                  # = cargo make ci：fmt 检查 + clippy（原生 + w
 
 两个容易踩的点：
 
-- **裸跑 `cargo test` 只覆盖根 package**，不含 `crates/shared` 与 `crates/web-ui`。要跑全量请用 `cargo make test` 或 `cargo test --workspace`。
+- **裸跑 `cargo test` 不是全部测试**：它只跑根 package（不含 `crates/shared`、`crates/web-ui`），也不会运行 `examples/` 里 `#[cfg(test)]` 模块的测试。`cargo make test` 跑的才是 CI 跑的全部内容。
 - **改完 `crates/shared` / `crates/web-ui` 要重新 `cargo make web`**。前端产物不在版本控制内，也不由 `cargo test` 覆盖，忘记重建的表现是浏览器静默使用旧 wasm（详见上方「Web UI」一节的提示）。
 
 ## 🗺️ Roadmap

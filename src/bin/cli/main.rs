@@ -744,6 +744,15 @@ async fn main() -> anyhow::Result<()> {
     );
   }
 
+  // Said before the first request rather than discovered later: these two variables used
+  // to point embeddings at a provider of their own, and now they are ignored, so text that
+  // was going somewhere private (a local endpoint, say) goes to the chat provider's host
+  // instead. Names only — `EMBED_API_KEY` is a credential and this line is printed and,
+  // under `--mode web`, logged.
+  if let Some(warning) = config::removed_embed_overrides_warning() {
+    println!("{warning}\n");
+  }
+
   // A suspended run is invisible otherwise: it produced no answer and, deliberately,
   // left nothing in the session history. Announcing it here is what makes "come back
   // tomorrow and approve it" a thing a person can actually do — without this, the run

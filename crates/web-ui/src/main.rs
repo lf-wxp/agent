@@ -765,7 +765,7 @@ fn App() -> impl IntoView {
         </div>
       </header>
 
-      <div class="timeline" node_ref=timeline_ref>
+      <div class="timeline scrollbar" node_ref=timeline_ref>
         <Show when=timeline_is_empty>
           <div class="empty-state">
             <p class="empty-state-glyph">"[ ]"</p>
@@ -791,7 +791,7 @@ fn App() -> impl IntoView {
 
       <form class="composer" on:submit=on_submit>
         <Show when=menu_open>
-          <div class="command-menu" role="listbox" aria-label=move || t(lang.get(), Key::CommandMenuAria)>
+          <div class="command-menu scrollbar" role="listbox" aria-label=move || t(lang.get(), Key::CommandMenuAria)>
             <For
               each=menu_options
               key=|(_, row)| row.alias
@@ -831,7 +831,7 @@ fn App() -> impl IntoView {
         </Show>
         <div class="composer-inner">
           <textarea
-            class="composer-input"
+            class="composer-input scrollbar"
             node_ref=textarea_ref
             rows="1"
             placeholder=move || t(lang.get(), Key::ComposerPlaceholder)

@@ -56,6 +56,16 @@ Notable changes to the `agent` crate. Entries under *Unreleased* ship with the n
   (`vector_search_with` takes any `Embedder`).
 - `OpenAiEmbedder` splits a large input into requests of at most 2048 texts **and** about
   200 KB, not by count alone.
+- **Breaking — embeddings use the chat provider's endpoint, and only that.** `EMBED_BASE_URL`
+  and `EMBED_API_KEY` are gone, along with `config::embed_base_url` / `config::embed_api_key`.
+  Embeddings go to `OPENAI_BASE_URL` / `OPENAI_API_KEY`, the same endpoint and credentials
+  as chat completions.
+  - Both variables are ignored if still set. The CLI and `examples/rag` print a warning
+    naming them and the endpoint that will be used instead; nothing else notices, so a
+    program that relied on them now sends its text to the chat provider.
+  - With a chat model that has no embeddings endpoint, or one that must not receive the
+    documents being indexed, a library caller passes `OpenAiEmbedder::new(config, model)`
+    with its own `OpenAIConfig`. The CLI and `rag` have no equivalent switch.
 - **Wire protocol:** `ChatEvent::ApprovalRequired` and `PendingApprovalView` gained a
   `once_only` field (`#[serde(default)]`, so an older bundle or server still reads). It
   is set for a tool that does not remember "always allow" (`run_command`, `forget`), and
@@ -136,5 +146,8 @@ Notable changes to the `agent` crate. Entries under *Unreleased* ship with the n
 ### Privacy
 
 - Memories are sent to the embedding provider when saved, and the opening of each user
-  message is sent as the recall query. With `EMBED_BASE_URL` unset that is the chat
-  provider; set it to a different provider and that one sees them too.
+  message is sent as the recall query. That provider is the chat model's own — the same
+  host that already receives the conversation — so nothing new leaves the machine. The
+  exception is a setup that had pointed embeddings elsewhere: `EMBED_BASE_URL` is no
+  longer read, so text that went to that endpoint (a local one, say) now goes to the chat
+  provider instead. The CLI and `examples/rag` warn when either removed variable is set.

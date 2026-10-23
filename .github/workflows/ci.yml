@@ -37,7 +37,32 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all-features
+      # Same two commands as `test` in Makefile.toml; keep them in step. `--workspace`
+      # brings in `crates/shared` and `crates/web-ui` (they build for the host too, so no
+      # wasm runner is needed), `--all-targets` the `#[cfg(test)]` modules inside
+      # `examples/`, which a plain `cargo test` compiles around but does not run. Doctests
+      # are separate because `--all-targets` leaves them out. `--no-fail-fast`: report every
+      # failing target in one run instead of stopping at the first and surfacing the next
+      # one only after it is fixed.
+      - run: cargo test --workspace --all-features --all-targets --no-fail-fast
+      - run: cargo test --workspace --all-features --doc --no-fail-fast
+
+  # The Web UI and the wire types it shares with the server compile for the browser, a
+  # target nothing above builds: a native-only dependency, or `std` API that does not exist
+  # on wasm, only shows up here. Same command as `clippy-wasm` in Makefile.toml.
+  clippy-wasm:
+    name: Clippy (wasm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm
+      - run: cargo clippy -p web-ui -p shared --target wasm32-unknown-unknown --all-targets -- -D warnings
 
   # Every optional part has to build on its own, and the crate has to build with none of
   # them: `--all-features` alone would never notice a `cfg` that only compiles because

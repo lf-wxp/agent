@@ -9,8 +9,8 @@
 //! - **Memory**: two separate conversations, the first saving a fact with the `remember`
 //!   tool, the second recalling it automatically — the point of a *cross-session* memory.
 //!
-//! Both need an embedding model (`EMBED_MODEL`, on `EMBED_BASE_URL` / `EMBED_API_KEY` if
-//! that is a different provider from the chat model) and a chat model (`LLM_MODEL`).
+//! Both need an embedding model (`EMBED_MODEL`, served from the chat provider's endpoint)
+//! and a chat model (`LLM_MODEL`).
 //!
 //! ```sh
 //! cargo run --example rag                 # indexes this crate's own `docs/`
@@ -79,6 +79,12 @@ async fn main() -> anyhow::Result<()> {
   };
 
   let embedder: Arc<dyn Embedder> = Arc::new(OpenAiEmbedder::from_config()?);
+  // Every file under the roots goes to the embedding provider, so a setting that used to
+  // send them elsewhere (`EMBED_BASE_URL`, now ignored) is reported before they are sent,
+  // not after.
+  if let Some(warning) = config::removed_embed_overrides_warning() {
+    println!("{warning}\n");
+  }
   // One file holds both collections: the indexed documents and the memories. That is
   // fine — a collection is a namespace, not a file. Under `.agent/`, which the repository
   // ignores.

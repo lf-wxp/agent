@@ -200,25 +200,36 @@ button {
   }
 }
 
-.timeline {
-  flex: 1;
-  overflow-y: auto;
+/* Scrollbar appearance only, so this class can be added to any already-scrollable
+   container (`.timeline`, `.command-menu`, `.composer-input`) without dragging layout
+   along. Everything the timeline needs to *be* the scrolling column — `flex`,
+   `overflow-y`, the flex column and its gap, the padding — stays on `.timeline` below.
+   Splitting it this way is deliberate: when the two were mixed, the rules that reached
+   `.command-menu` and `.composer-input` matched them at the same specificity (0,1,0) and
+   silently gave the command menu a `0.6rem` gap between rows and the `<textarea>` a
+   `display: flex`. */
+.scrollbar {
   overscroll-behavior-y: contain;
-  display: flex;
-  flex-direction: column;
-  gap: 0.6rem;
-  padding: 1rem 0.85rem 1.25rem;
   scrollbar-width: thin;
   scrollbar-color: var(--border-strong) transparent;
 }
 
-.timeline::-webkit-scrollbar {
+.scrollbar::-webkit-scrollbar {
   width: 8px;
 }
 
-.timeline::-webkit-scrollbar-thumb {
+.scrollbar::-webkit-scrollbar-thumb {
   background: var(--border-strong);
   border-radius: 4px;
+}
+
+.timeline {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  padding: 1rem 0.85rem 1.25rem;
 }
 
 /* Every direct child of this flex column must keep its content-based height instead of
@@ -292,6 +303,15 @@ button {
      `markdown::render_markdown` rather than as a literal pre-wrapped string, so this
      no longer needs `white-space: pre-wrap` to preserve line breaks itself. */
   min-width: 0;
+  /* `.message-row` aligns its bubbles with `align-items: flex-start`/`flex-end` so a
+     bubble hugs its content rather than stretching to the row's `max-width`. That
+     fit-content sizing ignores the row's own width, so a child with an unbreakable
+     intrinsic width (a code block's long line, a wide table) can make the bubble wider
+     than the row and shove the page sideways. Cap the bubble at the row's width: the
+     overflow then stays inside — `.md-codeblock-body` / `.md-table-wrap` scroll their
+     own `overflow-x: auto` — instead of producing a horizontal scrollbar on
+     `.timeline`. */
+  max-width: 100%;
 }
 
 .bubble.user {
