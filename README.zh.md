@@ -31,7 +31,7 @@
 | 🔍 **搜索结果压缩** | `web_search` 结果自动分块 + 向量检索压缩后再写入历史（[`SearchCompressorCallback`](src/callback/search_compressor.rs)），避免长文本占满上下文 |
 | 🧠 **`Agent` 运行时** | 完整事件记录（`ExecutionContext`）+ 无状态多轮续接（`run_continuing`）+ 流式输出（`run_stream`，含工具调用过程事件），每轮请求副本按 token 预算自动裁剪（`context.events` 保持完整） |
 | 💾 **会话持久化** | 落盘的 `FileSessionStore`（按 `(scope, sessionId)` 存 JSON 文件），CLI 与 Web UI 共用，`SessionStore` trait 可替换为其他后端 |
-| 🧰 **工具生态** | 内置 `calculator`、`web_search`（Tavily）、文件工具（`read_file` / `list_files` / `write_file` / `edit_file` / `delete_file` / `unzip_file` / `read_image`）、`grep` 代码搜索、`run_command` shell 执行（超时 + 进程组清理）和 `update_plan`（模型给多步任务列的计划清单）；任何 `Agent` 都能包装成另一个 agent 的工具（`AgentTool`，即子 agent）；并通过 `mcp.json` 接入任意 MCP Server（stdio / Streamable HTTP 两种传输） |
+| 🧰 **工具生态** | 内置 `calculator`、`web_search`（Tavily）、文件工具（`read_file` / `list_files` / `write_file` / `edit_file` / `delete_file` / `unzip_file` / `read_image`）、`grep` 代码搜索、`run_command` shell 执行（超时 + 进程组清理）、`update_plan`（模型给多步任务列的计划清单）和 `reflect`（模型写下的自检）；任何 `Agent` 都能包装成另一个 agent 的工具（`AgentTool`，即子 agent）；并通过 `mcp.json` 接入任意 MCP Server（stdio / Streamable HTTP 两种传输） |
 | 🏢 **多租户（库内）** | `Provider` 封装每租户凭据 + 并发限流，互不干扰（见 [`examples/multi_tenant.rs`](examples/multi_tenant.rs)） |
 | 📚 **检索与记忆** | 基于 SQLite 的持久化向量库（`VectorStore`，增量重建索引，没变的文本不会重新计算 embedding）、在其上做 RAG 的 `retrieve` 工具，以及跨会话的长期记忆（`remember` / `forget` / `recall` 工具 + 每轮自动召回），详见下方「检索与长期记忆」 |
 | 📊 **基准评测** | 内置 GAIA 数据集评测，量化模型 + 工具组合效果 |
@@ -398,6 +398,9 @@ match agent.run(input).await {
 - `update_plan`（已加入 `ToolRegistry::builtin`）让模型给多步任务维护一份计划清单。
   - 每次调用都带上完整计划并替换上一份，所以计划就保存在对话记录里，落盘、挂起恢复都不需要额外状态。
   - 终端里显示为 `[plan]` 清单。
+- `reflect`（同样在 `ToolRegistry::builtin` 里）让模型写下自检：做了什么、具体问题、结论（`on_track` / `needs_correction` / `blocked`）和下一步，并作为工具结果读回。
+  - 由模型自己决定何时调用，工具描述要求简单请求跳过；终端里显示为 `[reflect]` 块。
+  - `Agent::with_required_reflection()`（默认关闭，CLI 不开启）可以强制：本轮调用过工具后的回答，要等模型反思过才交付；没调用工具的普通问答照常直接交付。
 - 示例见 `examples/sub_agent.rs`。
 
 **链路追踪、用量与成本**：
@@ -524,7 +527,7 @@ agent.run_continuing(
 |---|---|---|
 | `LLM_MODEL` | `deepseek-v4-flash` | 默认模型 |
 | `LLM_MAX_CONCURRENCY` | `3` | 单租户并发上限 |
-| `LLM_MAX_TOOL_ROUNDS` | `10` | 单次调用工具轮次预算 |
+| `LLM_MAX_TOOL_ROUNDS` | `100` | 单次调用工具轮次预算 |
 | `LLM_MAX_RETRIES` | `3` | 单次模型请求失败后的重试次数（指数退避，`0` 关闭重试） |
 | `LLM_MAX_HISTORY_TOKENS` | `6000` | 多轮历史 token 软上限 |
 | `LLM_MAX_TOKENS` | `2048` | 单次普通请求的输出 token 上限（结构化输出会按需上调，但不会调低） |
@@ -564,7 +567,7 @@ src/
 │   ├── runtime/        纯文本 / 流式 / 结构化三条执行路径
 │   └── session/        SessionStore trait + 落盘的 FileSessionStore
 ├── llm/            Provider、tool_loop、stream、structured、complete
-├── tools/          Tool trait 与内置工具（calculator / web_search / 文件 / run_command / update_plan / retrieve / mcp）
+├── tools/          Tool trait 与内置工具（calculator / web_search / 文件 / run_command / update_plan / reflect / retrieve / mcp）
 ├── callback/       回调实现（双通道审批 / 工作区沙箱 / MCP 兜底 / 搜索压缩 / 上下文优化）
 ├── gaia/           GAIA 基准数据集与评测
 ├── knowledge_base/ 文本分块、Embedder trait、SQLite 向量库 VectorStore、相似度检索

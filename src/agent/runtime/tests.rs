@@ -2242,3 +2242,546 @@ async fn a_resumed_run_can_be_given_a_token() {
     "a cancelled resume runs nothing"
   );
 }
+
+// ---- required reflection ----------------------------------------------------------------
+
+mod required_reflection {
+  use serde_json::{Value, json};
+
+  use super::*;
+  use crate::llm::testing::{ScriptedBackend, answer, chunk, reply, tool_call};
+
+  fn reflect_args() -> Value {
+    json!({
+      "summary": "Checked the work against the request",
+      "verdict": "on_track",
+      "next_step": "write the answer",
+    })
+  }
+
+  /// Arguments `reflect` rejects: a `blocked` verdict with no issue named.
+  fn rejected_reflect_args() -> Value {
+    json!({ "summary": "s", "verdict": "blocked", "next_step": "n" })
+  }
+
+  fn calc_args() -> Value {
+    json!({ "operator": "add", "first_number": 1, "second_number": 2 })
+  }
+
+  /// A round of tool work for a reflection to check.
+  fn calc_call(id: &str) -> Value {
+    tool_call(id, calculator::NAME, calc_args())
+  }
+
+  fn reflect_call(id: &str) -> Value {
+    tool_call(id, reflect::NAME, reflect_args())
+  }
+
+  /// One round calling `calculator` and `reflect` together.
+  fn calc_and_reflect(calc_id: &str, reflect_id: &str) -> Value {
+    let call = |id: &str, name: &str, arguments: Value| {
+      json!({
+        "id": id, "type": "function",
+        "function": { "name": name, "arguments": arguments.to_string() },
+      })
+    };
+    reply(json!({
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        call(calc_id, calculator::NAME, calc_args()),
+        call(reflect_id, reflect::NAME, reflect_args()),
+      ],
+    }))
+  }
+
+  fn agent_on(backend: &Arc<ScriptedBackend>) -> Agent {
+    agent_named(backend, "gpt-test")
+  }
+
+  fn agent_named(backend: &Arc<ScriptedBackend>, model: &str) -> Agent {
+    Agent::new(
+      backend.provider(),
+      model,
+      Option::<String>::None,
+      Arc::new(ToolRegistry::builtin().unwrap()),
+    )
+  }
+
+  fn last_message(request: &Value) -> &Value {
+    request["messages"].as_array().unwrap().last().unwrap()
+  }
+
+  fn demands_reflection(request: &Value) -> bool {
+    last_message(request)["role"] == "system"
+      && last_message(request)["content"]
+        .as_str()
+        .is_some_and(|text| text == REFLECTION_DEMAND)
+  }
+
+  fn pinned_to_reflect() -> Value {
+    json!({ "type": "function", "function": { "name": reflect::NAME } })
+  }
+
+  #[tokio::test]
+  async fn off_by_default_an_answer_after_tool_work_is_delivered_unchecked() {
+    let backend = ScriptedBackend::replying(vec![calc_call("call_1"), answer("done")]);
+
+    let result = agent_on(&backend).run("hi").await.unwrap();
+
+    assert_eq!(result.output, "done");
+    assert_eq!(backend.seen().len(), 2);
+  }
+
+  /// The simple case the option must not tax: a question answered from what the model
+  /// knows has no work to check, so it costs one request, as without the option.
+  #[tokio::test]
+  async fn a_plain_question_is_not_asked_to_reflect() {
+    let backend = ScriptedBackend::replying(vec![answer("hello")]);
+    let agent = agent_on(&backend).with_required_reflection();
+
+    let result = agent.run("hi").await.unwrap();
+
+    assert_eq!(result.output, "hello");
+    assert_eq!(backend.seen().len(), 1, "no tool work, nothing to check");
+  }
+
+  #[tokio::test]
+  async fn an_answer_after_tool_work_is_held_back_and_a_reflection_demanded() {
+    let backend = ScriptedBackend::replying(vec![
+      calc_call("call_1"),
+      answer("draft"),
+      reflect_call("call_2"),
+      answer("final"),
+    ]);
+    let agent = agent_on(&backend).with_required_reflection();
+
+    let result = agent.run("hi").await.unwrap();
+
+    assert_eq!(result.output, "final");
+    let requests = backend.seen();
+    assert_eq!(requests.len(), 4);
+    assert!(!demands_reflection(&requests[1]));
+    assert!(demands_reflection(&requests[2]), "asked to reflect");
+    assert_eq!(
+      requests[2]["tool_choice"],
+      pinned_to_reflect(),
+      "and pinned to it"
+    );
+    assert!(
+      !demands_reflection(&requests[3]),
+      "the demand is for one request only"
+    );
+    assert!(
+      !requests[3]["messages"].to_string().contains("draft"),
+      "the held draft is not in the transcript: {}",
+      requests[3]["messages"]
+    );
+    assert!(
+      !format!("{:?}", result.context.events).contains("draft"),
+      "nor in the recorded events"
+    );
+  }
+
+  /// The demand goes through the trailer route, so the before-LLM hooks — the history
+  /// budget among them — measure it with the rest of the request.
+  #[tokio::test]
+  async fn the_demand_is_counted_against_the_history_budget() {
+    struct RecordInstructions(Arc<Mutex<Vec<Vec<String>>>>);
+
+    #[async_trait::async_trait]
+    impl BeforeLlmCallback for RecordInstructions {
+      async fn call(&self, _context: &ExecutionContext, request: &mut LlmRequest) {
+        self
+          .0
+          .lock()
+          .expect("not poisoned")
+          .push(request.instructions.clone());
+      }
+    }
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let backend = ScriptedBackend::replying(vec![
+      calc_call("call_1"),
+      answer("draft"),
+      reflect_call("call_2"),
+      answer("final"),
+    ]);
+    let agent = agent_on(&backend)
+      .with_required_reflection()
+      .with_before_llm_callback(Arc::new(RecordInstructions(Arc::clone(&seen))));
+
+    agent.run("hi").await.unwrap();
+
+    let seen = seen.lock().expect("not poisoned");
+    let measured = |round: usize| seen[round].iter().any(|i| i == REFLECTION_DEMAND);
+    assert_eq!(seen.len(), 4);
+    assert!(measured(2), "the hooks see the demand: {:?}", seen[2]);
+    assert!(!measured(1) && !measured(3), "and only on its own request");
+  }
+
+  #[tokio::test]
+  async fn a_run_that_already_reflected_is_not_asked_again() {
+    let backend = ScriptedBackend::replying(vec![
+      calc_call("call_1"),
+      reflect_call("call_2"),
+      answer("done"),
+    ]);
+    let agent = agent_on(&backend).with_required_reflection();
+
+    let result = agent.run("hi").await.unwrap();
+
+    assert_eq!(result.output, "done");
+    assert_eq!(backend.seen().len(), 3);
+  }
+
+  #[tokio::test]
+  async fn work_after_a_reflection_needs_a_new_one() {
+    let backend = ScriptedBackend::replying(vec![
+      reflect_call("call_1"),
+      calc_call("call_2"),
+      answer("draft"),
+      reflect_call("call_3"),
+      answer("final"),
+    ]);
+    let agent = agent_on(&backend).with_required_reflection();
+
+    let result = agent.run("hi").await.unwrap();
+
+    assert_eq!(result.output, "final");
+    let requests = backend.seen();
+    assert_eq!(requests.len(), 5);
+    assert!(demands_reflection(&requests[3]));
+  }
+
+  /// A `reflect` beside other calls ran before their results existed, so it checked none
+  /// of them.
+  #[tokio::test]
+  async fn a_reflection_alongside_other_tools_does_not_count() {
+    let backend = ScriptedBackend::replying(vec![
+      calc_and_reflect("call_1", "call_2"),
+      answer("draft"),
+      reflect_call("call_3"),
+      answer("final"),
+    ]);
+    let agent = agent_on(&backend).with_required_reflection();
+
+    let result = agent.run("hi").await.unwrap();
+
+    assert_eq!(result.output, "final");
+    assert!(demands_reflection(&backend.seen()[2]));
+  }
+
+  #[tokio::test]
+  async fn a_rejected_reflection_does_not_count() {
+    let backend = ScriptedBackend::replying(vec![
+      tool_call("call_1", reflect::NAME, rejected_reflect_args()),
+      answer("draft"),
+      reflect_call("call_2"),
+      answer("final"),
+    ]);
+    let agent = agent_on(&backend).with_required_reflection();
+
+    let result = agent.run("hi").await.unwrap();
+
+    assert_eq!(result.output, "final");
+    assert!(demands_reflection(&backend.seen()[2]));
+  }
+
+  /// The reply to a demand was told not to be the answer — it may well be "I will reflect
+  /// now" — so the draft it was asked in place of is what gets delivered.
+  #[tokio::test]
+  async fn a_model_that_answers_instead_of_reflecting_gets_its_draft_delivered() {
+    let backend = ScriptedBackend::replying(vec![
+      calc_call("call_1"),
+      answer("draft"),
+      answer("I will reflect now"),
+    ]);
+    let agent = agent_on(&backend).with_required_reflection();
+
+    let result = agent.run("hi").await.unwrap();
+
+    assert_eq!(result.output, "draft");
+    assert_eq!(backend.seen().len(), 3, "asked once, not in a loop");
+    let events = format!("{:?}", result.context.events);
+    assert!(events.contains("draft"), "the draft is recorded: {events}");
+    assert!(!events.contains("I will reflect now"), "the reply is not");
+  }
+
+  /// DeepSeek rejects a pinned `tool_choice`, so it gets the demand message alone.
+  #[tokio::test]
+  async fn a_model_that_cannot_be_pinned_still_gets_the_demand() {
+    let backend = ScriptedBackend::replying(vec![
+      calc_call("call_1"),
+      answer("draft"),
+      reflect_call("call_2"),
+      answer("final"),
+    ]);
+    let agent = agent_named(&backend, "deepseek-test").with_required_reflection();
+
+    let result = agent.run("hi").await.unwrap();
+
+    assert_eq!(result.output, "final");
+    let requests = backend.seen();
+    assert!(demands_reflection(&requests[2]));
+    assert_ne!(requests[2]["tool_choice"], pinned_to_reflect());
+  }
+
+  /// A model that keeps failing the tool's validation would otherwise loop "draft, demand,
+  /// rejected reflection" until the round budget ran out.
+  #[tokio::test]
+  async fn demands_stop_after_the_cap() {
+    let rejected = |id: &str| tool_call(id, reflect::NAME, rejected_reflect_args());
+    let backend = ScriptedBackend::replying(vec![
+      calc_call("call_1"),
+      answer("draft 1"),
+      rejected("call_2"),
+      answer("draft 2"),
+      rejected("call_3"),
+      answer("draft 3"),
+      rejected("call_4"),
+      answer("draft 4"),
+    ]);
+    let agent = agent_on(&backend).with_required_reflection();
+
+    let result = agent.run("hi").await.unwrap();
+
+    assert_eq!(
+      result.output, "draft 4",
+      "delivered unchecked once the cap is reached"
+    );
+    let requests = backend.seen();
+    assert_eq!(requests.len(), 8);
+    assert_eq!(
+      requests.iter().filter(|r| demands_reflection(r)).count(),
+      MAX_REFLECTION_DEMANDS
+    );
+  }
+
+  #[tokio::test]
+  async fn nothing_is_demanded_without_a_reflect_tool() {
+    let backend = ScriptedBackend::replying(vec![calc_call("call_1"), answer("done")]);
+    let agent = Agent::new(
+      backend.provider(),
+      "gpt-test",
+      Option::<String>::None,
+      Arc::new(ToolRegistry::select(&[calculator::NAME.to_owned()]).unwrap()),
+    )
+    .with_required_reflection();
+
+    let result = agent.run("hi").await.unwrap();
+
+    assert_eq!(result.output, "done");
+    assert_eq!(backend.seen().len(), 2);
+  }
+
+  #[tokio::test]
+  async fn no_demand_once_the_round_budget_is_spent() {
+    let backend = ScriptedBackend::replying(vec![calc_call("call_1"), answer("done")]);
+    let agent = agent_on(&backend)
+      .with_max_steps(1)
+      .with_required_reflection();
+
+    let result = agent.run("hi").await.unwrap();
+
+    assert_eq!(result.output, "done");
+    assert!(result.budget_exhausted);
+    assert_eq!(backend.seen().len(), 2);
+  }
+
+  /// Tool work in an earlier turn does not make a plain follow-up need a check.
+  #[tokio::test]
+  async fn a_follow_up_question_is_not_asked_to_reflect() {
+    let backend = ScriptedBackend::replying(vec![
+      calc_call("call_1"),
+      reflect_call("call_2"),
+      answer("3"),
+      answer("you're welcome"),
+    ]);
+    let agent = agent_on(&backend).with_required_reflection();
+
+    let first = agent.run("1+2?").await.unwrap();
+    let second = agent
+      .run_continuing(first.context.events, "thanks")
+      .await
+      .unwrap();
+
+    assert_eq!(second.output, "you're welcome");
+    assert_eq!(backend.seen().len(), 4);
+  }
+
+  /// Nor does an earlier turn's reflection cover this turn's work.
+  #[tokio::test]
+  async fn an_earlier_turns_reflection_does_not_cover_new_work() {
+    let backend = ScriptedBackend::replying(vec![
+      calc_call("call_1"),
+      reflect_call("call_2"),
+      answer("3"),
+      calc_call("call_3"),
+      answer("draft"),
+      reflect_call("call_4"),
+      answer("6"),
+    ]);
+    let agent = agent_on(&backend).with_required_reflection();
+
+    let first = agent.run("1+2?").await.unwrap();
+    let second = agent
+      .run_continuing(first.context.events, "and doubled?")
+      .await
+      .unwrap();
+
+    assert_eq!(second.output, "6");
+    let requests = backend.seen();
+    assert_eq!(requests.len(), 7);
+    assert!(demands_reflection(&requests[5]));
+  }
+
+  /// Suspends the one call with the given id, so a round can be split by a suspension.
+  struct SuspendCall(&'static str);
+
+  #[async_trait::async_trait]
+  impl BeforeToolCallback for SuspendCall {
+    async fn call(
+      &self,
+      _context: &ExecutionContext,
+      tool_call: ToolCallView<'_>,
+    ) -> ToolCallDecision {
+      if tool_call.tool_call_id == self.0 {
+        ToolCallDecision::Suspend
+      } else {
+        ToolCallDecision::Proceed
+      }
+    }
+  }
+
+  /// A suspended round's results are recorded in two parts; here the `reflect` beside the
+  /// calculator is the call that waited, so its result is the last one recorded. The
+  /// round still mixed it with other work, and the resumed run still checks the answer.
+  #[tokio::test]
+  async fn a_resumed_round_is_judged_by_all_its_calls() {
+    let backend = ScriptedBackend::replying(vec![
+      calc_and_reflect("call_1", "call_2"),
+      answer("draft"),
+      reflect_call("call_3"),
+      answer("final"),
+    ]);
+    let agent = agent_on(&backend)
+      .with_required_reflection()
+      .with_before_tool_callback(Arc::new(SuspendCall("call_2")));
+
+    let outcome = agent
+      .run_continuing_resumable(Vec::<Event>::new(), "hi")
+      .await
+      .unwrap();
+    let AgentOutcome::Suspended(state) = outcome else {
+      panic!("call_2 waits for a decision");
+    };
+    let decisions = HashMap::from([("call_2".to_owned(), ResumedDecision::Approved)]);
+    let AgentOutcome::Done(result) = agent.resume(state, &decisions).await.unwrap() else {
+      panic!("nothing else waits");
+    };
+
+    assert_eq!(result.output, "final");
+    let requests = backend.seen();
+    assert_eq!(requests.len(), 4);
+    assert!(demands_reflection(&requests[2]));
+  }
+
+  async fn tokens_of(agent: &Agent) -> (Vec<String>, String) {
+    let stream = agent.run_stream("hi");
+    futures::pin_mut!(stream);
+    let mut tokens = Vec::new();
+    let mut output = String::new();
+    while let Some(event) = stream.next().await {
+      match event.unwrap() {
+        AgentStreamEvent::Token(text) => tokens.push(text),
+        AgentStreamEvent::Done { output: text, .. } => output = text,
+        _ => {}
+      }
+    }
+    (tokens, output)
+  }
+
+  fn streamed_call(id: &str, tool: &str, arguments: &Value) -> Vec<Value> {
+    vec![chunk(json!({
+      "tool_calls": [{
+        "index": 0, "id": id, "type": "function",
+        "function": { "name": tool, "arguments": arguments.to_string() },
+      }],
+    }))]
+  }
+
+  fn text(chunks: &[&str]) -> Vec<Value> {
+    chunks
+      .iter()
+      .map(|text| chunk(json!({ "content": text })))
+      .collect()
+  }
+
+  #[tokio::test]
+  async fn a_plain_question_streams_token_by_token() {
+    let backend = ScriptedBackend::streaming(vec![text(&["hel", "lo"])]);
+    let agent = agent_on(&backend).with_required_reflection();
+
+    let (tokens, output) = tokens_of(&agent).await;
+
+    assert_eq!(tokens, ["hel", "lo"]);
+    assert_eq!(output, "hello");
+    assert_eq!(backend.seen().len(), 1);
+  }
+
+  #[tokio::test]
+  async fn a_streamed_draft_is_never_shown() {
+    let backend = ScriptedBackend::streaming(vec![
+      streamed_call("call_1", calculator::NAME, &calc_args()),
+      text(&["dra", "ft"]),
+      streamed_call("call_2", reflect::NAME, &reflect_args()),
+      text(&["fi", "nal"]),
+    ]);
+    let agent = agent_on(&backend).with_required_reflection();
+
+    let (tokens, output) = tokens_of(&agent).await;
+
+    assert_eq!(tokens, ["fi", "nal"], "the answer streams token by token");
+    assert_eq!(output, "final");
+    assert!(demands_reflection(&backend.seen()[2]));
+  }
+
+  /// Held while it could still have been a draft; the round turned out to call a tool, so
+  /// it is forwarded after all, in one piece.
+  #[tokio::test]
+  async fn held_text_before_a_tool_call_is_still_delivered() {
+    let mut calling = text(&["Let me ", "check. "]);
+    calling.extend(streamed_call("call_2", calculator::NAME, &calc_args()));
+    let backend = ScriptedBackend::streaming(vec![
+      streamed_call("call_1", calculator::NAME, &calc_args()),
+      calling,
+      streamed_call("call_3", reflect::NAME, &reflect_args()),
+      text(&["3"]),
+    ]);
+    let agent = agent_on(&backend).with_required_reflection();
+
+    let (tokens, output) = tokens_of(&agent).await;
+
+    assert_eq!(tokens, ["Let me check. ", "3"]);
+    assert_eq!(output, "3");
+    assert_eq!(backend.seen().len(), 4);
+  }
+
+  /// The reply to a demand is held like a draft, so a caller never sees text that is then
+  /// replaced: only the draft arrives, once, when it is delivered.
+  #[tokio::test]
+  async fn a_streamed_reply_to_the_demand_is_replaced_by_the_draft() {
+    let backend = ScriptedBackend::streaming(vec![
+      streamed_call("call_1", calculator::NAME, &calc_args()),
+      text(&["dra", "ft"]),
+      text(&["I will ", "reflect now"]),
+    ]);
+    let agent = agent_on(&backend).with_required_reflection();
+
+    let (tokens, output) = tokens_of(&agent).await;
+
+    assert_eq!(tokens, ["draft"]);
+    assert_eq!(output, "draft");
+  }
+}

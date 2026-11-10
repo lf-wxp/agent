@@ -37,11 +37,12 @@ mod structured;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_openai::types::chat::{
-  ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
+  ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, ChatCompletionNamedToolChoice,
   ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
   ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
-  ChatCompletionRequestUserMessageArgs, ChatCompletionStreamOptions, CreateChatCompletionResponse,
-  CreateChatCompletionStreamResponse, FunctionCall,
+  ChatCompletionRequestUserMessageArgs, ChatCompletionStreamOptions,
+  ChatCompletionToolChoiceOption, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
+  FunctionCall, FunctionName,
 };
 use async_stream::stream;
 use futures::{Stream, StreamExt, future::join_all};
@@ -67,7 +68,7 @@ use crate::{
     tool_calls::ToolCallAccumulator,
     tool_loop::disable_tools,
   },
-  tools::{ToolRegistry, schedule, tool::execute_with_timeout},
+  tools::{ToolRegistry, reflect, schedule, tool::execute_with_timeout},
   util::truncate_chars,
 };
 
@@ -84,6 +85,64 @@ pub use structured::StructuredAgentResult;
 /// sensitive payloads (e.g. fetched web content, credentials echoed by a misbehaving
 /// MCP server) into the log stream in full.
 const TOOL_LOG_PREVIEW_CHARS: usize = 500;
+
+/// The last message of a request that demands a self-check; see
+/// [`Agent::with_required_reflection`].
+///
+/// A trailing system message rather than a hook-supplied instruction, because it has to be
+/// the last thing the model reads (instructions go ahead of the conversation), and it is
+/// not recorded in the transcript: it belongs to this one request. Sent through
+/// [`Agent::messages_with_trailer`], like the structured routes' schema hint, so the
+/// history budget counts it.
+const REFLECTION_DEMAND: &str = "Your answer cannot be delivered until you have checked your \
+  work with the `reflect` tool. Call `reflect` now: say what you have done, compare it with \
+  what the user actually asked, list concrete problems (an empty list only if you looked and \
+  found none), and give your verdict and next step. Do not write the answer in this message; \
+  write it after the reflection, and fix what the reflection finds first.";
+
+/// Most reflections one pass of the loop may demand (see
+/// [`Agent::with_required_reflection`]): the first draft, the draft after fixing what that
+/// reflection found, and one spare. Past it an answer is delivered unchecked, which bounds
+/// what a model that keeps failing the tool's validation can cost; without it, "draft,
+/// demand, rejected reflection" would repeat until the round budget ran out.
+const MAX_REFLECTION_DEMANDS: usize = 3;
+
+/// Where [`Agent::with_required_reflection`] stands within one pass of the loop.
+#[derive(Debug, Default)]
+struct ReflectionDemand {
+  /// The answer turned back for want of a reflection, with its reasoning. Set while the
+  /// next request demands the reflection; delivered if the model answers again instead.
+  held: Option<(String, Option<String>)>,
+  /// Demands made so far, against [`MAX_REFLECTION_DEMANDS`].
+  made: usize,
+}
+
+impl ReflectionDemand {
+  /// Whether the request being built demands a reflection.
+  fn active(&self) -> bool {
+    self.held.is_some()
+  }
+
+  fn can_demand(&self) -> bool {
+    self.made < MAX_REFLECTION_DEMANDS
+  }
+
+  /// Turn `draft` back: keep it, and have the next request demand a reflection.
+  fn hold(&mut self, draft: String, reasoning: Option<String>) {
+    self.made += 1;
+    self.held = Some((draft, reasoning));
+  }
+
+  /// The held draft, if the request just answered was a demand.
+  fn take(&mut self) -> Option<(String, Option<String>)> {
+    self.held.take()
+  }
+
+  /// The model called tools: whatever was held is superseded by the work that follows.
+  fn clear(&mut self) {
+    self.held = None;
+  }
+}
 
 /// Outcome of [`Agent::run`].
 ///
@@ -525,6 +584,9 @@ pub struct Agent {
   /// What the [`ContextOptimizer`] installed by [`Self::new`] counts the history budget
   /// in; see [`Self::context_encoding`].
   context_encoding: Encoding,
+  /// Whether a final answer must be preceded by a `reflect` call; see
+  /// [`Self::with_required_reflection`].
+  require_reflection: bool,
 }
 
 impl Agent {
@@ -567,6 +629,7 @@ impl Agent {
       settings: ModelSettings::from_config(),
       name: None,
       context_encoding,
+      require_reflection: false,
     }
   }
 
@@ -728,6 +791,123 @@ impl Agent {
   pub fn with_max_steps(mut self, max_steps: u32) -> Self {
     self.max_steps = max_steps;
     self
+  }
+
+  /// Make the model check its work with the `reflect` tool before an answer that follows
+  /// tool work is accepted. Off by default.
+  ///
+  /// Meant for callers that want the check enforced rather than left to the model.
+  /// `reflect`'s own description already asks for it after milestones and before hard
+  /// answers, and tells the model to skip it for simple requests — usually the better
+  /// judge, since the agent cannot tell a hard task from an easy one.
+  ///
+  /// Which answers are checked: those of a turn that has called a tool since the user's
+  /// message. An answer given without any — a plain question — is delivered as is: there
+  /// is no work to check it against, and forcing it would triple the cost of the simplest
+  /// turn. Otherwise, when the latest tool round is not a successful `reflect`, the answer
+  /// is held back and one more request demands a `reflect` call: a trailing system
+  /// message, and `tool_choice` pinned to it where the model allows (see
+  /// [`config::model_supports_tool_choice`]). The model then answers after reading its
+  /// own reflection. A tool round after the reflection (the fix it asked for) makes the
+  /// next answer need a fresh one.
+  ///
+  /// It gives way rather than loop: no demand once the round budget is spent (tools are
+  /// off then), at most three demands per pass of the loop, and a model that answers
+  /// again instead of reflecting gets its first draft delivered — the reply to a demand
+  /// was told not to be the answer, so it is not taken as one. Without a `reflect` in the
+  /// toolbox it does nothing.
+  ///
+  /// What the user sees: a held draft is neither recorded nor forwarded unless it ends up
+  /// delivered. [`Self::run_stream`] therefore holds a round's text until the round ends
+  /// whenever it could still be turned back, so after a turn's first tool round its text
+  /// arrives per round rather than token by token until the reflection; the answer after
+  /// that streams as usual. Reasoning is never held. A cancelled run loses held text.
+  ///
+  /// Costs one extra request per checked answer, plus the held draft. Only the plain-text
+  /// entry points are covered; the structured routes ([`Self::run_structured`]) end in a
+  /// schema, not in an answer.
+  ///
+  /// Not part of [`Self::fingerprint`]: it changes how a run is driven, not what a
+  /// suspended one means.
+  #[must_use]
+  pub fn with_required_reflection(mut self) -> Self {
+    self.require_reflection = true;
+    self
+  }
+
+  /// Whether an answer ending the run now would be one nobody has checked: this turn has
+  /// done tool work, and its latest tool round was not a successful reflection.
+  ///
+  /// A turn with no tool round since the user's message is not held back (see
+  /// [`Self::with_required_reflection`]). Otherwise the latest round is judged by its
+  /// calls: checked means it called nothing but `reflect` and at least one of those calls
+  /// succeeded. A `reflect` issued alongside other tools ran before their results existed,
+  /// so it checks none of them; a rejected one (bad arguments) checked nothing.
+  ///
+  /// The round is found through its calls rather than its results because a round that
+  /// was suspended and resumed has its results recorded in two events: judging by the last
+  /// of those would see only the calls that were resumed.
+  fn reflection_pending(&self, context: &ExecutionContext) -> bool {
+    if !self.require_reflection || !self.toolbox.contains(reflect::NAME) {
+      return false;
+    }
+    // Successful `reflect` results seen so far, walking back: they belong to the round
+    // whose calls are met next.
+    let mut reflected: Vec<&str> = Vec::new();
+    for event in context.events.iter().rev() {
+      let mut calls: Vec<(&str, &str)> = Vec::new();
+      for item in &event.content {
+        match item {
+          ContentItem::ToolCall {
+            tool_call_id, name, ..
+          } => calls.push((tool_call_id.as_str(), name.as_str())),
+          ContentItem::ToolResult {
+            tool_call_id,
+            name,
+            status: ToolResultStatus::Success,
+            ..
+          } if name == reflect::NAME => reflected.push(tool_call_id),
+          ContentItem::Message { role, .. } if role == "user" => return false,
+          _ => {}
+        }
+      }
+      if !calls.is_empty() {
+        let only_reflections = calls.iter().all(|(_, name)| *name == reflect::NAME);
+        let one_succeeded = calls.iter().any(|(id, _)| reflected.contains(id));
+        return !(only_reflections && one_succeeded);
+      }
+    }
+    false
+  }
+
+  /// This round's messages: the conversation as [`Self::prepare_llm_request`] leaves it,
+  /// plus the demand for a reflection as the last message when `demand_reflection` (see
+  /// [`Self::with_required_reflection`]).
+  async fn round_messages(
+    &self,
+    context: &ExecutionContext,
+    demand_reflection: bool,
+  ) -> crate::Result<WireMessages> {
+    if demand_reflection {
+      return self.messages_with_trailer(context, REFLECTION_DEMAND).await;
+    }
+    let request = self.prepare_llm_request(context).await;
+    self.build_messages(request)
+  }
+
+  /// Pin the model's next call to `reflect`, when it accepts a `tool_choice`. The demand
+  /// message is sent either way; a model that cannot be pinned may ignore it, and the
+  /// loops accept its answer then.
+  fn pin_reflection(&self, builder: &mut RequestDraft) {
+    if config::model_supports_tool_choice(&self.model) {
+      builder.tool_choice(ChatCompletionToolChoiceOption::Function(
+        ChatCompletionNamedToolChoice {
+          function: FunctionName {
+            name: reflect::NAME.to_owned(),
+          },
+        },
+      ));
+    }
   }
 
   /// This agent's identity, for checking whether a run suspended earlier can still be
@@ -1081,17 +1261,23 @@ impl Agent {
 
   /// The loop [`Self::drive`] runs.
   async fn drive_rounds(&self, mut context: ExecutionContext) -> crate::Result<AgentOutcome> {
+    // See [`Self::with_required_reflection`]. Active once an unchecked answer has been
+    // turned back, so that the next request demands the reflection; cleared by any tool
+    // round, since new work needs a new check.
+    let mut demand = ReflectionDemand::default();
     loop {
       let (tools_allowed, budget_exhausted) = self.round_budget(&context);
 
-      let llm_request = self.prepare_llm_request(&context).await;
-      let wire = self.build_messages(llm_request)?;
+      let wire = self.round_messages(&context, demand.active()).await?;
       let mut builder = request_builder(
         &self.model,
         wire,
         &self.settings,
         self.toolbox.definitions(),
       );
+      if demand.active() {
+        self.pin_reflection(&mut builder);
+      }
       if !tools_allowed {
         disable_tools(&mut builder, self.toolbox.definitions());
       }
@@ -1114,6 +1300,19 @@ impl Agent {
             "No content in final response",
           ))
         })?;
+        let (content, reasoning) = match demand.take() {
+          // Asked to reflect and answered instead. That reply was told not to be the
+          // answer, so the draft it was asked in place of is delivered.
+          Some(draft) => draft,
+          // Turned back: kept aside (usage already counted), not recorded, and the next
+          // request demands the reflection.
+          None if tools_allowed && demand.can_demand() && self.reflection_pending(&context) => {
+            tracing::debug!("final answer held back until the model has reflected");
+            demand.hold(content, reasoning);
+            continue;
+          }
+          None => (content, reasoning),
+        };
         self.record_reasoning(&mut context, reasoning.as_deref());
         self.record_final_answer(&mut context, &content);
         return Ok(AgentOutcome::Done(AgentResult {
@@ -1123,6 +1322,7 @@ impl Agent {
           reasoning,
         }));
       };
+      demand.clear();
 
       // The model ignored the disabled tools. Returning its message beats looping
       // forever; the caller still sees whatever content came back.
@@ -1387,21 +1587,31 @@ impl Agent {
         context.increment_step();
       }
 
+      // See `drive_rounds`.
+      let mut demand = ReflectionDemand::default();
       loop {
         let (tools_allowed, round_budget_exhausted) = self.round_budget(&context);
         let budget_exhausted = round_budget_exhausted || carried_budget_exhausted;
 
-        let llm_request = self.prepare_llm_request(&context).await;
-        let wire = self.build_messages(llm_request)?;
+        let wire = self.round_messages(&context, demand.active()).await?;
         let mut builder = request_builder(
           &self.model,
           wire,
           &self.settings,
           self.toolbox.definitions(),
         );
+        if demand.active() {
+          self.pin_reflection(&mut builder);
+        }
         if !tools_allowed {
           disable_tools(&mut builder, self.toolbox.definitions());
         }
+        // Whether an answer from this round would be turned back for want of a reflection.
+        let may_demand = tools_allowed && demand.can_demand() && self.reflection_pending(&context);
+        // Text this round might yet have to take back — a draft that may be turned back, or
+        // a reply to a demand, which the held draft replaces if it is an answer. Held until
+        // the round shows whether it ends in an answer or in tool calls (forwarded then).
+        let hold_text = demand.active() || may_demand;
 
         let token = context.cancellation.clone();
         let opened = tokio::select! {
@@ -1478,7 +1688,9 @@ impl Agent {
             && !text.is_empty()
           {
             assistant_text.push_str(text);
-            yield Ok(AgentStreamEvent::Token(text.clone()));
+            if !hold_text {
+              yield Ok(AgentStreamEvent::Token(text.clone()));
+            }
           }
         }
 
@@ -1489,10 +1701,27 @@ impl Agent {
 
         // No tool calls means the model produced its final answer.
         if accumulator.is_empty() {
-          self.record_reasoning(&mut context, Some(&reasoning_text));
-          self.record_final_answer(&mut context, &assistant_text);
+          let held = demand.take();
+          if held.is_none() && may_demand {
+            tracing::debug!("final answer held back until the model has reflected");
+            demand.hold(assistant_text, Some(reasoning_text));
+            continue;
+          }
+          let (output, reasoning) = match held {
+            // Asked to reflect and answered instead: the draft is delivered in place of the
+            // reply (see `drive_rounds`), and this is the first the caller sees of it.
+            Some((draft, draft_reasoning)) => {
+              if !draft.is_empty() {
+                yield Ok(AgentStreamEvent::Token(draft.clone()));
+              }
+              (draft, draft_reasoning)
+            }
+            None => (assistant_text, Some(reasoning_text)),
+          };
+          self.record_reasoning(&mut context, reasoning.as_deref());
+          self.record_final_answer(&mut context, &output);
           yield Ok(AgentStreamEvent::Done {
-            output: assistant_text,
+            output,
             context,
             budget_exhausted,
           });
@@ -1512,6 +1741,13 @@ impl Agent {
           });
           return;
         }
+
+        // The text held back above belongs to a round that turned out to call tools, which
+        // is the case where it is forwarded and recorded after all.
+        if hold_text && !assistant_text.is_empty() {
+          yield Ok(AgentStreamEvent::Token(assistant_text.clone()));
+        }
+        demand.clear();
 
         let tool_calls = match accumulator.finish() {
           Ok(tool_calls) => tool_calls,
@@ -1771,8 +2007,8 @@ impl Agent {
   }
 
   /// [`Self::prepare_llm_request`] for a caller that will append `trailer` as a trailing
-  /// system message of its own (see [`structured`]'s `json_object` route, where the schema
-  /// hint has to be the last thing the model reads).
+  /// system message of its own — see [`Self::messages_with_trailer`], which every such
+  /// caller goes through.
   ///
   /// Such a message is part of what goes on the wire, so a hook measuring the request has
   /// to see it — otherwise every token budget in the chain undercounts by exactly the
@@ -1782,7 +2018,8 @@ impl Agent {
   ///
   /// A hook that rewrote or dropped the trailer is respected rather than fought: removal
   /// matches on the exact text, so if it is no longer there nothing happens — it was still
-  /// accounted for, which is the point.
+  /// accounted for, which is the point. The hooks stop early on a cancelled run, as in
+  /// [`Self::prepare_llm_request`].
   async fn prepare_llm_request_with_trailer(
     &self,
     context: &ExecutionContext,
@@ -1791,9 +2028,7 @@ impl Agent {
     let mut request = LlmRequest::new(self.instructions.clone(), &context.events);
     request.push_instruction(trailer);
 
-    for callback in &self.before_llm_callbacks {
-      callback.call(context, &mut request).await;
-    }
+    self.run_before_llm_callbacks(context, &mut request).await;
 
     if let Some(at) = request
       .instructions
@@ -1804,6 +2039,32 @@ impl Agent {
     }
 
     request
+  }
+
+  /// The rendered conversation followed by `trailer` as a one-off system message: the
+  /// `json_object` route's schema hint (see [`structured`]), or the demand for a
+  /// reflection (see [`Self::with_required_reflection`]).
+  ///
+  /// The trailer goes after the conversation rather than among the leading system
+  /// messages because models follow an instruction far more reliably when it is the last
+  /// thing they read; it goes through [`Self::prepare_llm_request_with_trailer`] so the
+  /// before-LLM hooks count it against the history budget. It is never recorded in the
+  /// transcript: it belongs to this one request.
+  async fn messages_with_trailer(
+    &self,
+    context: &ExecutionContext,
+    trailer: &str,
+  ) -> crate::Result<WireMessages> {
+    let request = self
+      .prepare_llm_request_with_trailer(context, trailer)
+      .await;
+    let mut wire = self.build_messages(request)?;
+    wire.push(
+      ChatCompletionRequestSystemMessageArgs::default()
+        .content(trailer)
+        .build()?,
+    );
+    Ok(wire)
   }
 
   /// Record what the model said *alongside* a round's tool calls, when it said anything.

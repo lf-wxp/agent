@@ -107,8 +107,11 @@ const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 /// Default max concurrency: most LLM services rate-limit requests per minute, so default conservatively to 3.
 const DEFAULT_MAX_CONCURRENCY: usize = 3;
 
-/// Default tool-round budget: enough for multi-step tasks while keeping cost bounded.
-const DEFAULT_MAX_TOOL_ROUNDS: usize = 10;
+/// Default tool-round budget: enough for genuinely multi-step tasks (search, read, edit,
+/// verify, repeat) without forcing a partial answer, while keeping the worst case of a
+/// model that never stops calling tools bounded. Raise it with `LLM_MAX_TOOL_ROUNDS` for
+/// long agentic sessions.
+const DEFAULT_MAX_TOOL_ROUNDS: usize = 100;
 
 /// Default retry attempts for a transient LLM request failure.
 const DEFAULT_MAX_RETRIES: usize = 3;

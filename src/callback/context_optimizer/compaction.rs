@@ -58,6 +58,8 @@
 //! - [`crate::tools::plan`] (`update_plan`) — its result is a short echo of the call's own
 //!   arguments, and the usual note ("call it again to get this back") would be an
 //!   instruction to *change* the plan, since every call replaces it.
+//! - [`crate::tools::reflect`] — the same shape: a short echo of the call's own arguments,
+//!   so there is nothing to re-fetch, and "call it again" would mean reflecting again.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -387,7 +389,7 @@ mod tests {
   use crate::{
     agent::ToolResultStatus,
     callback::context_optimizer::tokens,
-    tools::{calculator, file_delete, file_edit, file_write, plan, read_image, shell},
+    tools::{calculator, file_delete, file_edit, file_write, plan, read_image, reflect, shell},
   };
 
   fn call(id: &str, name: &str, arguments: Value) -> ContentItem {
@@ -736,6 +738,7 @@ mod tests {
       read_image::NAME,
       calculator::NAME,
       plan::NAME,
+      reflect::NAME,
     ] {
       assert!(
         !compaction.describers.contains_key(name),

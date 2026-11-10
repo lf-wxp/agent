@@ -43,7 +43,7 @@ use crate::{
   },
   error::ResultExt,
   memory::{Forgotten, MemoryStore, Remembered},
-  tools::{Tool, calculator, plan},
+  tools::{Tool, calculator, plan, reflect},
 };
 
 pub const REMEMBER: &str = "remember";
@@ -245,17 +245,24 @@ impl RecallTool {
 
 /// Tools whose output is the agent's own bookkeeping, carrying no text from outside: the
 /// ones a turn can use without making what it later wants to remember suspect.
-fn own_output_tools() -> [&'static str; 5] {
-  [calculator::NAME, plan::NAME, REMEMBER, FORGET, RECALL]
+fn own_output_tools() -> [&'static str; 6] {
+  [
+    calculator::NAME,
+    plan::NAME,
+    reflect::NAME,
+    REMEMBER,
+    FORGET,
+    RECALL,
+  ]
 }
 
 /// Declines [`REMEMBER`] for the rest of a turn in which the model has used a tool whose
 /// output can contain someone else's words — see the module docs.
 ///
 /// "Can contain" is decided by exclusion: every tool is suspect except the few known to
-/// return only the agent's own bookkeeping (a calculation, a plan, the memory tools
-/// themselves). A web search, a file, a command's output, an MCP server's reply — and any
-/// tool added later, whose output nobody has vouched for — all count, which is the safe
+/// return only the agent's own bookkeeping (a calculation, a plan, a reflection, the memory
+/// tools themselves). A web search, a file, a command's output, an MCP server's reply — and
+/// any tool added later, whose output nobody has vouched for — all count, which is the safe
 /// way round for a list that can only be kept right by remembering to extend it. Extend it
 /// with [`Self::trusting`] for a tool of yours that is known to be clean.
 ///
@@ -593,6 +600,7 @@ mod tests {
       vec![user("remember that I like tea")],
       vec![user("what is 2+2, and remember it"), calls(&["calculator"])],
       vec![user("plan it"), calls(&["update_plan", "recall"])],
+      vec![user("check it"), calls(&["reflect"])],
     ] {
       assert!(remember_decision(&guard, events).await.is_proceed());
     }

@@ -23,6 +23,7 @@ pub(crate) mod macros;
 pub mod mcp;
 pub mod plan;
 pub mod read_image;
+pub mod reflect;
 pub mod registry;
 #[cfg(feature = "sqlite")]
 pub mod retrieve;

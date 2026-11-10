@@ -31,7 +31,7 @@
 | Reasoning / thinking | ✅ | 读取 `reasoning_content` / `reasoning`（`AgentResult::reasoning`、`AgentStreamEvent::Reasoning`），支持 `reasoning_effort`，可选回传（`LLM_REPLAY_REASONING`，DeepSeek 思考模式带 tools 时需要）；推理 token 数尚未统计 |
 | 采样参数 | ✅ | `ModelSettings`：`max_tokens`（可选 `max_completion_tokens` 字段）、`temperature`、`top_p`、`reasoning_effort` |
 | 多模态输入 | ⚠️ | 用户消息只能是 `String`；MCP 返回的图片会被丢弃（`read_image` 已改走 `Provider`） |
-| 规划 / 反思 | ⚠️ | 有 `update_plan` 计划工具（`src/tools/plan/`）；没有反思 / 自检步骤 |
+| 规划 / 反思 | ✅ | 有 `update_plan` 计划工具（`src/tools/plan/`）和 `reflect` 反思工具（`src/tools/reflect.rs`，由模型主动调用，写下自检并读回）；框架层可选 `Agent::with_required_reflection`（默认关闭，只对本轮调用过工具后的回答生效），CLI 不开启 |
 | 多 agent | ⚠️ | 有 agent-as-tool（`AgentTool`，`src/agent/sub_agent.rs`）；handoff、workflow / graph 编排没有 |
 | 长期记忆 / RAG | ✅ | SQLite 持久化向量库（`knowledge_base::store`，增量索引、复用已算过的向量）、`retrieve` 工具、跨会话记忆（`memory`：remember / forget / recall + 每轮自动召回）；检索是精确余弦，不是 ANN；没有混合检索和重排 |
 | 可观测性 | ✅ | GenAI 约定的 span（`invoke_agent` / `chat` / `execute_tool`），`--features otel` 导出 OTLP；按模型统计用量（含缓存、推理 token），子 agent / 工具 / 摘要的消耗计入所在运行；按价格表估算成本。没有 metrics |
@@ -585,7 +585,7 @@
 - **未做 / 遗留**：
   - 子 agent 的中间过程（它的 token、工具调用）不会出现在父 agent 的流式事件里，前端只能看到一次工具调用和它的结果。
   - 没有 handoff（把对话控制权转交给另一个 agent），也没有 workflow / graph 编排。
-  - 没有反思 / 自检步骤。
+  - 没有反思 / 自检步骤。（已解决：`reflect` 工具，以及可选的 `Agent::with_required_reflection`。）
   - 子 agent 的用量没有合并进父 agent 的 `usage`，失败运行的用量也没有统计，留给第 5 项。（第 5 项已解决。）
   - 加入 `update_plan` 改变了 `builtin()` 的工具列表，但不会让升级前挂起的运行失效：`RunFingerprint::mismatch` 只检查记录里的工具是否还在，新增的工具不算差异（见 `an_added_tool_still_matches`）。
 

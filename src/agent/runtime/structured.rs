@@ -24,8 +24,8 @@
 use std::collections::HashMap;
 
 use async_openai::types::chat::{
-  ChatCompletionMessageToolCalls, ChatCompletionRequestSystemMessageArgs,
-  ChatCompletionToolChoiceOption, FinishReason, ResponseFormat, ToolChoiceOptions,
+  ChatCompletionMessageToolCalls, ChatCompletionToolChoiceOption, FinishReason, ResponseFormat,
+  ToolChoiceOptions,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -35,7 +35,7 @@ use crate::{
   error::ProviderError,
   llm::{
     backend::ChatResponse,
-    client::{WireMessages, first_choice, request_builder},
+    client::{first_choice, request_builder},
     schema::{
       FINAL_ANSWER_TOOL_NAME, final_answer_tool, final_answer_tool_from_schema,
       native_schema_format, native_schema_format_from_value, schema_instruction,
@@ -375,7 +375,7 @@ impl Agent {
       // unconstrained it would reply in prose and fail to parse. On tool-calling rounds
       // `content` is empty anyway, so the constraint is harmless there.
       let wire = match &schema_hint {
-        Some(hint) => self.messages_with_schema_hint(&context, hint).await?,
+        Some(hint) => self.messages_with_trailer(&context, hint).await?,
         None => {
           let request = self.prepare_llm_request(&context).await;
           self.build_messages(request)?
@@ -465,31 +465,6 @@ impl Agent {
         budget_exhausted,
       });
     }
-  }
-
-  /// Like [`Self::build_messages`] but appends a one-off system message carrying the schema
-  /// hint, used by the `json_object` response-format route.
-  ///
-  /// Goes through [`Self::prepare_llm_request_with_trailer`] so the before-LLM hook chain
-  /// (token budget trimming, and anything else registered) applies here exactly as it does
-  /// on the plain route — *and* so the hint is counted against that budget, which is what
-  /// the trailer dance exists for. The hint is emitted after the conversation rather than
-  /// among the leading system messages: under `json_object` the schema is only
-  /// prompt-guided, and models follow it far more reliably when it is the last thing they
-  /// read.
-  async fn messages_with_schema_hint(
-    &self,
-    context: &ExecutionContext,
-    hint: &str,
-  ) -> crate::Result<WireMessages> {
-    let request = self.prepare_llm_request_with_trailer(context, hint).await;
-    let mut wire = self.build_messages(request)?;
-    wire.push(
-      ChatCompletionRequestSystemMessageArgs::default()
-        .content(hint)
-        .build()?,
-    );
-    Ok(wire)
   }
 
   /// Record a structured final answer produced through the `final_answer` tool.

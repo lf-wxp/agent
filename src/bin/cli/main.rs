@@ -174,7 +174,7 @@ use agent::{
   },
   session::{FileSessionStore, SessionStore},
   telemetry,
-  tools::{ToolRegistry, file_delete, file_edit, file_write, plan, shell},
+  tools::{ToolRegistry, file_delete, file_edit, file_write, plan, reflect, shell},
 };
 use anyhow::Context;
 use async_stream::stream;
@@ -1570,11 +1570,12 @@ fn render_chat_event(event: ChatEvent) -> String {
     // Normally handled by `TerminalView::render` before this is reached; plain text is
     // the right fallback if it ever is.
     ChatEvent::Reasoning { text } => text,
-    // `update_plan` is left out here and shown by its result below instead: its arguments
-    // are the plan as raw JSON, and the result is the same plan as a readable checklist.
+    // `update_plan` and `reflect` are left out here and shown by their results below
+    // instead: their arguments are raw JSON, and the result is the same content rendered
+    // for a reader.
     ChatEvent::ToolCallsStarted { calls } => calls
       .into_iter()
-      .filter(|call| call.name != plan::NAME)
+      .filter(|call| call.name != plan::NAME && call.name != reflect::NAME)
       .map(|call| format!("\n[tool] {}({})\n", call.name, call.arguments))
       .collect(),
     ChatEvent::ToolCallsFinished { results } => results
@@ -1582,6 +1583,8 @@ fn render_chat_event(event: ChatEvent) -> String {
       .map(|result| {
         if result.name == plan::NAME && result.status == ToolStatus::Success {
           render_plan(&result.content)
+        } else if result.name == reflect::NAME && result.status == ToolStatus::Success {
+          render_reflection(&result.content)
         } else {
           format!("[tool] {} -> {:?}\n", result.name, result.status)
         }
@@ -1637,10 +1640,23 @@ fn render_chat_event(event: ChatEvent) -> String {
 /// nothing (see the `ToolCallsStarted` arm), so whatever the model said just before may
 /// still be on the current line.
 fn render_plan(checklist: &str) -> String {
-  let mut lines = checklist.lines();
-  let mut out = format!("\n[plan] {}\n", lines.next().unwrap_or_default());
+  render_block("plan", checklist)
+}
+
+/// `reflect`'s result (`Reflection (verdict):`, then the summary, numbered issues and next
+/// step, see [`reflect`]) in the same shape as [`render_plan`]. Like the plan, its call
+/// printed nothing, so it starts with its own newline.
+fn render_reflection(reflection: &str) -> String {
+  render_block("reflect", reflection)
+}
+
+/// `text`'s first line after `[label] `, each further line indented under it.
+fn render_block(label: &str, text: &str) -> String {
+  let mut lines = text.lines();
+  let mut out = format!("\n[{label}] {}\n", lines.next().unwrap_or_default());
+  let indent = " ".repeat(label.chars().count() + 3);
   for line in lines {
-    out.push_str(&format!("       {line}\n"));
+    out.push_str(&format!("{indent}{line}\n"));
   }
   out
 }
@@ -2630,6 +2646,66 @@ mod tests {
     assert_eq!(
       view.render(plan_result(ToolStatus::Error, "2 steps are in_progress")),
       "[tool] update_plan -> Error\n"
+    );
+  }
+
+  fn reflect_result(status: ToolStatus, content: &str) -> ChatEvent {
+    ChatEvent::ToolCallsFinished {
+      results: vec![ToolResultSummary {
+        id: "call_1".to_owned(),
+        name: reflect::NAME.to_owned(),
+        status,
+        content: content.to_owned(),
+      }],
+    }
+  }
+
+  /// The self-check is shown once, as a block under its own label: the call (raw JSON) is
+  /// skipped, the result printed in full.
+  #[test]
+  fn a_reflection_prints_the_verdict_block_instead_of_the_call() {
+    let mut view = TerminalView::new(false);
+    let call = view.render(ChatEvent::ToolCallsStarted {
+      calls: vec![shared::ToolCallSummary {
+        id: "call_1".to_owned(),
+        name: reflect::NAME.to_owned(),
+        arguments: serde_json::json!({ "summary": "s" }),
+      }],
+    });
+    assert_eq!(call, "", "the raw arguments are not shown");
+
+    let printed = view.render(reflect_result(
+      ToolStatus::Success,
+      "Reflection (needs_correction):\nSummary: Checked the units\nIssues:\n1. wrong unit\nNext: recompute",
+    ));
+    assert_eq!(
+      printed,
+      "\n[reflect] Reflection (needs_correction):\n          Summary: Checked the units\n          Issues:\n          1. wrong unit\n          Next: recompute\n"
+    );
+  }
+
+  /// A rejected reflection has nothing to show; it reads like any failed call.
+  #[test]
+  fn a_rejected_reflection_reads_like_any_failed_call() {
+    let mut view = TerminalView::new(false);
+    assert_eq!(
+      view.render(reflect_result(ToolStatus::Error, "verdict must be one of")),
+      "[tool] reflect -> Error\n"
+    );
+  }
+
+  /// After streamed thinking the reflection block starts on its own line, once.
+  #[test]
+  fn a_reflection_after_reasoning_adds_no_blank_line() {
+    let mut view = TerminalView::new(false);
+    let mut printed = view.render(reasoning("checking"));
+    printed += &view.render(reflect_result(
+      ToolStatus::Success,
+      "Reflection (on_track):\nSummary: ok",
+    ));
+    assert_eq!(
+      printed,
+      "[thinking] checking\n[reflect] Reflection (on_track):\n          Summary: ok\n"
     );
   }
 }

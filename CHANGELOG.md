@@ -25,6 +25,18 @@ Notable changes to the `agent` crate. Entries under *Unreleased* ship with the n
 - `cli`: `--memory`, `--reindex-memory`, `/memory`, and `AGENT_CLI_MEMORY_PATH`.
 - `knowledge_base::embed::Embedder::{embed_checked, embed_one}`, and `tools::schema_of`.
 - `examples/rag.rs`.
+- `tools::reflect::ReflectTool` (`reflect`): the model writes down a self-check on its own
+  initiative (summary, issues, `on_track` / `needs_correction` / `blocked`, next step) and
+  reads it back as the tool result. Stateless and read-only like `update_plan`; in
+  `ToolRegistry::builtin` and selectable by name. The CLI renders its result as a
+  `[reflect]` block instead of the raw call.
+- `Agent::with_required_reflection` (off by default): an answer that follows tool work is
+  held back until the model has reflected on it. The demand is one trailing system
+  message, counted against the history budget, with `tool_choice` pinned to `reflect`
+  where the model allows it. A plain question answered without tools is never held, at
+  most three demands are made per pass of the loop, and a model that answers again instead
+  of reflecting gets its first draft delivered. Streaming holds a round's text until the
+  round ends while it could still be turned back. The CLI does not turn it on.
 - `tools::FnTool`: a tool built from an argument struct (`Deserialize + JsonSchema`) and
   an async closure, with `with_timeout` / `read_only`. Unparseable arguments are reported
   to the model with serde's reason; empty arguments are read as `{}`.
@@ -39,6 +51,11 @@ Notable changes to the `agent` crate. Entries under *Unreleased* ship with the n
 
 ### Changed
 
+- **Default tool-round budget 10 → 100** (`LLM_MAX_TOOL_ROUNDS`). Applies wherever no budget
+  is set explicitly: an `Agent` without `with_max_steps`, `llm::tool_loop` and
+  `llm::stream`. A multi-step task is cut short less often; a model that keeps calling
+  tools can now spend up to three times as many requests before it is made to answer. Set
+  `LLM_MAX_TOOL_ROUNDS=100` for the old behaviour.
 - **Token counting follows the model.** The `ContextOptimizer` that `Agent::new` installs
   counts the budget with `o200k_base` when the agent's model uses it (GPT-4o, GPT-4.1,
   GPT-5, the `o` series, `gpt-oss`), by `tiktoken-rs`'s model table; every other model is

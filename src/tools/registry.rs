@@ -17,6 +17,7 @@ use crate::tools::{
   grep::{self, GrepTool},
   plan::{self, UpdatePlanTool},
   read_image::{self, ReadImageTool},
+  reflect::{self, ReflectTool},
   shell::{self, RunCommandTool},
   tool::{Tool, ToolDefinition, execute_with_timeout, validate_tool_name},
   web_search::{self, WebSearch},
@@ -45,7 +46,8 @@ impl ToolRegistry {
   /// no external process to construct.
   ///
   /// `calculator`, `web_search`, `update_plan` (the model's own checklist, see
-  /// [`crate::tools::plan`]), and the filesystem tools that read (`list_files`,
+  /// [`crate::tools::plan`]), `reflect` (the model's written self-check, see
+  /// [`crate::tools::reflect`]), and the filesystem tools that read (`list_files`,
   /// `read_file`, `read_image`, `grep`) plus the two that already existed before the
   /// write/execute tools did (`delete_file`, `unzip_file`). This is what a caller gets
   /// when it reaches for "the defaults" without having set up a sandbox and an approval
@@ -89,6 +91,7 @@ impl ToolRegistry {
     registry.add(Arc::new(ReadImageTool::default()))?;
     registry.add(Arc::new(GrepTool))?;
     registry.add(Arc::new(UpdatePlanTool))?;
+    registry.add(Arc::new(ReflectTool))?;
     Ok(registry)
   }
 
@@ -134,6 +137,7 @@ impl ToolRegistry {
         grep::NAME => Arc::new(GrepTool),
         shell::NAME => Arc::new(RunCommandTool),
         plan::NAME => Arc::new(UpdatePlanTool),
+        reflect::NAME => Arc::new(ReflectTool),
         other => crate::error::bail!(invalid_input, "unknown tool `{other}`"),
       };
       registry.add(tool)?;
@@ -314,7 +318,7 @@ mod tests {
   use super::*;
   use crate::tools::{
     calculator, file_delete, file_edit, file_list, file_read, file_write, grep, plan, read_image,
-    shell, web_search,
+    reflect, shell, web_search,
   };
 
   #[test]
@@ -339,6 +343,7 @@ mod tests {
       read_image::NAME,
       grep::NAME,
       plan::NAME,
+      reflect::NAME,
     ] {
       assert!(registry.contains(name), "missing built-in tool `{name}`");
     }
