@@ -80,7 +80,7 @@
 - LLM 重试时读取 `Retry-After`；（→ 执行项第 10 项）
 - 提供服务化的 HTTP API 和鉴权；（→ 执行项第 11 项）
 - 增加端到端回归评测；（→ 执行项第 14 项）
-- 修正 README 中测试数量不一致的问题：徽章写 418，正文写 528。
+- 修正 README 中测试数量不一致的问题：徽章写 418，正文写 528。（已在 7d 完成）
 
 ## 4. 执行项
 
@@ -107,7 +107,7 @@
 |---|---|---|---|---|---|
 | 8 | 补全 MCP | 断线重连、`list_changed` 通知、resources / prompts、SSE 传输（待定） | 中–大 | 无 | ⏳ 待开始 |
 | 9 | Agent 作为 MCP Server | 把一个 `Agent` 作为 MCP 工具暴露给其他客户端 | 中 | HTTP 传输的鉴权与第 11 项共用 | ⏳ 待开始 |
-| 10 | LLM 重试读取 `Retry-After` | 自己实现聊天和 embedding 的 HTTP 层，按服务端要求的时间等待 | 小–中 | 无 | ⏳ 待开始 |
+| 10 | LLM 重试读取 `Retry-After` | 自己实现聊天和 embedding 的 HTTP 层，按服务端要求的时间等待 | 小–中 | 无 | ✅ 已完成，待审批 |
 | 11 | 服务化 HTTP API 与鉴权 | 多用户、带鉴权的对外 API；Web UI 不再只能本机访问 | 大 | 无；第 9 项的 HTTP 传输复用它的鉴权 | ⏳ 待开始 |
 | 12 | 审批时改写参数（`edit`） | 审批人修改工具参数后放行，对话记录与实际执行的参数保持一致 | 中 | 无 | ⏳ 待开始 |
 | 13 | 多模态输入 | 用户消息带图片；工具（含 MCP）返回的图片交给模型 | 大 | 与第 8 项都改 MCP 结果的处理，先做的一方定接口 | ⏳ 待开始 |
@@ -221,29 +221,29 @@
 **现状**
 - `src/llm/retry.rs`：`with_retry` 用 `backon` 做指数退避，完全不看 `Retry-After`（文档里写了这一限制）。
 - **根本原因**：`async-openai` 的 `ApiErrorResponse` 只保留状态码和错误体，响应头在错误到达我们之前就被丢掉了。用到它的地方有两处：
-  - `OpenAiCompatible`（`src/llm/backend.rs`），通过 `create_byot` / `create_stream_byot`；
+  - `OpenAiCompatible`（`src/llm/backend.rs`），通过 `create_byot` / `create_stream_byot`（第 10 项完成后已改为 `llm::transport`，见本项的完成记录）；
   - `OpenAiEmbedder`（`src/knowledge_base/embed.rs`）。
 - **有利条件**：
   - `backon` 1.6 有 `adjust(|err, default_delay| ...)`，可以按错误修改下一次的等待时间；
   - `ProviderError` 是自有类型（7c），可以直接加字段；
   - `ChatRequest::to_body`、`parse_response`、`parse_chunk` 已经基于原始 JSON，自己发 HTTP 不需要重写解析；
-  - `crate::http::client()` 已有共享的 reqwest 客户端。
+  - `crate::http::client()` 已有共享的 reqwest 客户端（但它有 30 秒的总超时，适合工具、不适合流式聊天，所以 `Transport` 自己建客户端）。
 
 **子任务**
-- [ ] 10.1 `ProviderError` 增加 `retry_after: Option<Duration>`，以及 `with_retry_after` / `retry_after()`。
-- [ ] 10.2 `with_retry` 用 `adjust`：
+- [x] 10.1 `ProviderError` 增加 `retry_after: Option<Duration>`，以及 `with_retry_after` / `retry_after()`。
+- [x] 10.2 `with_retry` 用 `adjust`：
   - 有 `retry_after` 时，等待 `max(retry_after, 默认退避)`；
   - 超过上限时不再重试，直接返回错误。
-- [ ] 10.3 聊天请求改用 reqwest 自己发：
+- [x] 10.3 聊天请求改用 reqwest 自己发：
   - 实现 `OpenAiCompatible::create` / `create_stream`，流式部分自己解析 SSE；
   - 从响应头读 `Retry-After`，支持秒数和 HTTP 日期两种格式；
   - 部分服务（如 Azure OpenAI）还会发 `retry-after-ms`，一并支持。
-- [ ] 10.4 embedding 请求同样处理。
-- [ ] 10.5 行为保持不变：
+- [x] 10.4 embedding 请求同样处理。
+- [x] 10.5 行为保持不变：
   - 错误分类（状态码 → 能否重试）不变；
   - `OpenAIConfig` 的配置方式不变（base URL、key、组织、项目、自定义头）；
   - `OPENAI_*` 环境变量照常生效。
-- [ ] 10.6 文档（去掉 `retry.rs` 里的「已知限制」）和测试。
+- [x] 10.6 文档（去掉 `retry.rs` 里的「已知限制」）和测试。
 
 **开始前要确认**
 - 自己实现 HTTP 层，还是给 `async-openai` 提 PR、让它保留响应头：
@@ -453,10 +453,11 @@
     - 可选参数 `workdir`。
 - `WorkspaceGuardCallback` 现在也会检查这些新工具的路径参数：`write_file` / `edit_file` 的 `file_path`、`grep` 的 `path`、`run_command` 的 `workdir`。
   - 注意：`run_command` 的命令字符串本身无法做路径校验，只能靠审批把关。
+  - `run_command` 没有进程隔离，这个缺口以及让 Agent 现场写 Python 并安全执行（`run_python`）的方案，见 [python-sandbox-design.md](python-sandbox-design.md)（设计草案，未排期）。
 - CLI 默认需要审批的工具从 `delete_file` 扩大为 `delete_file`、`write_file`、`edit_file`、`run_command`。
 - `Compaction` 默认会压缩 `grep` 的历史结果（它是只读的、可以重跑）。写入和执行类工具明确排除在外，并有测试保证。
 - `gaia` 基准评测只用一组固定的工具（`calculator`、`web_search`、`list_files`、`read_file`、`unzip_file`、`read_image`），不含写入、执行和删除类工具：评测无人值守，没有人可以审批。这不是原来 `builtin()` 的完整集合（原来还含 `delete_file`），评测条件的差别仅此一项。
-- 代码审查后的调整见 `docs/code-review-tools-and-cancellation-2026-10-19.md`。其中改变了对外行为的几处：
+- 改变了对外行为的几处：
   - `ToolRegistry::builtin()` 不再含 `write_file`、`edit_file`、`run_command`；完整集合改为 `builtin_all()`，CLI 使用后者。
   - 同一轮里有副作用的工具按调用顺序执行（`Tool::concurrency_safe`，默认 `false`）。
 
@@ -497,7 +498,7 @@
   - 自定义后端可以用 `llm::retry::Permanent::wrap` 标记“重试也没用”的错误，`is_transient` 会识别，避免白白走完整条退避曲线。
   - 响应结构解析失败时，错误里带上截断到 300 字符的原始响应体。
 - **推理内容**：
-  - 给 `async-openai` 开启了 `byot` feature，用来读取原始 JSON。`reasoning_content`（DeepSeek、Qwen、Kimi、vLLM）或 `reasoning`（OpenRouter、Ollama）中有哪个就取哪个，然后再按标准结构解析。
+  - （第 10 项后：聊天请求改由自己的 `llm::transport` 发送，`byot` feature 已去掉，下面关于 `byot` 的两条只是当时的实现记录。）给 `async-openai` 开启了 `byot` feature，用来读取原始 JSON。`reasoning_content`（DeepSeek、Qwen、Kimi、vLLM）或 `reasoning`（OpenRouter、Ollama）中有哪个就取哪个，然后再按标准结构解析。
   - 非流式运行通过 `AgentResult::reasoning` 返回最终回答那一轮的推理；中间工具轮次的推理只记在 debug 日志里。
   - 流式运行在回答之前推送 `AgentStreamEvent::Reasoning` 事件。
   - 默认不写入 transcript，也不会发回给模型。
@@ -506,7 +507,7 @@
   - 为保证推理内容不和所属消息分开：`find_safe_start` 和驱逐的头部边界不会把二者切开；摘要的文本里不包含推理；孤立的（所属消息已被裁掉的）推理在构建请求时丢弃，不会挂到别的消息上；关闭开关后，transcript 里已有的推理也不再发送。
   - Web 历史接口返回 `Reasoning` 项（`HistoryContentItem::Reasoning`），页面刷新后以折叠状态显示；只有开启回传时 transcript 里才有。
   - 无状态的 `tool_loop::Completion` 也新增了 `reasoning` 字段。
-  - 注意：开启 `byot` 后，原始的流式调用不会再自动设置 `stream: true`，现在由 `OpenAiCompatible` 自己设置。`tests/openai_backend.rs` 有端到端测试覆盖这一点。
+  - 注意：开启 `byot` 后，原始的流式调用不会再自动设置 `stream: true`，现在由 `OpenAiCompatible` 自己设置（第 10 项后不再经过 `async-openai` 的客户端，仍由它设置）。`tests/openai_backend.rs` 有端到端测试覆盖这一点。
 - **模型参数**（`src/llm/settings.rs`）：
   - 新增 `ModelSettings`，包含 `max_tokens`、`token_limit_field`、`temperature`、`top_p`、`reasoning_effort`、`replay_reasoning` 六项。
   - 默认值来自环境变量 `LLM_MAX_TOKENS`、`LLM_TOKEN_LIMIT_FIELD`、`LLM_TEMPERATURE`、`LLM_TOP_P`、`LLM_REASONING_EFFORT`、`LLM_REPLAY_REASONING`。取值无效（无法解析、为 0、越界、不认识的名字）时打 warn 日志并忽略，不会让进程报错。`ModelSettings::from_config()` 每个进程只读取一次并缓存，所以警告也只出现一次；需要在 `.env` 加载之后再调用。
@@ -657,7 +658,7 @@
   - 一张 `documents` 表，按集合（collection）和来源（source）组织；`put_source` 在一个事务里替换某个来源的全部文本块，检索时看不到新旧混杂的中间状态。
   - **复用向量**：写入前按「文本哈希 + 模型」查找库里已有的向量（哈希只用来找候选，最终比对原文），只为没见过的文本调用 embedder，同一批里重复的文本只算一次。`IndexReport` 报告计算了多少、复用了多少。
   - **模型隔离**：每个向量记录生成它的模型，检索只比较当前模型的向量；换了模型后旧文档不会被删除，但在重建索引前检索不到，并打一条 warn。维度对不上时报错，提示可能是模型换了但名字没变。
-  - **检索**：精确余弦。每个集合的向量预先归一化后缓存在内存里；缓存是否过期由每个集合在 `meta` 表里的版本号决定（每次写入在同一事务内加一），本进程、同文件的其他句柄、其他进程的写入都能发现（第三轮审查前用的是整库级的 `PRAGMA data_version`，见下）。
+  - **检索**：精确余弦。每个集合的向量预先归一化后缓存在内存里；缓存是否过期由每个集合在 `meta` 表里的版本号决定（每次写入在同一事务内加一），本进程、同文件的其他句柄、其他进程的写入都能发现。
   - SQLite 使用 WAL 模式，设置 5 秒忙等待；所有数据库操作都放在 `spawn_blocking` 里，不阻塞异步线程。
   - 文件里记录 schema 版本：旧版本（1）原地升级到 2，未知版本拒绝打开，不会误读。
   - FNV-1a 哈希从 `fingerprint.rs` 移到 `util`，算法和输出不变（有参考向量测试），已有的运行指纹不受影响。
@@ -688,18 +689,16 @@
   - 自动召回只用最新一条用户消息做查询，不看更早的上下文。
   - 防提示注入靠工具说明、可见的工具调用、「参考资料 / 可能不可信」标注，以及 `forget` 的默认审批；模型仍可能把网页里的内容存成记忆。需要更严格时，可以把 `remember` 加进 `--dangerous-tools` 走审批；但这个参数会替换默认的审批列表，所以要连同默认的 `delete_file,write_file,edit_file,run_command,forget` 一起写上。
   - 开着 `--memory` 时挂起的轮次，关掉 `--memory` 后恢复会被拒绝：记录里的 `remember` 等工具不在了（新增工具不影响恢复，减少工具会）。
-- **审查后修订**（上面几段保留为当时的实现记录）：
-  - 记忆库默认**按工作区**隔离（相对 `--workspace` 解析），不是"整机一个"；要跨工作区共享就把 `AGENT_CLI_MEMORY_PATH` 指向绝对路径。库文件新建时权限为 `0600`。
-  - `forget` 进入 CLI 默认审批列表，且不给"总是允许"；`remember` 仍免审批。召回消息里补了"可能来自不可信来源"的提示。
-  - 换 `EMBED_MODEL` 不再是死局：`VectorStore::reindex` 原地重新嵌入（保留编号）。**不会在启动时自动进行**（第二轮审查改为必须显式 `--memory --reindex-memory`，因为它会覆盖旧向量）；`remember` 命中旧模型记录时只重新嵌入那一条。
-  - 召回缓存改为按存储修订号失效，`remember` / `forget` 之后同样的提问会重新检索；检索失败与超时（3 秒）在这一轮内缓存为空，不会每个工具轮次都重试一遍。
-  - 凭证规则补了中文字段名、`Bearer`、GitLab token，并把"值要像密钥"（够长或含数字）作为第二道判断，`token: bucket` 之类不再误伤。
-  - `rusqlite` 进了默认开启的 `sqlite` feature，库使用者可以关掉整棵 SQLite 依赖树。
-- **第三轮审查修订**（上面各段仍是当时的实现记录，与本段冲突处以本段为准）：
-  - 文档与实现对齐：不再有"启动时自动重新嵌入"；缓存失效改为按集合的版本号。
+- **最终实现**（前面几段为当时的记录，与本段冲突处以本段为准）：
+  - 记忆库默认**按工作区**隔离（相对 `--workspace` 解析）；要跨工作区共享就把 `AGENT_CLI_MEMORY_PATH` 指向绝对路径。库文件新建时权限为 `0600`。
+  - `forget` 在 CLI 默认审批列表里，且不给"总是允许"；`remember` 免审批。召回消息里注明"可能来自不可信来源"。
+  - 换 `EMBED_MODEL`：`VectorStore::reindex` 原地重新嵌入并保留编号，必须显式 `--memory --reindex-memory` 才触发（会覆盖旧向量，不在启动时自动进行）；`remember` 命中旧模型记录时只重新嵌入那一条。
+  - 缓存失效按集合的版本号；召回缓存按存储修订号失效，`remember` / `forget` 之后同样的提问会重新检索；检索失败与超时（3 秒）在这一轮内缓存为空，不会每个工具轮次都重试一遍。
   - 记忆编号永不复用（`AUTOINCREMENT`，旧库首次打开时原地升级并保留编号）；`forget` 必须带上那条记忆的原文，对不上就不删，审批提示因此能看到将要删除的内容。
-  - `remember` 在用过可能带第三方文字的工具（网页、文件、命令、MCP）的那一轮会被拒绝（`RememberGuard`），直到用户确认；`forget` 的"总是允许"选项在提示里去掉（它本来就不会被记住）。
-  - 快照重建分页读取、同一集合同一时刻只重建一次；批量嵌入同时受条数和字节数限制；凭证规则补了 `DB_PASSWORD=` 一类带前缀的字段、Stripe/Google/npm 密钥与带口令的 URL。
+  - `remember` 在用过可能带第三方文字的工具（网页、文件、命令、MCP）的那一轮会被拒绝（`RememberGuard`），直到用户确认。
+  - 凭证规则覆盖中文字段名、`Bearer`、GitLab token、`DB_PASSWORD=` 一类带前缀的字段、Stripe/Google/npm 密钥与带口令的 URL，并把"值像密钥"（够长或含数字）作为第二道判断，`token: bucket` 之类不误伤。
+  - 快照重建分页读取、同一集合同一时刻只重建一次；批量嵌入同时受条数和字节数限制。
+  - `rusqlite` 在默认开启的 `sqlite` feature 下，库使用者可以关掉整棵 SQLite 依赖树。
 
 #### 第 7a 项：Cargo features 裁剪
 
@@ -804,22 +803,11 @@
   - 全部 feature：库内 769 个、CLI 53 个、集成测试、doctest 通过；不开 feature：库内 651 个通过；示例里的测试 5 个通过；6 种 feature 组合、全部 feature 和 wasm 端的 clippy 都没有警告；文档没有失效链接。
 - **未做 / 遗留**：
   - **行为变化**：对 GPT-4o 等模型，同一段对话现在计得更少（中文尤其明显），裁剪会比以前晚一些开始；`LLM_MAX_HISTORY_TOKENS` 的含义没变，仍然是请求大小的软上限。
-  - ~~没有为 Agent 级别的默认安装单独写测试~~：审核后补了 `Agent::context_encoding` 与对应测试（`gpt-4o` / `gpt-4` / 未知模型三种）。安装的优化器本身仍是 trait object，取不出编码，所以这个访问器报告的是构造时记下的值。
+  - ~~没有为 Agent 级别的默认安装单独写测试~~：已补 `Agent::context_encoding` 与对应测试（`gpt-4o` / `gpt-4` / 未知模型三种）。安装的优化器本身仍是 trait object，取不出编码，所以这个访问器报告的是构造时记下的值。
   - 其他提供商的模型仍用 `cl100k_base` 估算，没有接入它们各自的 tokenizer。
   - `examples/vector_search.rs`、`examples/callback_search_compressor.rs` 演示分块时仍直接用 `cl100k_base`，没改。
   - 新徽章依赖仓库公开且 CI 在 `main` 上跑过；仓库若是私有的，徽章不会显示状态。
   - 7c 遗留的「CI 没有跑 `cargo test --examples`」仍未处理。
-
-#### 审核修复（2026-10-23）
-
-对本次全部未提交改动的审核见 [code-review-uncommitted-2026-10-23.md](code-review-uncommitted-2026-10-23.md)。除 7a–7d 的记录外，审核还发现并修复了下面这些，都属于同一批改动：
-
-- `ResultExt::{wrap_err, wrap_err_with, err_as}` 会把本 crate 的 `Error` 重新归类（`Cancelled` 变 `Tool`、不可重试的 `Provider` 变得可重试），现在只对其他 crate 的错误生效。
-- CI 的 feature 矩阵补了 `cargo check --lib --bins`：`--all-targets` 会把 dev-dependencies 的 feature 合并进来，缺 `cfg` 的库代码在它下面照样能编译。
-- 工具名规则统一到 `MAX_TOOL_NAME_CHARS` / `validate_tool_name`，不再有两份常量和一份手写规则；`FnTool` 与 `AgentTool` 都要求描述非空。
-- `with_mcp_over` 的「坏工具只记日志并跳过」抽成 `add_skipping` 并有测试；`ToolRegistry::add` 拒绝非法名字也有测试。
-- embedder 契约违约（数量不符、空向量、长度不一致）由 `transient` 改为 `permanent`：同一输入重试只会失败得一样。
-- `file_read` / `file_upzip` 的裸 `?` 补了路径上下文，模型能看到是哪个文件失败。
 
 #### 第 15 项：补全 CI 覆盖
 
@@ -842,8 +830,8 @@
   - `Makefile.toml` 的 `test` 任务改成同样的两条命令，本地 `cargo make test` 和 CI 跑的一致。
   - README 中英文：任务表里 `cargo make test` 的说明改为实际覆盖范围；「裸 `cargo test` 只覆盖根 package」那条陷阱补上「也不运行示例里的测试」。
 - **`--no-fail-fast` 是实测后加的**：同时在 `examples/rag.rs` 和 `crates/shared` 里各埋一个失败测试，默认模式在 `rag` 处就停了，`shared` 的失败要等前一个修好才会暴露；加 `--no-fail-fast` 一次报出两处（`error: 2 targets failed`）。
-- **`Makefile.toml` 的两条命令不能串在 `set -e` 下**（初审后修）：第一条失败就退出，doctest 一个都不跑，正好抵消 `--no-fail-fast` 的意义，也让它与 CI 的两个独立 step 不一致。现在两条都跑、失败按位或汇总到退出码。
-- **初审后的数字变化**：上表和下面「验收」里的 898 / 687 是第 15 项落地时的实测。随后的审查修复新增了 2 个 `config` 单测（旧变量告警），所以当前是 900（892 + 8）和 689；概览表（第 2 节「测试」）已按当前值更新。审查修复的完整清单见 `docs/change-review.md`。
+- **`Makefile.toml` 的两条命令不能串在 `set -e` 下**：第一条失败就退出，doctest 一个都不跑，正好抵消 `--no-fail-fast` 的意义，也让它与 CI 的两个独立 step 不一致。现在两条都跑、失败按位或汇总到退出码。
+- **数字变化**：上表和下面「验收」里的 898 / 687 是第 15 项落地时的实测。随后新增了 2 个 `config` 单测（旧变量告警），所以当前是 900（892 + 8）和 689；概览表（第 2 节「测试」）已按当前值更新。
 - **验收**（均在本地实测，改动随即还原）：
   - 示例测试里埋一个失败断言：原来的 `cargo test --all-features` 没抓到，新命令抓到；
   - `crates/shared` 里埋一个失败测试：新命令抓到；
@@ -855,3 +843,38 @@
   - 15.5（CI 里跑 `trunk build`）没做：需要在 CI 里安装 `trunk`，多花时间，而 wasm clippy 已经覆盖了编译错误。要做的话再说。
   - 没有 `web-ui` 的浏览器端测试：现有 6 个测试在宿主上跑，测的是翻译表和命令表这类纯逻辑；渲染、事件流这些要 `wasm-bindgen-test` 加浏览器才能测，本机虽然装了 `wasm-bindgen-test-runner`，CI 里还没配。
   - 新 workflow 本身没有在 GitHub 上跑过：这里只验证了 YAML 能解析、各条命令在本地等价运行。第一次推送后要看一下 `clippy-wasm` 任务（`targets:` 的写法和 rust-cache 的 key）是否一次通过。
+
+#### 第 10 项：LLM 重试读取 `Retry-After`
+
+- **方案**：自己实现聊天和 embedding 的 HTTP 层（`src/llm/transport.rs`），不再经过 `async-openai` 的客户端；`async-openai` 只保留 `OpenAIConfig`（base URL、key、组织、项目、自定义头）和请求 / 响应类型。去掉了 `byot` feature。新增依赖 `eventsource-stream`、`httpdate`，都已在依赖树里；`reqwest` 加了 `stream` feature。
+  - 开始前的三个问题按默认处理：自己实现而不是给上游提 PR；等待上限 60 秒，可用 `LLM_RETRY_MAX_WAIT_SECS` 改；超过上限时直接返回错误，不是"按上限等一下再试"。
+- **`Transport`**（`pub(crate)`）：`post_json` 和 `post_sse` 两个方法，返回原始 JSON，解析仍在 `backend.rs` / `embed.rs`。
+  - 非 2xx 响应在这里转成 `ProviderError`：带状态码、能否重试（408 / 409 / 429 / 5xx 可重试，其余不可）和 `retry_after`。错误文本沿用 `async-openai` 原来的格式（`{status} {type}: {message} (param: ..) (code: ..)`），网关返回的 HTML 或空响应体也会带出来。
+  - `Retry-After` 先读 `retry-after-ms`（毫秒），再读 `Retry-After`（秒数或 HTTP 日期；过去的日期算不用等；读不懂的值当作没有）。
+  - SSE 用 `eventsource-stream` 解析，`[DONE]` 结束，`keepalive` 和空事件跳过；流中途断开给出 `stream` 类错误并结束，不再继续读。
+  - 与原实现的差别：流式不再为每个响应起一个 tokio task；没有总超时（和原来一样，流式回答可能很长）。
+- **`ProviderError`**：新增 `retry_after` 字段，`with_retry_after` / `retry_after()`；`context` 层会保留它，和状态码一样。自定义 `ChatBackend` 可以自己设置。
+- **`with_retry`**：用 backon 的 `adjust`：
+  - 没有 `retry_after`：照旧用指数退避；
+  - 有：等 `max(退避, retry_after)`，退避曲线是下限不是上限；
+  - `retry_after` 大于上限、或重试次数用尽：不再重试，错误里仍带着 `retry_after()` 供调用方查看。
+  - 所有调用点（普通请求、流式、结构化、摘要、`read_image`、embedding、GAIA）共用这一处，不需要逐个改。
+- **实现细节**：
+  - embedding 响应直接解析成 `CreateEmbeddingResponse`，不经过 `Value`；成功响应体和错误响应体都有大小上限。
+  - 响应不是合法 JSON（或形状不对）时归入 `invalid_response` 类；流错误的文本带 `EventStream error:` 前缀。
+  - 「哪些状态码可重试」收在一处 `error::is_retryable_status`，`ProviderError::from_status` 和 `From<OpenAIError>` 共用。
+  - `Transport` 有连接超时（10 秒）；重定向只在同一台服务器内跟随（同主机同端口，或同主机从 `http` 升级到 `https`），其他 3xx 当作错误返回并写明跳转目标，避免自定义头（如 `api-key`）被带到别的域。
+  - `Retry-After` 的等待带最多 10% 的抖动，上限仍按服务端要求的原值判断；叠加抖动用饱和加法。
+- **测试**：
+  - `transport.rs` 单测：秒数、毫秒、HTTP 日期（相对传入的时钟）、过去的日期、各种读不懂的值、`retry-after-ms` 优先；错误文本的几种形状；可重试的状态码。
+  - `retry.rs` 单测：`next_wait` 的下限、上限、次数用尽、`context` 之后仍有效。
+  - `tests/retry_after.rs`：本地假服务，5 个用例——非流式聊天（`Retry-After: 2`）、流式聊天（`retry-after-ms: 2500`）、embedding、超过上限（一次请求、不等待、错误里有 `retry_after`）、没有该头时走默认退避。间隔取自假服务自己记录的到达时间。
+  - `tests/transport_edges.rs`（15 个）：响应大小上限、错误分类、重定向、HTTP 日期等边界。
+  - 原有的 `tests/openai_backend.rs`（推理回传、流式 `stream: true`、4xx 不重试）和 `tests/openai_embedder.rs` 未改，全部通过。
+- **验证**：全部 feature 下 clippy `-D warnings`（含 wasm 成员所在的 workspace）无警告；`--workspace --all-features --all-targets` 测试全部通过（库内 826、CLI 56、`shared` 27、`web-ui` 6 等）；不开 feature 时库内 706 个通过，clippy 无警告；`cargo doc` 无警告。
+- **未做 / 遗留**：
+  - 没有对真实服务（OpenAI、DeepSeek 等）手动跑过；只在本地假服务上验证了请求格式、SSE 和 429。
+  - 第 14 项（真实模型端到端评测）还没有，所以"换 HTTP 层后真实模型行为不变"没有真实模型的证据。
+  - 没有读取 / 总超时（流式回答可能很长，推理模型的非流式回答也可能很久没有输出），靠调用方的取消。
+  - 只读了 `Retry-After` 和 `retry-after-ms`。一些服务用 `x-ratelimit-reset-*` 之类的头表达同样的意思，格式各不相同，没有处理。
+  - 重试对象是整个请求，流式请求中途断开仍会从头重来（和以前一样）。

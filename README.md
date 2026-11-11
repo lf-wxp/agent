@@ -460,6 +460,7 @@ Everything is read from environment variables (single entry point: [`src/config.
 | `LLM_MAX_CONCURRENCY` | `3` | Per-tenant concurrency limit |
 | `LLM_MAX_TOOL_ROUNDS` | `100` | Tool-round budget for a single call |
 | `LLM_MAX_RETRIES` | `3` | Retries after a failed model request (exponential backoff, `0` disables) |
+| `LLM_RETRY_MAX_WAIT_SECS` | `60` | A provider's `Retry-After` is waited out up to this long; asking for more ends the retrying and returns the error |
 | `LLM_MAX_HISTORY_TOKENS` | `6000` | Soft token cap for multi-turn history |
 | `LLM_MAX_TOKENS` | `2048` | Output token cap of one ordinary request (structured output raises it as needed, never lowers it) |
 | `LLM_TOKEN_LIMIT_FIELD` | `max_tokens` | Which field carries the cap: `max_tokens` (most compatible servers) or `max_completion_tokens` (the only one OpenAI's reasoning models accept) |

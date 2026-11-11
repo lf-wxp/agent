@@ -15,11 +15,7 @@
 
 use std::sync::LazyLock;
 
-use async_openai::{
-  Client,
-  config::OpenAIConfig,
-  types::embeddings::{CreateEmbeddingRequestArgs, EmbeddingInput},
-};
+use async_openai::{config::OpenAIConfig, types::embeddings::CreateEmbeddingResponse};
 use tracing::Instrument;
 
 use crate::{
@@ -27,7 +23,10 @@ use crate::{
   agent::{TokenUsage, usage},
   config,
   error::ProviderError,
-  llm::retry::{is_transient, with_retry},
+  llm::{
+    retry::{is_transient, with_retry},
+    transport::Transport,
+  },
 };
 
 /// Max inputs accepted per embeddings request by OpenAI-compatible APIs. Batches larger
@@ -109,24 +108,27 @@ fn plan_batches(texts: &[String]) -> Vec<std::ops::Range<usize>> {
   batches
 }
 
-/// Reuse a single client within the process: avoid rebuilding the connection pool and
+/// Reuse a single transport within the process: avoid rebuilding the connection pool and
 /// re-reading env vars on every call.
 ///
-/// The chat provider's own client: embeddings are served from the same endpoint and
+/// The chat provider's own endpoint: embeddings are served from the same base URL and
 /// credentials as chat completions, which `OpenAIConfig::default()` reads from
 /// `OPENAI_BASE_URL` / `OPENAI_API_KEY`.
-static CLIENT: LazyLock<Client<OpenAIConfig>> =
-  LazyLock::new(|| Client::with_config(OpenAIConfig::default()));
+static TRANSPORT: LazyLock<Transport> = LazyLock::new(|| Transport::new(OpenAIConfig::default()));
+
+/// The path of the embeddings endpoint, under the configured base URL.
+const EMBEDDINGS_PATH: &str = "/embeddings";
 
 /// Any server speaking the OpenAI embeddings API.
 ///
-/// Every request is retried on transient failures, traced as an `embeddings` span, and
-/// its token usage charged to the agent run it happens inside (see
-/// [`crate::agent::usage`]) — so what retrieval and memory spend shows up in that run's
-/// `usage_by_model`, and in a cost estimate, like any other model call.
+/// Every request is retried on transient failures (waiting as long as the provider's
+/// `Retry-After` asks), traced as an `embeddings` span, and its token usage charged to the
+/// agent run it happens inside (see [`crate::agent::usage`]) — so what retrieval and memory
+/// spend shows up in that run's `usage_by_model`, and in a cost estimate, like any other
+/// model call.
 #[derive(Clone)]
 pub struct OpenAiEmbedder {
-  client: Client<OpenAIConfig>,
+  transport: Transport,
   model: String,
 }
 
@@ -134,7 +136,7 @@ impl OpenAiEmbedder {
   /// An embedder for `model` on the endpoint and credentials in `config`.
   pub fn new(config: OpenAIConfig, model: impl Into<String>) -> Self {
     Self {
-      client: Client::with_config(config),
+      transport: Transport::new(config),
       model: model.into(),
     }
   }
@@ -142,7 +144,7 @@ impl OpenAiEmbedder {
   /// `model` on the chat provider's endpoint.
   pub fn with_model(model: impl Into<String>) -> Self {
     Self {
-      client: CLIENT.clone(),
+      transport: TRANSPORT.clone(),
       model: model.into(),
     }
   }
@@ -170,13 +172,13 @@ impl OpenAiEmbedder {
       gen_ai.usage.input_tokens = tracing::field::Empty,
       agent.inputs = texts.len() as i64,
     );
+    let body = serde_json::json!({ "model": self.model, "input": texts });
     let response = with_retry(
       || async {
-        let request = CreateEmbeddingRequestArgs::default()
-          .model(&self.model)
-          .input(EmbeddingInput::StringArray(texts.to_vec()))
-          .build()?;
-        Ok::<_, Error>(self.client.embeddings().create(request).await?)
+        self
+          .transport
+          .post_json::<CreateEmbeddingResponse>(EMBEDDINGS_PATH, &body)
+          .await
       },
       is_transient,
     )

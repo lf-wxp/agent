@@ -25,6 +25,13 @@ Notable changes to the `agent` crate. Entries under *Unreleased* ship with the n
 - `cli`: `--memory`, `--reindex-memory`, `/memory`, and `AGENT_CLI_MEMORY_PATH`.
 - `knowledge_base::embed::Embedder::{embed_checked, embed_one}`, and `tools::schema_of`.
 - `examples/rag.rs`.
+- Retries honor the provider's `Retry-After` (seconds or an HTTP date) and `retry-after-ms`:
+  `llm::retry::with_retry` waits at least that long, and stops retrying when it is longer
+  than `LLM_RETRY_MAX_WAIT_SECS` (default 60), returning the error. A wait that comes from
+  the header is stretched by up to 10% so callers rate limited together do not all come back
+  at the same instant. The wait is on
+  `ProviderError::retry_after()` (set with `with_retry_after`), so a custom `ChatBackend`
+  can pass one along. Applies to chat (complete and streamed) and embeddings.
 - `tools::reflect::ReflectTool` (`reflect`): the model writes down a self-check on its own
   initiative (summary, issues, `on_track` / `needs_correction` / `blocked`, next step) and
   reads it back as the tool result. Stateless and read-only like `update_plan`; in
@@ -69,6 +76,28 @@ Notable changes to the `agent` crate. Entries under *Unreleased* ship with the n
   `default-features = false`; the `cli` binary and the `rag` example require the feature.
 - `knowledge_base::embed::embed_text` and `embed_texts` are deprecated in favour of
   `OpenAiEmbedder`; they still work.
+- **Chat and embedding requests no longer go through `async-openai`'s client.** The new
+  `llm::transport` sends them with `reqwest`, because that client drops the response
+  headers before an error reaches us. The same `OpenAIConfig` (base URL, key,
+  organization, project, custom headers) and the same request bodies are used, and the
+  retry classification is the same where the provider answers in the API's own format:
+  transport errors, 408, 409, 429 and 5xx retry, other statuses do not. Differences:
+  - A 4xx whose body is not the API's JSON (a gateway's HTML page, say) is now not retried;
+    it used to be, as a response that failed to parse. The status decides.
+  - An error message is cut to 2000 chars, and a body that is not JSON to 300; an error
+    body is read only up to 64 KiB. A successful response is read up to 256 MiB.
+  - A 5xx's message is the provider's JSON message when there is one, not the raw body.
+  - The connection has a 10 s timeout, and a redirect to another host (or a downgrade from
+    `https` to `http`, or to another port) is not followed: it is an error that names where
+    it pointed, like any other non-success status, so custom headers such as an `api-key` do
+    not reach a host the config did not name. Redirects to the same server, including an
+    `http` to `https` upgrade of the same host, are followed.
+  - The stream path no longer spawns a task per response.
+
+  `async-openai` is still used for `OpenAIConfig` and the request / response types, and its
+  `byot` feature is no longer enabled. New dependencies, both already in the tree:
+  `eventsource-stream` and `httpdate`. Anything that converted an
+  `async_openai::error::OpenAIError` into `agent::Error` still works.
 - `knowledge_base::search::vector_search` embeds the query and the chunks in one request
   (`vector_search_with` takes any `Embedder`).
 - `OpenAiEmbedder` splits a large input into requests of at most 2048 texts **and** about

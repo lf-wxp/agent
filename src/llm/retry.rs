@@ -6,7 +6,10 @@
 //! budget ([`crate::config::max_retries`]) and backoff curve live in one place instead of
 //! being copied (and drifting) at each call site.
 
-use std::future::Future;
+use std::{
+  future::Future,
+  time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use backon::{ExponentialBuilder, Retryable};
 
@@ -29,15 +32,8 @@ use crate::{Error, Result, config};
 ///   deterministic, and guessing at the rest would turn a recoverable blip into a hard
 ///   failure.
 ///
-/// # Known limitation: `Retry-After`
-///
-/// A 429 or 503 usually carries a `Retry-After` header, and honoring it is strictly
-/// better than guessing — backing off *less* than the server asked for is what turns one
-/// rate-limit response into a sustained one. It is not honored here because it cannot be
-/// read: [`async_openai::error::ApiErrorResponse`] keeps only the status code and the
-/// parsed error body, discarding the response headers before the error reaches us. Fixing
-/// this needs either an upstream change or a custom transport, so until then
-/// [`with_retry`]'s exponential curve is the whole of the backoff policy.
+/// How long to wait is [`with_retry`]'s business, and it honors the provider's
+/// `Retry-After` ([`crate::error::ProviderError::retry_after`]).
 pub fn is_transient(err: &Error) -> bool {
   match err {
     Error::Provider(provider) => provider.is_retryable(),
@@ -50,8 +46,57 @@ pub fn is_transient(err: &Error) -> bool {
   }
 }
 
+/// The most a `Retry-After` is stretched by [`jitter`], as a fraction of what was asked.
+const RETRY_AFTER_JITTER: f64 = 0.1;
+
+/// The wait before the next attempt: `backoff` (the exponential curve's next step, `None`
+/// once its attempts are spent), raised to the provider's `Retry-After` when it asked for
+/// longer.
+///
+/// Backing off *less* than the server asked for is what turns one rate-limit response into
+/// a sustained one, so the curve is a floor, not a ceiling. `None` — give up — when the
+/// attempts are spent, or when the provider wants more than `max_wait`: a request that
+/// would sit in a retry loop for minutes is better reported than silently stalled.
+///
+/// A wait that comes from `Retry-After` is stretched by up to [`RETRY_AFTER_JITTER`] of
+/// itself, scaled by `jitter` (in `0.0..=1.0`): callers rate limited together all hear the
+/// same number, and would otherwise all come back at the same instant. It only ever adds to
+/// what was asked, and `max_wait` is judged against what was asked, not the stretch.
+fn next_wait(
+  err: &Error,
+  backoff: Option<Duration>,
+  max_wait: Duration,
+  jitter: f64,
+) -> Option<Duration> {
+  let backoff = backoff?;
+  let asked = err
+    .as_provider()
+    .and_then(|provider| provider.retry_after());
+  match asked {
+    None => Some(backoff),
+    Some(asked) if asked > max_wait => None,
+    Some(asked) => {
+      let stretch = asked.mul_f64(RETRY_AFTER_JITTER * jitter.clamp(0.0, 1.0));
+      Some(backoff.max(asked.saturating_add(stretch)))
+    }
+  }
+}
+
+/// A value in `0.0..1.0` that differs between callers failing at the same moment: the
+/// sub-second part of the clock. Telling callers apart is all it is for, not randomness of
+/// any quality.
+fn jitter() -> f64 {
+  SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map_or(0.0, |elapsed| f64::from(elapsed.subsec_nanos()) / 1e9)
+}
+
 /// Retry `op` with exponential backoff, skipping failures for which `should_retry` returns
 /// `false`.
+///
+/// A provider that says how long to wait (`Retry-After`) is waited for, if that is within
+/// [`config::retry_max_wait`] (`LLM_RETRY_MAX_WAIT_SECS`), plus a little jitter; a longer
+/// request ends the retrying and the error is returned.
 ///
 /// Pass [`is_transient`] unless the operation has deterministic failures of its own it
 /// knows about; `|_| true` retries everything.
@@ -62,8 +107,10 @@ pub async fn with_retry<T, Fut>(
 where
   Fut: Future<Output = Result<T>>,
 {
+  let max_wait = config::retry_max_wait();
   op.retry(ExponentialBuilder::default().with_max_times(config::max_retries()))
     .when(should_retry)
+    .adjust(|err, backoff| next_wait(err, backoff, max_wait, jitter()))
     .notify(|err, dur| tracing::warn!("retrying after {dur:?}: {err}"))
     .await
 }
@@ -77,6 +124,131 @@ mod tests {
 
   use super::*;
   use crate::error::{BudgetExhausted, ProviderError, TruncatedOutput};
+
+  fn rate_limited(asked: Option<u64>) -> Error {
+    let error = ProviderError::transient("429").with_status(429);
+    Error::from(match asked {
+      Some(secs) => error.with_retry_after(Duration::from_secs(secs)),
+      None => error,
+    })
+  }
+
+  const LIMIT: Duration = Duration::from_secs(60);
+
+  /// No jitter, so a wait can be compared exactly.
+  const STEADY: f64 = 0.0;
+
+  /// No `Retry-After`: the curve's own step, unchanged.
+  #[test]
+  fn without_retry_after_the_backoff_is_the_curves() {
+    let backoff = Some(Duration::from_secs(1));
+    assert_eq!(
+      next_wait(&rate_limited(None), backoff, LIMIT, STEADY),
+      backoff
+    );
+    assert_eq!(
+      next_wait(&Error::other("x"), backoff, LIMIT, STEADY),
+      backoff,
+      "an error that is not a provider's has no header to read"
+    );
+  }
+
+  /// Backing off less than asked is what makes one 429 into many, so the longer wins.
+  #[test]
+  fn retry_after_raises_the_wait_but_never_lowers_it() {
+    let one = Some(Duration::from_secs(1));
+    assert_eq!(
+      next_wait(&rate_limited(Some(7)), one, LIMIT, STEADY),
+      Some(Duration::from_secs(7))
+    );
+    let four = Some(Duration::from_secs(4));
+    assert_eq!(
+      next_wait(&rate_limited(Some(2)), four, LIMIT, STEADY),
+      four,
+      "the curve was already longer"
+    );
+  }
+
+  #[test]
+  fn a_wait_over_the_limit_ends_the_retrying() {
+    let one = Some(Duration::from_secs(1));
+    assert_eq!(next_wait(&rate_limited(Some(61)), one, LIMIT, STEADY), None);
+    assert_eq!(
+      next_wait(&rate_limited(Some(60)), one, LIMIT, STEADY),
+      Some(Duration::from_secs(60)),
+      "exactly the limit is still waited out"
+    );
+  }
+
+  /// The attempts running out still ends it, whatever the header says.
+  #[test]
+  fn spent_attempts_stay_spent() {
+    assert_eq!(next_wait(&rate_limited(Some(1)), None, LIMIT, STEADY), None);
+  }
+
+  /// `context` layers keep what the provider asked for, like they keep its status.
+  #[test]
+  fn retry_after_survives_added_context() {
+    let err = rate_limited(Some(5)).context("calling the backend");
+    assert_eq!(
+      next_wait(&err, Some(Duration::from_secs(1)), LIMIT, STEADY),
+      Some(Duration::from_secs(5))
+    );
+  }
+
+  /// Jitter only ever adds to what was asked, never more than a tenth of it, and does not
+  /// touch a wait the curve already made longer.
+  #[test]
+  fn jitter_stretches_a_retry_after_but_never_shortens_it() {
+    let one = Some(Duration::from_secs(1));
+    let asked = rate_limited(Some(10));
+    assert_eq!(
+      next_wait(&asked, one, LIMIT, 0.0),
+      Some(Duration::from_secs(10))
+    );
+    assert_eq!(
+      next_wait(&asked, one, LIMIT, 0.5),
+      Some(Duration::from_millis(10_500))
+    );
+    assert_eq!(
+      next_wait(&asked, one, LIMIT, 1.0),
+      Some(Duration::from_secs(11))
+    );
+    assert_eq!(
+      next_wait(&asked, one, LIMIT, 7.0),
+      Some(Duration::from_secs(11)),
+      "out-of-range jitter is clamped"
+    );
+    let long_curve = Some(Duration::from_secs(30));
+    assert_eq!(next_wait(&asked, long_curve, LIMIT, 1.0), long_curve);
+    assert_eq!(
+      next_wait(&rate_limited(None), one, LIMIT, 1.0),
+      one,
+      "no Retry-After, nothing to stretch"
+    );
+    assert_eq!(
+      next_wait(&rate_limited(Some(60)), one, LIMIT, 1.0),
+      Some(Duration::from_secs(66)),
+      "the limit is judged against what was asked"
+    );
+  }
+
+  /// A provider can send any number, and the limit is configurable up to the largest one:
+  /// stretching it must not overflow.
+  #[test]
+  fn an_extreme_retry_after_does_not_overflow_when_stretched() {
+    let huge = Duration::from_secs(u64::MAX);
+    let err = Error::from(ProviderError::transient("429").with_retry_after(huge));
+    let wait = next_wait(&err, Some(Duration::from_secs(1)), huge, 1.0);
+    assert!(wait.is_some_and(|wait| wait >= huge));
+  }
+
+  #[test]
+  fn the_jitter_source_stays_within_its_range() {
+    for _ in 0..100 {
+      assert!((0.0..1.0).contains(&jitter()));
+    }
+  }
 
   #[tokio::test]
   async fn succeeds_without_retrying_on_the_first_try() {

@@ -16,14 +16,11 @@ resolver = "2"
 
 [dependencies]
 anyhow = "1.0.104"
-# `byot` adds raw-JSON variants of the chat calls (`create_byot` / `create_stream_byot`),
-# which is how `llm::backend` reads the non-standard `reasoning_content` field that the
-# typed responses have no slot for, and writes it back on replayed assistant messages.
-# Caveat: the feature is crate-wide, and with it on the *typed* `chat().create()` /
-# `create_stream()` no longer check or set `stream` themselves (`async-openai` compiles
-# that out). Nothing here calls them: `OpenAiCompatible` is the one place that talks to
-# the client, and sets `stream` itself. Keep it that way.
-async-openai = { version = "0.42.2", features = ["byot", "chat-completion", "embedding"] }
+# Chat and embedding requests go out through `llm::transport` (reqwest), not through
+# `async-openai`'s client: that client drops the response headers before an error reaches
+# us, so a `Retry-After` could never be read. What is still used from it is the request /
+# response *types* and `OpenAIConfig` (base URL, key, organization, project, headers).
+async-openai = { version = "0.42.2", features = ["chat-completion", "embedding"] }
 async-stream = "0.3.6"
 async-trait = "0.1.92"
 # The CLI's local web server (`cli` feature). The library itself serves nothing.
@@ -35,10 +32,16 @@ chrono = "0.4.45"
 crossterm = { version = "0.29.0", optional = true }
 csv = "1.4.0"
 dotenvy = "0.15.7"
+# Parses the SSE framing of a streamed chat completion (already in the tree through
+# `async-openai`).
+eventsource-stream = "0.2.3"
 futures = "0.3.34"
+# `Retry-After` can be an HTTP date (already in the tree through `async-openai`'s deps).
+httpdate = "1.0.3"
 reedline = { version = "0.52.1", optional = true }
 regex = "1.13.1"
-reqwest = { version = "0.13.5", features = ["json"] }
+# `stream`: `Response::bytes_stream`, for streamed chat completions.
+reqwest = { version = "0.13.5", features = ["json", "stream"] }
 # The MCP *client* (`mcp` feature): what `tools::mcp` needs to spawn or reach a server
 # and call its tools. The server side the examples run lives in `[dev-dependencies]`, so
 # a library build never compiles it.

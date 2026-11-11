@@ -529,6 +529,7 @@ agent.run_continuing(
 | `LLM_MAX_CONCURRENCY` | `3` | 单租户并发上限 |
 | `LLM_MAX_TOOL_ROUNDS` | `100` | 单次调用工具轮次预算 |
 | `LLM_MAX_RETRIES` | `3` | 单次模型请求失败后的重试次数（指数退避，`0` 关闭重试） |
+| `LLM_RETRY_MAX_WAIT_SECS` | `60` | 服务端 `Retry-After` 要求的等待时间不超过它就照等；超过则不再重试，直接返回错误 |
 | `LLM_MAX_HISTORY_TOKENS` | `6000` | 多轮历史 token 软上限 |
 | `LLM_MAX_TOKENS` | `2048` | 单次普通请求的输出 token 上限（结构化输出会按需上调，但不会调低） |
 | `LLM_TOKEN_LIMIT_FIELD` | `max_tokens` | 输出上限放在哪个字段：`max_tokens`（多数兼容服务）或 `max_completion_tokens`（OpenAI 推理模型只认这个） |

@@ -9,9 +9,9 @@
 //! adapter for one that does not (a native Anthropic or Gemini client, a local runtime,
 //! a test double) translates to and from.
 //!
-//! [`OpenAiCompatible`] is the implementation that ships: one `async-openai` client per
-//! tenant, pointed at any compatible base URL (OpenAI, DeepSeek, Qwen, vLLM, Ollama,
-//! OpenRouter, Gemini's and Anthropic's compatibility endpoints, ...).
+//! [`OpenAiCompatible`] is the implementation that ships: an HTTP client (see
+//! [`crate::llm::transport`]) pointed at any compatible base URL (OpenAI, DeepSeek, Qwen,
+//! vLLM, Ollama, OpenRouter, Gemini's and Anthropic's compatibility endpoints, ...).
 //!
 //! # Reasoning
 //!
@@ -33,7 +33,6 @@
 use std::pin::Pin;
 
 use async_openai::{
-  Client,
   config::OpenAIConfig,
   types::chat::{
     CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
@@ -46,12 +45,9 @@ use serde_json::Value;
 use crate::{
   Error, Result,
   error::{ProviderError, ResultExt},
+  llm::transport::{BODY_PREVIEW_CHARS, Transport},
   util::truncate_chars,
 };
-
-/// Chars of a response body quoted in a "wrong shape" error: enough to see what came
-/// back, not enough to dump a whole completion into a log.
-const BODY_PREVIEW_CHARS: usize = 300;
 
 /// The request field a replayed chain of thought is written to.
 const REPLAY_FIELD: &str = "reasoning_content";
@@ -130,6 +126,7 @@ pub type ChatChunkStream = Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>
 /// Implementations report a provider's failures as [`ProviderError`] (an
 /// [`async_openai::error::OpenAIError`] converts with `?`), saying whether the same
 /// request could succeed if sent again: [`crate::llm::retry::is_transient`] goes by that.
+/// A provider that asked for a pause says so with [`ProviderError::with_retry_after`].
 /// A failure retrying cannot fix (a rejected key, a request the API calls malformed) is
 /// [`ProviderError::permanent`], or each one costs the whole backoff curve before it
 /// surfaces; anything a retry might get past is [`ProviderError::transient`].
@@ -147,48 +144,48 @@ pub trait ChatBackend: Send + Sync {
   async fn create_stream(&self, request: ChatRequest) -> Result<ChatChunkStream>;
 }
 
-/// Any server speaking the OpenAI Chat Completions API, reached through `async-openai`.
+/// Any server speaking the OpenAI Chat Completions API, reached over HTTP by
+/// [`crate::llm::transport`].
+///
+/// Requests are sent by this crate rather than through `async-openai`'s client so that a
+/// failed one keeps its response headers: `Retry-After` is what tells
+/// [`crate::llm::retry::with_retry`] how long to wait. `async-openai` still supplies
+/// [`OpenAIConfig`] and the request / response types.
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatible {
-  client: Client<OpenAIConfig>,
+  transport: Transport,
 }
 
 impl OpenAiCompatible {
   /// A client for the endpoint and credentials in `config`.
   pub fn new(config: OpenAIConfig) -> Self {
     Self {
-      client: Client::with_config(config),
+      transport: Transport::new(config),
     }
   }
 }
 
+/// The path of the chat completions endpoint, under the configured base URL.
+const CHAT_PATH: &str = "/chat/completions";
+
 #[async_trait::async_trait]
 impl ChatBackend for OpenAiCompatible {
   async fn create(&self, request: ChatRequest) -> Result<ChatResponse> {
-    // The raw (`_byot`) variants skip `async-openai`'s own check that `stream` matches
-    // the method, so it is set here instead.
+    // `stream` is not meaningful for a complete response; the caller's value is dropped.
     let mut body = request.to_body()?;
     if let Some(object) = body.as_object_mut() {
       object.remove("stream");
     }
-    let raw: Value = self.client.chat().create_byot(body).await?;
-    parse_response(raw)
+    parse_response(self.transport.post_json::<Value>(CHAT_PATH, &body).await?)
   }
 
   async fn create_stream(&self, request: ChatRequest) -> Result<ChatChunkStream> {
-    // Same reason as above: the raw variant does not set this itself.
     let mut body = request.to_body()?;
     if let Some(object) = body.as_object_mut() {
       object.insert("stream".to_owned(), Value::Bool(true));
     }
-    let raw = self
-      .client
-      .chat()
-      .create_stream_byot::<_, Value>(body)
-      .await?;
-    Ok(Box::pin(
-      raw.map(|item| item.map_err(Error::from).and_then(parse_chunk)),
-    ))
+    let raw = self.transport.post_sse(CHAT_PATH, &body).await?;
+    Ok(Box::pin(raw.map(|item| item.and_then(parse_chunk))))
   }
 }
 

@@ -1,11 +1,13 @@
 //! End-to-end coverage for [`agent::llm::backend::OpenAiCompatible`] over real HTTP: a
 //! local stub speaking the chat-completions API, in both its JSON and SSE forms.
 //!
-//! The parts worth an HTTP round trip are the ones a scripted backend cannot see:
-//! that the raw (`byot`) calls the backend uses still set `stream` correctly — they no
-//! longer do it themselves — that a provider's `reasoning_content` survives the SSE
-//! framing, and that a provider error still arrives as the `OpenAIError` the retry
-//! policy recognizes, rather than being retried as though it were a network blip.
+//! The parts worth an HTTP round trip are the ones a scripted backend cannot see: that
+//! `stream` is set to match the call, that a provider's `reasoning_content` survives the
+//! SSE framing, and that a provider's rejection arrives as a non-retryable
+//! `ProviderError`, rather than being retried as though it were a network blip.
+//!
+//! Failure paths that need a misbehaving provider (a cut stream, a gateway's HTML, a
+//! redirect) are in `tests/transport_edges.rs`, and `Retry-After` in `tests/retry_after.rs`.
 
 use std::{
   convert::Infallible,

@@ -58,7 +58,7 @@
 //! reports provider failures as [`ProviderError`], saying whether the same request could
 //! succeed if sent again.
 
-use std::{error::Error as StdError, fmt};
+use std::{error::Error as StdError, fmt, time::Duration};
 
 use crate::agent::ExecutionContext;
 
@@ -388,6 +388,7 @@ pub struct ProviderError {
   message: Option<String>,
   status: Option<u16>,
   retryable: bool,
+  retry_after: Option<Duration>,
   class: &'static str,
   source: Option<BoxError>,
 }
@@ -405,11 +406,24 @@ impl ProviderError {
     Self::new(Some(message.into()), false)
   }
 
+  /// The failure for a response with a non-success HTTP `status`: transient or permanent
+  /// by [`is_retryable_status`], with the status recorded.
+  pub(crate) fn from_status(status: u16, message: impl Into<String>) -> Self {
+    let message = message.into();
+    if is_retryable_status(status) {
+      Self::transient(message)
+    } else {
+      Self::permanent(message)
+    }
+    .with_status(status)
+  }
+
   fn new(message: Option<String>, retryable: bool) -> Self {
     Self {
       message,
       status: None,
       retryable,
+      retry_after: None,
       class: "provider",
       source: None,
     }
@@ -422,10 +436,26 @@ impl ProviderError {
     self
   }
 
+  /// Record how long the provider asked callers to wait before sending the request
+  /// again (its `Retry-After` header). [`crate::llm::retry::with_retry`] waits at least
+  /// this long, and gives up when it is longer than it is willing to wait.
+  #[must_use]
+  pub fn with_retry_after(mut self, wait: Duration) -> Self {
+    self.retry_after = Some(wait);
+    self
+  }
+
   /// Attach the underlying error as the cause.
   #[must_use]
   pub fn with_source(mut self, source: impl Into<BoxError>) -> Self {
     self.source = Some(source.into());
+    self
+  }
+
+  /// Name the kind of failure for a trace's `error.type` (see [`Self::class`]).
+  #[must_use]
+  pub(crate) fn with_class(mut self, class: &'static str) -> Self {
+    self.class = class;
     self
   }
 
@@ -434,6 +464,7 @@ impl ProviderError {
       message: Some(message),
       status: self.status,
       retryable: self.retryable,
+      retry_after: self.retry_after,
       class: self.class,
       source: Some(Box::new(self)),
     }
@@ -442,6 +473,11 @@ impl ProviderError {
   /// The HTTP status the provider answered with, when it answered at all.
   pub fn status(&self) -> Option<u16> {
     self.status
+  }
+
+  /// How long the provider asked callers to wait before trying again, when it said.
+  pub fn retry_after(&self) -> Option<Duration> {
+    self.retry_after
   }
 
   /// Whether sending the same request again could succeed.
@@ -481,6 +517,14 @@ impl StdError for ProviderError {
   }
 }
 
+/// Whether a request answered with this HTTP `status` is worth sending again: any 5xx, a
+/// request timeout (408), a conflict (409), or rate limiting (429). Every other status — a
+/// malformed request, a rejected key, a model the tenant cannot reach — is not: the
+/// identical request fails identically.
+pub(crate) fn is_retryable_status(status: u16) -> bool {
+  (500..600).contains(&status) || matches!(status, 408 | 409 | 429)
+}
+
 impl From<async_openai::error::OpenAIError> for ProviderError {
   /// Retryable: transport errors, a broken stream, a response that did not parse,
   /// rate limiting (429), a request timeout (408), a conflict (409), and any 5xx. Every
@@ -492,8 +536,11 @@ impl From<async_openai::error::OpenAIError> for ProviderError {
     let (status, retryable, class) = match &err {
       OpenAIError::ApiError(response) => {
         let status = response.status_code;
-        let retryable = status.is_server_error() || matches!(status.as_u16(), 408 | 409 | 429);
-        (Some(status.as_u16()), retryable, "provider")
+        (
+          Some(status.as_u16()),
+          is_retryable_status(status.as_u16()),
+          "provider",
+        )
       }
       OpenAIError::Reqwest(inner) => (inner.status().map(|s| s.as_u16()), true, "transport"),
       OpenAIError::StreamError(_) => (None, true, "stream"),
@@ -506,6 +553,7 @@ impl From<async_openai::error::OpenAIError> for ProviderError {
       message: None,
       status,
       retryable,
+      retry_after: None,
       class,
       source: Some(Box::new(err)),
     }
@@ -817,6 +865,29 @@ mod tests {
       format!("{err:#}"),
       "embedding request failed: 401 invalid api key: no such file"
     );
+  }
+
+  #[test]
+  fn only_the_transient_statuses_are_retryable() {
+    for status in [408, 409, 429, 500, 502, 503, 599] {
+      assert!(is_retryable_status(status), "{status}");
+    }
+    for status in [200, 301, 307, 400, 401, 403, 404, 422, 600] {
+      assert!(!is_retryable_status(status), "{status}");
+    }
+  }
+
+  #[test]
+  fn a_status_error_records_the_status_and_is_classified_by_it() {
+    let limited = ProviderError::from_status(429, "429 slow down");
+    assert_eq!(limited.status(), Some(429));
+    assert!(limited.is_retryable());
+    assert_eq!(limited.class(), "429");
+
+    let rejected = ProviderError::from_status(401, "401 bad key");
+    assert_eq!(rejected.status(), Some(401));
+    assert!(!rejected.is_retryable());
+    assert_eq!(rejected.to_string(), "401 bad key");
   }
 
   #[test]

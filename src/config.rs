@@ -32,6 +32,9 @@ const ENV_MAX_TOOL_ROUNDS: &str = "LLM_MAX_TOOL_ROUNDS";
 /// Environment variable: max attempts for a retryable LLM request ([`crate::llm::retry::with_retry`]).
 const ENV_MAX_RETRIES: &str = "LLM_MAX_RETRIES";
 
+/// Environment variable: longest `Retry-After` (seconds) a retry will wait out.
+const ENV_RETRY_MAX_WAIT_SECS: &str = "LLM_RETRY_MAX_WAIT_SECS";
+
 /// Environment variable: path to the MCP server config file.
 const ENV_MCP_CONFIG_PATH: &str = "MCP_CONFIG_PATH";
 
@@ -115,6 +118,11 @@ const DEFAULT_MAX_TOOL_ROUNDS: usize = 100;
 
 /// Default retry attempts for a transient LLM request failure.
 const DEFAULT_MAX_RETRIES: usize = 3;
+
+/// Default longest pause a provider's `Retry-After` can ask for and still be waited out.
+/// Rate-limit windows are usually a minute; a provider asking for much more is closed
+/// for the day or the hour, which is better reported than sat through.
+const DEFAULT_RETRY_MAX_WAIT_SECS: u64 = 60;
 
 /// Default MCP config location, relative to the working directory.
 const DEFAULT_MCP_CONFIG_PATH: &str = "mcp.json";
@@ -234,6 +242,17 @@ pub fn max_tool_rounds() -> usize {
 /// retrying. Invalid (non-numeric) values fall back to the default.
 pub fn max_retries() -> usize {
   parsed_var(ENV_MAX_RETRIES, DEFAULT_MAX_RETRIES)
+}
+
+/// The longest `Retry-After` a retry will wait out: when a provider asks for more than
+/// this, [`crate::llm::retry::with_retry`] stops retrying and returns the error instead.
+/// Override with `LLM_RETRY_MAX_WAIT_SECS`; invalid values (non-numeric or 0) fall back to
+/// the default of 60 seconds.
+pub fn retry_max_wait() -> Duration {
+  Duration::from_secs(parsed_var_nonzero(
+    ENV_RETRY_MAX_WAIT_SECS,
+    DEFAULT_RETRY_MAX_WAIT_SECS,
+  ))
 }
 
 /// Path to the `mcp.json` declaring MCP servers. Override with `MCP_CONFIG_PATH`.

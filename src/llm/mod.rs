@@ -13,3 +13,4 @@ pub mod structured;
 pub(crate) mod testing;
 pub mod tool_calls;
 pub mod tool_loop;
+pub(crate) mod transport;
